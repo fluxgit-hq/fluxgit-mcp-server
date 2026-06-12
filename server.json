@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.fluxgit-hq/fluxgit-mcp-server",
+  "description": "Safety-first Git MCP server: 22 read-only tools built for agent context budgets; writes are proposals a human approves in the FluxGit desktop app.",
+  "repository": {
+    "url": "https://github.com/fluxgit-hq/fluxgit-mcp-server",
+    "source": "github"
+  },
+  "websiteUrl": "https://fluxgit.com/features/mcp-agent-git/",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "fluxgit-mcp-sidecar",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 # fluxgit-mcp-sidecar
+<!-- mcp-name: io.github.fluxgit-hq/fluxgit-mcp-server -->
 
 **Safety-first read-only Model Context Protocol (MCP) server for Git.**
 
