@@ -133,6 +133,14 @@ Tier classification:
 
 ## Quick start
 
+One-line install (puts `fluxgit-mcp-sidecar` on your PATH):
+
+```bash
+cargo install --git https://github.com/fluxgit-hq/fluxgit-mcp-server fluxgit-mcp-sidecar
+```
+
+Or build from a clone:
+
 ```bash
 # Build
 cargo build --release
