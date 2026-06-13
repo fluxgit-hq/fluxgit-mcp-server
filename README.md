@@ -5,7 +5,7 @@
 
 > AI agents inspect. FluxGit keeps control.
 
-A Rust MCP server that exposes 28 carefully designed tools for AI code agents to navigate Git repositories without ever being able to silently mutate them. Built as the bridge between MCP-compatible agents and the [FluxGit](https://fluxgit.com) desktop application.
+A Rust MCP server that exposes 29 carefully designed tools for AI code agents to navigate Git repositories without ever being able to silently mutate them. Built as the bridge between MCP-compatible agents and the [FluxGit](https://fluxgit.com) desktop application.
 
 ---
 
@@ -46,7 +46,7 @@ Other MCP Git servers face a choice: stay strictly read-only (limited utility) o
 | `flux.restorePoints` | List of restore points |
 | `flux.restorePointDetails` | One restore point with before/after refs |
 
-### 6 write-with-UI-handshake tools
+### 7 write-with-UI-handshake tools
 
 All 6 operations dispatch through the FluxGit gateway when configured (the original 5 as of 2026-05-28; `plan` added 2026-06-10). The sidecar POSTs the proposal to the gateway's handshake server, the FluxGit app renders an "🤖 Requested by AI agent" approval card per operation type, and the sidecar polls until the user approves, rejects, or the proposal expires. When the gateway is not reachable, the sidecar returns `write_handshake_pending` (code 10003) so the agent can recommend the user perform the action in FluxGit UI.
 
@@ -58,6 +58,7 @@ All 6 operations dispatch through the FluxGit gateway when configured (the origi
 | `operation.preview.reset` | Propose soft / mixed / hard reset | POST `/v1/mcp/operation/preview/reset` → mode-aware card (hard mode forces strong confirmation) |
 | `operation.preview.patch` | Propose applying an agent-generated patch | POST `/v1/mcp/operation/preview/patch` → monospace patch preview + applyToIndex toggle |
 | `operation.preview.plan` | Propose a 1-10 step **sequence** (any of the five operations above) approved as one unit | POST `/v1/mcp/operation/preview/plan` → numbered step card; destructive steps require an explicit checkbox; execution stops at the first failure and the result reports per-step status |
+| `operation.preview.worktree` | Propose creating an isolated worktree for a parallel task (non-destructive; never touches history) | POST `/v1/mcp/operation/preview/worktree` → approval card with branch + target path + reason; runs through the same worktree-create action a manual click uses |
 
 All 6 require a free-text `reason` so the user sees the agent's justification in the approval modal. All 6 reuse the same gateway state machine (`pending → approved → completed`, terminal states `rejected | failed | expired`) and the same Tauri bridge in the UI. When an approved merge/rebase/reset executes, the completion `result` includes the captured restore point (`beforeCommit`/`afterCommit`/`canUndo`) so the agent can tell the user the change is reversible from FluxGit's Safety Timeline.
 
@@ -257,7 +258,7 @@ Programmatic verification uses the public `verify_audit_event_signature(&event_v
 - MCP protocol version: `2024-11-05`
 - Transport: stdin/stdout (newline-delimited JSON-RPC 2.0). Legacy Content-Length framing also supported.
 - Capabilities: `tools` (listChanged: false).
-- 23 tools in `tools/list`. Read-only tools advertised with `annotations.readOnlyHint: true`. Write-handshake tools advertised with `annotations.readOnlyHint: false`.
+- 29 tools in `tools/list`. Read-only tools advertised with `annotations.readOnlyHint: true`. Write-handshake tools advertised with `annotations.readOnlyHint: false`.
 
 Error codes:
 

@@ -356,6 +356,7 @@ enum ToolKind {
     OperationPreviewReset,
     OperationPreviewPatch,
     OperationPreviewPlan,
+    OperationPreviewWorktree,
 }
 
 impl ToolKind {
@@ -389,6 +390,7 @@ impl ToolKind {
             ToolKind::OperationPreviewReset => "operation.preview.reset",
             ToolKind::OperationPreviewPatch => "operation.preview.patch",
             ToolKind::OperationPreviewPlan => "operation.preview.plan",
+            ToolKind::OperationPreviewWorktree => "operation.preview.worktree",
         }
     }
 }
@@ -406,6 +408,7 @@ const WRITE_HANDSHAKE_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::OperationPreviewReset,
     ToolKind::OperationPreviewPatch,
     ToolKind::OperationPreviewPlan,
+    ToolKind::OperationPreviewWorktree,
 ];
 
 fn is_write_handshake(kind: ToolKind) -> bool {
@@ -725,6 +728,9 @@ impl McpSidecar {
                     }
                     ToolKind::OperationPreviewPlan => {
                         dispatch_operation_preview_plan(&addr, arguments)
+                    }
+                    ToolKind::OperationPreviewWorktree => {
+                        dispatch_operation_preview_worktree(&addr, arguments)
                     }
                     _ => None,
                 };
@@ -1073,7 +1079,8 @@ fn local_tool_payload(
         | ToolKind::OperationPreviewDiscard
         | ToolKind::OperationPreviewReset
         | ToolKind::OperationPreviewPatch
-        | ToolKind::OperationPreviewPlan => {
+        | ToolKind::OperationPreviewPlan
+        | ToolKind::OperationPreviewWorktree => {
             // Write-handshake tools are short-circuited in handle_tools_call before
             // reaching here. If execution gets here, something rerouted incorrectly.
             unreachable!(
@@ -3605,6 +3612,7 @@ impl ToolKind {
             "operation.preview.reset" => Some(Self::OperationPreviewReset),
             "operation.preview.patch" => Some(Self::OperationPreviewPatch),
             "operation.preview.plan" => Some(Self::OperationPreviewPlan),
+            "operation.preview.worktree" => Some(Self::OperationPreviewWorktree),
             _ => None,
         }
     }
@@ -3723,6 +3731,9 @@ fn tool_description(kind: ToolKind) -> &'static str {
         }
         ToolKind::OperationPreviewPlan => {
             "Propose a SEQUENCE of operations (1-10 steps of merge/rebase/discard/reset/patch) as one reviewable plan with a single approval. FluxGit shows every step in the approval card; the user approves intent once and FluxGit executes the steps in order through its safety pipeline, stopping at the first failure. The completion result reports per-step status and captured restore points. Use this instead of chaining single proposals when the work is one logical change (e.g. rebase then merge). Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog."
+        }
+        ToolKind::OperationPreviewWorktree => {
+            "Propose creating an isolated git worktree for a parallel task BEFORE you start changing files, so your work happens in its own checkout instead of disturbing the user's current one. Use this at the start of a task that needs its own branch (e.g. 'fix the flaky test' or 'try an alternative refactor') so you can edit, build and commit without touching the main working tree. Provide `branch` (a new or existing branch name to check out in the worktree) and a clear `reason`; `path` is optional — omit it and FluxGit picks a sane default location next to the repo. Creating a worktree is non-destructive: it never rewrites history and never deletes files, it just adds a second checkout. The sidecar never creates the worktree itself; FluxGit opens an approval card, the user approves or rejects, and FluxGit creates it through its normal pipeline. On completion the result includes the created worktree's path so you can switch your work there. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
         }
     }
 }
@@ -4149,6 +4160,31 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 }),
             );
             required.push("steps");
+            required.push("reason");
+        }
+        ToolKind::OperationPreviewWorktree => {
+            properties.insert(
+                "branch".into(),
+                json!({
+                    "type": "string",
+                    "description": "Branch to check out in the new worktree. May be a new branch name (FluxGit creates it) or an existing branch. Each branch can be checked out in only one worktree at a time."
+                }),
+            );
+            properties.insert(
+                "path".into(),
+                json!({
+                    "type": "string",
+                    "description": "Optional absolute path for the worktree directory. Omit it and FluxGit picks a sane default next to the repository."
+                }),
+            );
+            properties.insert(
+                "reason".into(),
+                json!({
+                    "type": "string",
+                    "description": "Why this worktree should be created. Shown to the user in the approval modal."
+                }),
+            );
+            required.push("branch");
             required.push("reason");
         }
     }
@@ -4591,6 +4627,59 @@ fn dispatch_operation_preview_plan(
     )
 }
 
+/// Build the worktree body and dispatch (AGENT_FIRST_ROADMAP P2 / NORTH_STAR
+/// vector 5). `path` is optional: when the agent omits it the field is left
+/// out of the body and FluxGit picks a sane default location.
+fn dispatch_operation_preview_worktree(
+    gateway_addr: &str,
+    arguments: &Value,
+) -> Option<ToolCallResult> {
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let repo_path = arguments
+        .get("repoPath")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let branch = arguments
+        .get("branch")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    let reason = arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requested_at = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let mut body = json!({
+        "previewId": preview_id,
+        "agentId": "external-mcp-sidecar",
+        "operationType": "worktree",
+        "repoPath": repo_path,
+        "branch": branch,
+        "reason": reason,
+        "requestedAt": requested_at,
+    });
+    if let Some(path) = path {
+        body["path"] = Value::String(path);
+    }
+
+    dispatch_operation_preview_request(
+        ToolKind::OperationPreviewWorktree.as_str(),
+        "worktree",
+        gateway_addr,
+        &preview_id,
+        &body,
+    )
+}
+
 fn operation_preview_success_result(
     tool_name: &'static str,
     preview_id: &str,
@@ -4939,16 +5028,19 @@ mod tests {
                 "operation.preview.reset",
                 "operation.preview.patch",
                 "operation.preview.plan",
+                "operation.preview.worktree",
             ]
         );
 
-        // Verify all 5 write-handshake tools advertise readOnlyHint: false.
+        // Verify all 7 write-handshake tools advertise readOnlyHint: false.
         for handshake_name in [
             "operation.preview.merge",
             "operation.preview.rebase",
             "operation.preview.discard",
             "operation.preview.reset",
             "operation.preview.patch",
+            "operation.preview.plan",
+            "operation.preview.worktree",
         ] {
             let tool = tools
                 .iter()
@@ -6698,6 +6790,14 @@ mod tests {
                     "reason": "rebase then merge as one reviewed unit"
                 }),
             ),
+            (
+                "operation.preview.worktree",
+                &["branch", "reason"],
+                json!({
+                    "repoPath": "/tmp/x", "branch": "agent/fix-flaky-test",
+                    "reason": "isolate the flaky-test fix in its own checkout"
+                }),
+            ),
         ];
 
         for (name, must_require, args) in cases {
@@ -7257,6 +7357,135 @@ mod tests {
                 "repoPath": "/tmp/example",
                 "patchContent": "@@ -1,3 +1,3 @@\n-old\n+new",
                 "reason": "Apply suggested fix"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            payload["error"]["code"], 10003,
+            "unreachable gateway must fall back to write_handshake_pending"
+        );
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["readOnly"], false);
+    }
+
+    // ---------------------------------------------------------------------
+    // operation.preview.worktree gateway dispatch
+    // (AGENT_FIRST_ROADMAP P2 / NORTH_STAR vector 5). Mirrors the other
+    // operations: POST to /v1/mcp/operation/preview/worktree, poll the
+    // shared status endpoint. The body must include operationType "worktree".
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn operation_preview_worktree_dispatches_when_gateway_configured() {
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "worktree",
+            "completed",
+            json!({
+                "worktreePath": "/tmp/example.worktrees/agent-fix",
+                "branch": "agent/fix-flaky-test",
+            }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.worktree",
+            json!({
+                "repoPath": "/tmp/example",
+                "branch": "agent/fix-flaky-test",
+                "path": "/tmp/example.worktrees/agent-fix",
+                "reason": "Isolate the flaky-test fix in its own checkout"
+            }),
+            true,
+        );
+
+        assert_eq!(
+            response["result"]["isError"], false,
+            "completed status must return isError: false; full response: {response:?}"
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["tool"], "operation.preview.worktree");
+        assert_eq!(payload["source"], "fluxgit-app");
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["status"], "completed");
+        let preview_id = payload["previewId"]
+            .as_str()
+            .expect("previewId must be a string");
+        assert!(!preview_id.is_empty(), "previewId must be non-empty");
+        assert_eq!(
+            payload["data"]["result"]["worktreePath"],
+            "/tmp/example.worktrees/agent-fix"
+        );
+
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
+        assert_eq!(
+            dispatched["operationType"], "worktree",
+            "worktree body must include operationType"
+        );
+        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(dispatched["branch"], "agent/fix-flaky-test");
+        assert_eq!(dispatched["path"], "/tmp/example.worktrees/agent-fix");
+        assert_eq!(
+            dispatched["reason"],
+            "Isolate the flaky-test fix in its own checkout"
+        );
+        assert!(
+            dispatched["requestedAt"].is_string(),
+            "requestedAt must be an ISO-8601 string"
+        );
+    }
+
+    #[test]
+    fn operation_preview_worktree_omits_path_when_not_supplied() {
+        // When the agent omits `path`, FluxGit picks a default — the sidecar
+        // must NOT send an empty path field that the gateway would treat as a
+        // literal location.
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "worktree",
+            "completed",
+            json!({ "worktreePath": "/tmp/example.worktrees/agent-fix" }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.worktree",
+            json!({
+                "repoPath": "/tmp/example",
+                "branch": "agent/fix-flaky-test",
+                "reason": "Isolate the fix"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], false);
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert!(
+            dispatched.get("path").is_none(),
+            "path must be omitted when the agent does not supply it"
+        );
+        assert_eq!(dispatched["branch"], "agent/fix-flaky-test");
+    }
+
+    #[test]
+    fn operation_preview_worktree_falls_back_to_pending_when_gateway_unreachable() {
+        let _env = GatewayEnvGuard::set("127.0.0.1:1");
+
+        let response = call_tool(
+            "operation.preview.worktree",
+            json!({
+                "repoPath": "/tmp/example",
+                "branch": "agent/fix-flaky-test",
+                "reason": "Isolate the fix"
             }),
             true,
         );
