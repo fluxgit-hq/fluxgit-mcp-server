@@ -1,11 +1,10 @@
 # fluxgit-mcp-sidecar
-<!-- mcp-name: io.github.fluxgit-hq/fluxgit-mcp-server -->
 
 **Safety-first read-only Model Context Protocol (MCP) server for Git.**
 
 > AI agents inspect. FluxGit keeps control.
 
-A Rust MCP server that exposes 29 carefully designed tools for AI code agents to navigate Git repositories without ever being able to silently mutate them. Built as the bridge between MCP-compatible agents and the [FluxGit](https://fluxgit.com) desktop application.
+A Rust MCP server that exposes 34 carefully designed tools for AI code agents to navigate Git repositories without ever being able to silently mutate them. Built as the bridge between MCP-compatible agents and the [FluxGit](https://fluxgit.com) desktop application.
 
 ---
 
@@ -19,7 +18,7 @@ Other MCP Git servers face a choice: stay strictly read-only (limited utility) o
 
 ## What's exposed
 
-### 22 read-only tools
+### 23 read-only tools
 
 | Tool | Purpose |
 |---|---|
@@ -45,8 +44,9 @@ Other MCP Git servers face a choice: stay strictly read-only (limited utility) o
 | `flux.latestRestorePoint` | Newest FluxGit restore point |
 | `flux.restorePoints` | List of restore points |
 | `flux.restorePointDetails` | One restore point with before/after refs |
+| `operation.status` | Re-check a proposal's status by previewId (poll after the initial 60s window; returns rejectionReason or the completion result) |
 
-### 7 write-with-UI-handshake tools
+### 11 write-with-UI-handshake tools
 
 All 6 operations dispatch through the FluxGit gateway when configured (the original 5 as of 2026-05-28; `plan` added 2026-06-10). The sidecar POSTs the proposal to the gateway's handshake server, the FluxGit app renders an "🤖 Requested by AI agent" approval card per operation type, and the sidecar polls until the user approves, rejects, or the proposal expires. When the gateway is not reachable, the sidecar returns `write_handshake_pending` (code 10003) so the agent can recommend the user perform the action in FluxGit UI.
 
@@ -59,8 +59,12 @@ All 6 operations dispatch through the FluxGit gateway when configured (the origi
 | `operation.preview.patch` | Propose applying an agent-generated patch | POST `/v1/mcp/operation/preview/patch` → monospace patch preview + applyToIndex toggle |
 | `operation.preview.plan` | Propose a 1-10 step **sequence** (any of the five operations above) approved as one unit | POST `/v1/mcp/operation/preview/plan` → numbered step card; destructive steps require an explicit checkbox; execution stops at the first failure and the result reports per-step status |
 | `operation.preview.worktree` | Propose creating an isolated worktree for a parallel task (non-destructive; never touches history) | POST `/v1/mcp/operation/preview/worktree` → approval card with branch + target path + reason; runs through the same worktree-create action a manual click uses |
+| `operation.preview.commit` | Propose staging + committing with a message (non-destructive; amend not supported) | POST `/v1/mcp/operation/preview/commit` → approval card lists the exact files that will be staged and committed; runs through the normal commit pipeline (hooks, signing, policy); completion returns the new SHA |
+| `operation.preview.push` | Propose pushing a branch to a remote (optional set-upstream; force-with-lease shows a HIGH-risk warning) | POST `/v1/mcp/operation/preview/push` → approval card with remote + branch + force warning when applicable; runs the guarded push flow |
+| `operation.preview.branch` | Propose creating (and optionally checking out) a branch from a start point | POST `/v1/mcp/operation/preview/branch` → approval card with name + start point + checkout choice |
+| `operation.cancel` | Cancel the agent's own still-pending proposal by previewId | POST cancel; the card disappears from the user's queue like an expired proposal |
 
-All 6 require a free-text `reason` so the user sees the agent's justification in the approval modal. All 6 reuse the same gateway state machine (`pending → approved → completed`, terminal states `rejected | failed | expired`) and the same Tauri bridge in the UI. When an approved merge/rebase/reset executes, the completion `result` includes the captured restore point (`beforeCommit`/`afterCommit`/`canUndo`) so the agent can tell the user the change is reversible from FluxGit's Safety Timeline.
+All write proposals require a free-text `reason` so the user sees the agent's justification in the approval modal. All reuse the same gateway state machine (`pending → approved → completed`, terminal states `rejected | failed | expired`) and the same Tauri bridge in the UI. When an approved merge/rebase/reset executes, the completion `result` includes the captured restore point (`beforeCommit`/`afterCommit`/`canUndo`) so the agent can tell the user the change is reversible from FluxGit's Safety Timeline.
 
 ### Write protocol details
 
@@ -116,7 +120,7 @@ Host: 127.0.0.1:59647
 
 The sidecar returns the result to the agent as `isError: false`. Any terminal status other than `completed` (`rejected`, `failed`, `expired`) returns `isError: true` with the structured payload, so the agent can report the rejection reason cleanly without inventing an outcome.
 
-The same pattern applies to all 6 operations. Only the request body fields and the `result` shape differ; the polling, state machine, and error semantics are shared. The full per-operation contract ships with the FluxGit desktop app and is summarized at [fluxgit.com/features/mcp-agent-git](https://fluxgit.com/features/mcp-agent-git/).
+The same pattern applies to all 6 operations. Only the request body fields and the `result` shape differ; the polling, state machine, and error semantics are shared. The full per-operation contract lives in §14 of the [Master Playbook](https://github.com/FluxGit/fluxgit/blob/main/product/mcp/PLAYBOOK.md).
 
 ---
 
@@ -134,14 +138,6 @@ Tier classification:
 ---
 
 ## Quick start
-
-One-line install (puts `fluxgit-mcp-sidecar` on your PATH):
-
-```bash
-cargo install --git https://github.com/fluxgit-hq/fluxgit-mcp-server fluxgit-mcp-sidecar
-```
-
-Or build from a clone:
 
 ```bash
 # Build
@@ -258,7 +254,7 @@ Programmatic verification uses the public `verify_audit_event_signature(&event_v
 - MCP protocol version: `2024-11-05`
 - Transport: stdin/stdout (newline-delimited JSON-RPC 2.0). Legacy Content-Length framing also supported.
 - Capabilities: `tools` (listChanged: false).
-- 29 tools in `tools/list`. Read-only tools advertised with `annotations.readOnlyHint: true`. Write-handshake tools advertised with `annotations.readOnlyHint: false`.
+- 34 tools in `tools/list`. Read-only tools advertised with `annotations.readOnlyHint: true`. Write-handshake tools advertised with `annotations.readOnlyHint: false`.
 
 Error codes:
 
@@ -291,4 +287,5 @@ Apache-2.0. See `LICENSE`.
 ## Related
 
 - [FluxGit](https://fluxgit.com) — the desktop app that produces the FluxGit-powered context.
-- [MCP for agents — feature page](https://fluxgit.com/features/mcp-agent-git/) — capabilities, write-handshake contract and roadmap.
+- [Master Playbook](https://github.com/FluxGit/fluxgit/blob/main/product/mcp/PLAYBOOK.md) — internal source of truth for positioning, tool catalog, contracts and roadmap.
+- [Agent Client Guide](https://github.com/FluxGit/fluxgit/blob/main/AGENT_MCP_CLIENT_GUIDE.md) — technical rules for connected agents.

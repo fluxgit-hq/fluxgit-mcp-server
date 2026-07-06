@@ -79,9 +79,18 @@ impl AuditSigner {
         self.signing_key.verifying_key()
     }
 
+    /// Build a signer from raw 32-byte Ed25519 secret material. Public so the
+    /// gateway's decision-audit tests can construct a deterministic signer
+    /// without touching disk or PEM.
+    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+        Self::from_signing_key(SigningKey::from_bytes(secret))
+    }
+
     /// Sign the canonical-JSON form of `event` (event MUST NOT yet contain
-    /// a `signature` field). Returns the base64url-no-pad signature.
-    fn sign_event(&self, event: &Value) -> String {
+    /// a `signature` field). Returns the base64url-no-pad signature. Public
+    /// so the gateway can sign its human-decision audit events with the exact
+    /// same canonical form the sidecar uses (PLAYBOOK §6.1).
+    pub fn sign_event(&self, event: &Value) -> String {
         let canonical = canonical_json_bytes(event);
         let sig: Signature = self.signing_key.sign(&canonical);
         BASE64_URL_NO_PAD.encode(sig.to_bytes())
@@ -289,6 +298,12 @@ struct ToolSpec {
 struct ToolAnnotations {
     #[serde(rename = "readOnlyHint")]
     read_only_hint: bool,
+    /// MCP destructive-operation hint. Only set (true) on the proposal tools
+    /// whose approved execution can destroy uncommitted or committed work
+    /// (`operation.preview.reset`, `operation.preview.discard`). Omitted
+    /// entirely for every other tool so the advertised JSON stays compact.
+    #[serde(rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
+    destructive_hint: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -344,6 +359,10 @@ enum ToolKind {
     FluxLatestRestorePoint,
     FluxRestorePoints,
     FluxRestorePointDetails,
+    /// Read-only status check for a previously proposed operation
+    /// (PLAYBOOK §10.6). Talks to the gateway handshake bridge, not to
+    /// local git; requires only `previewId`.
+    OperationStatus,
     // Write-with-UI-handshake operations (PLAYBOOK §10, Phase 3).
     // These are NOT read-only — they request a preview the user must approve
     // inside FluxGit. The sidecar never performs the write itself. When the
@@ -357,6 +376,13 @@ enum ToolKind {
     OperationPreviewPatch,
     OperationPreviewPlan,
     OperationPreviewWorktree,
+    OperationPreviewCommit,
+    OperationPreviewPush,
+    OperationPreviewBranch,
+    /// Write-adjacent: withdraws one of THIS agent's still-pending proposals
+    /// by `previewId`. Never touches the repository and can only cancel
+    /// proposals created by the same agent, so it needs no policy gating.
+    OperationCancel,
 }
 
 impl ToolKind {
@@ -384,6 +410,8 @@ impl ToolKind {
             ToolKind::FluxLatestRestorePoint => "flux.latestRestorePoint",
             ToolKind::FluxRestorePoints => "flux.restorePoints",
             ToolKind::FluxRestorePointDetails => "flux.restorePointDetails",
+            ToolKind::OperationStatus => "operation.status",
+            ToolKind::OperationCancel => "operation.cancel",
             ToolKind::OperationPreviewMerge => "operation.preview.merge",
             ToolKind::OperationPreviewRebase => "operation.preview.rebase",
             ToolKind::OperationPreviewDiscard => "operation.preview.discard",
@@ -391,6 +419,9 @@ impl ToolKind {
             ToolKind::OperationPreviewPatch => "operation.preview.patch",
             ToolKind::OperationPreviewPlan => "operation.preview.plan",
             ToolKind::OperationPreviewWorktree => "operation.preview.worktree",
+            ToolKind::OperationPreviewCommit => "operation.preview.commit",
+            ToolKind::OperationPreviewPush => "operation.preview.push",
+            ToolKind::OperationPreviewBranch => "operation.preview.branch",
         }
     }
 }
@@ -409,6 +440,13 @@ const WRITE_HANDSHAKE_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::OperationPreviewPatch,
     ToolKind::OperationPreviewPlan,
     ToolKind::OperationPreviewWorktree,
+    ToolKind::OperationPreviewCommit,
+    ToolKind::OperationPreviewPush,
+    ToolKind::OperationPreviewBranch,
+    // operation.cancel is write-adjacent (it mutates handshake state, never
+    // the repository). It is short-circuited in handle_tools_call before the
+    // generic preview dispatch runs.
+    ToolKind::OperationCancel,
 ];
 
 fn is_write_handshake(kind: ToolKind) -> bool {
@@ -440,6 +478,9 @@ const READ_ONLY_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::FluxLatestRestorePoint,
     ToolKind::FluxRestorePoints,
     ToolKind::FluxRestorePointDetails,
+    // operation.status is read-only: it inspects the lifecycle of an existing
+    // proposal through the gateway handshake bridge and mutates nothing.
+    ToolKind::OperationStatus,
 ];
 
 /// Tools that strictly require a configured FluxGit gateway to produce meaningful payloads.
@@ -682,14 +723,28 @@ impl McpSidecar {
 
         let kind = ToolKind::from_name(tool_name).ok_or_else(|| JsonRpcError {
             code: -32602,
-            message: "Tool is not on the read-only whitelist".into(),
+            message: format!("Unknown tool '{tool_name}'"),
             data: Some(json!({
                 "tool": tool_name,
-                "allowedTools": read_only_tool_names(),
+                "reason": "This server exposes read-only inspection tools plus operation.preview.* write proposals that require human approval inside FluxGit. The requested name matches neither surface.",
+                "readOnlyTools": read_only_tool_names(),
+                "writeProposalTools": write_handshake_tool_names(),
             })),
         })?;
 
         let arguments = object.get("arguments").unwrap_or(&Value::Null);
+
+        // operation.status / operation.cancel talk directly to the gateway
+        // handshake bridge (they take only a previewId, no repoPath), so they
+        // are short-circuited before every other dispatch path — including the
+        // generic write-handshake block below, which would otherwise try to
+        // POST a preview for operation.cancel.
+        if kind == ToolKind::OperationStatus {
+            return operation_status_tool_call(arguments);
+        }
+        if kind == ToolKind::OperationCancel {
+            return operation_cancel_tool_call(arguments);
+        }
 
         // Write-with-UI-handshake tools (PLAYBOOK §10, §14.2, §14.7):
         // All five `operation.preview.*` tools dispatch through the gateway HTTP
@@ -701,15 +756,7 @@ impl McpSidecar {
         // fall through to the standard `write_handshake_pending_error` (code 10003)
         // so the agent gets the existing, well-known error contract.
         if is_write_handshake(kind) {
-            let handshake_addr = env::var("FLUXGIT_MCP_HANDSHAKE_ADDR")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .or_else(|| {
-                    env::var("FLUXGIT_GATEWAY_ADDR")
-                        .ok()
-                        .filter(|v| !v.trim().is_empty())
-                });
-            if let Some(addr) = handshake_addr {
+            if let Some(addr) = resolve_handshake_addr() {
                 let dispatched = match kind {
                     ToolKind::OperationPreviewMerge => {
                         dispatch_operation_preview_merge(&addr, arguments)
@@ -731,6 +778,15 @@ impl McpSidecar {
                     }
                     ToolKind::OperationPreviewWorktree => {
                         dispatch_operation_preview_worktree(&addr, arguments)
+                    }
+                    ToolKind::OperationPreviewCommit => {
+                        dispatch_operation_preview_commit(&addr, arguments)
+                    }
+                    ToolKind::OperationPreviewPush => {
+                        dispatch_operation_preview_push(&addr, arguments)
+                    }
+                    ToolKind::OperationPreviewBranch => {
+                        dispatch_operation_preview_branch(&addr, arguments)
                     }
                     _ => None,
                 };
@@ -822,19 +878,17 @@ impl McpSidecar {
     }
 
     fn record_tool_audit(&self, context: &McpAuditContext, result: &ToolCallResult) {
-        let event_type = if context.read_only_whitelisted {
-            "tool_call"
-        } else {
-            "write_block"
-        };
+        let labels = context.audit_labels();
         let result_label = if result.is_error { "error" } else { "success" };
+        let noun = match labels.event_type {
+            "write_proposal" => "write-proposal",
+            "proposal_cancel" => "proposal-cancel",
+            _ => "read-only",
+        };
         let summary = if result.is_error {
-            format!(
-                "MCP read-only tool {} returned a structured error.",
-                context.tool
-            )
+            format!("MCP {noun} tool {} returned a structured error.", context.tool)
         } else {
-            format!("MCP read-only tool {} completed.", context.tool)
+            format!("MCP {noun} tool {} completed.", context.tool)
         };
         self.append_audit_event(json!({
             "id": format!("mcp-tool-{}-{}", now_ms(), context.tool.replace('.', "-")),
@@ -842,33 +896,34 @@ impl McpSidecar {
             "tool": context.tool,
             "repo_scope": context.repo_scope,
             "args_fingerprint": context.args_fingerprint,
-            "risk": "none",
-            "approval": "not_required",
+            "risk": labels.risk,
+            "approval": labels.approval,
             "result": result_label,
-            "event_type": event_type,
+            "event_type": labels.event_type,
             "session_id": "external-mcp-sidecar",
             "duration_ms": 0,
             "summary": summary,
-            "readOnly": context.read_only_whitelisted,
+            "readOnly": labels.read_only,
             "sidecarReadOnly": true,
         }));
     }
 
     fn record_tool_error_audit(&self, context: &McpAuditContext, error: &JsonRpcError) {
+        let labels = context.audit_labels();
         self.append_audit_event(json!({
             "id": format!("mcp-block-{}-{}", now_ms(), context.tool.replace('.', "-")),
             "timestamp": now_ms(),
             "tool": context.tool,
             "repo_scope": context.repo_scope,
             "args_fingerprint": context.args_fingerprint,
-            "risk": "none",
+            "risk": labels.risk,
             "approval": "denied",
             "result": "blocked",
             "event_type": "write_block",
             "session_id": "external-mcp-sidecar",
             "duration_ms": 0,
             "summary": format!("MCP tool {} was blocked: {}", context.tool, error.message),
-            "readOnly": context.read_only_whitelisted,
+            "readOnly": labels.read_only,
             "sidecarReadOnly": true,
         }));
     }
@@ -921,10 +976,51 @@ struct McpAuditContext {
     tool: String,
     repo_scope: String,
     args_fingerprint: Option<String>,
-    read_only_whitelisted: bool,
+    kind: Option<ToolKind>,
+}
+
+/// Honest audit labels per tool class. Write-proposal tools must never be
+/// mislabeled as read-only / no-risk / no-approval: the whole point of the
+/// audit chain is that agent intent for a write is distinguishable from a
+/// read at a glance.
+struct AuditLabels {
+    event_type: &'static str,
+    read_only: bool,
+    approval: &'static str,
+    risk: &'static str,
 }
 
 impl McpAuditContext {
+    fn audit_labels(&self) -> AuditLabels {
+        match self.kind {
+            Some(ToolKind::OperationCancel) => AuditLabels {
+                event_type: "proposal_cancel",
+                read_only: false,
+                approval: "not_required",
+                risk: "none",
+            },
+            Some(kind) if is_write_handshake(kind) => AuditLabels {
+                event_type: "write_proposal",
+                read_only: false,
+                approval: "ui_handshake",
+                risk: operation_risk(kind),
+            },
+            Some(_) => AuditLabels {
+                event_type: "tool_call",
+                read_only: true,
+                approval: "not_required",
+                risk: "none",
+            },
+            // Unknown tool name: blocked before dispatch.
+            None => AuditLabels {
+                event_type: "write_block",
+                read_only: false,
+                approval: "denied",
+                risk: "none",
+            },
+        }
+    }
+
     fn from_params(params: &Value) -> Self {
         let tool = params
             .get("name")
@@ -943,7 +1039,7 @@ impl McpAuditContext {
                     .and_then(Value::as_str)
                     .map(|path| {
                         let fingerprint = arguments_fingerprint(&Value::String(path.to_string()))
-                            .unwrap_or_else(|| "fnv1a64:unavailable".into());
+                            .unwrap_or_else(|| "sha256:unavailable".into());
                         format!("repoPath:{fingerprint}")
                     })
             })
@@ -962,24 +1058,58 @@ impl McpAuditContext {
             .unwrap_or_else(|| "unknown".into());
         Self {
             args_fingerprint: arguments_fingerprint(arguments),
-            read_only_whitelisted: ToolKind::from_name(&tool).is_some(),
+            kind: ToolKind::from_name(&tool),
             tool,
             repo_scope,
         }
     }
 }
 
+/// Risk label of an approved write proposal, per operation type. Drives the
+/// audit `risk` field so operators can filter high-risk agent intent.
+fn operation_risk(kind: ToolKind) -> &'static str {
+    match kind {
+        // Reset and discard can destroy work (hard reset / working-tree loss).
+        ToolKind::OperationPreviewReset | ToolKind::OperationPreviewDiscard => "high",
+        // History rewrites, working-tree mutations and remote-ref mutations
+        // (push), but always behind a restore point and preview. Push with
+        // forceWithLease can rewrite the remote branch — the approval card
+        // renders it as HIGH risk at runtime; the static per-tool label stays
+        // medium because a plain push is a routine remote update.
+        ToolKind::OperationPreviewMerge
+        | ToolKind::OperationPreviewRebase
+        | ToolKind::OperationPreviewPatch
+        | ToolKind::OperationPreviewPlan
+        | ToolKind::OperationPreviewPush => "medium",
+        // Worktree/branch creation and committing staged work are
+        // non-destructive (they only add state, never rewrite or delete);
+        // cancel touches no repo state.
+        ToolKind::OperationPreviewWorktree
+        | ToolKind::OperationPreviewCommit
+        | ToolKind::OperationPreviewBranch => "low",
+        _ => "none",
+    }
+}
+
+/// SHA-256 fingerprint of the serialized tool arguments. The audit log never
+/// stores arguments verbatim; this hash lets identical calls be correlated
+/// without leaking paths or ref names. Labeled `sha256:` so verifiers know
+/// the algorithm (the pre-hardening `fnv1a64:` label is retired — FNV-1a is
+/// not collision-resistant and must not anchor an audit trail).
 fn arguments_fingerprint(arguments: &Value) -> Option<String> {
+    use sha2::{Digest, Sha256};
     if arguments.is_null() {
         return None;
     }
     let serialized = serde_json::to_vec(arguments).ok()?;
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in serialized {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    let digest = Sha256::digest(&serialized);
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{:02x}", byte);
     }
-    Some(format!("fnv1a64:{hash:016x}"))
+    Some(out)
 }
 
 fn render_local_tool_result(kind: ToolKind, arguments: &Value, repo_path: &Path) -> ToolCallResult {
@@ -1080,11 +1210,17 @@ fn local_tool_payload(
         | ToolKind::OperationPreviewReset
         | ToolKind::OperationPreviewPatch
         | ToolKind::OperationPreviewPlan
-        | ToolKind::OperationPreviewWorktree => {
-            // Write-handshake tools are short-circuited in handle_tools_call before
-            // reaching here. If execution gets here, something rerouted incorrectly.
+        | ToolKind::OperationPreviewWorktree
+        | ToolKind::OperationPreviewCommit
+        | ToolKind::OperationPreviewPush
+        | ToolKind::OperationPreviewBranch
+        | ToolKind::OperationStatus
+        | ToolKind::OperationCancel => {
+            // Handshake-bridge tools are short-circuited in handle_tools_call
+            // before reaching here. If execution gets here, something rerouted
+            // incorrectly.
             unreachable!(
-                "operation.preview.* must be short-circuited by handle_tools_call before local dispatch"
+                "operation.* handshake tools must be short-circuited by handle_tools_call before local dispatch"
             );
         }
     };
@@ -2940,10 +3076,27 @@ fn submodule_status_payload(repo_path: &Path) -> Result<Value, JsonRpcError> {
     }))
 }
 
+/// Default byte cap for `diff.text` output (64 KiB). A repo-wide diff can be
+/// hundreds of megabytes; dumping it uncapped floods the agent's context and
+/// can wedge the MCP host. Truncation mirrors conflict.read's pattern:
+/// explicit `truncated: true` plus the full `totalBytes`, never a silent cut.
+const DIFF_TEXT_DEFAULT_MAX_BYTES: u64 = 65_536;
+/// Hard ceiling for the `maxBytes` input (1 MiB).
+const DIFF_TEXT_MAX_MAX_BYTES: u64 = 1_048_576;
+
 fn diff_text_payload(repo_path: &Path, arguments: &Value) -> Result<Value, JsonRpcError> {
     let base = arguments.get("base").and_then(Value::as_str);
     let head = arguments.get("head").and_then(Value::as_str);
     let path_filter = diff_path_filter(arguments, repo_path);
+    let max_bytes = arguments
+        .get("maxBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DIFF_TEXT_DEFAULT_MAX_BYTES)
+        .clamp(1, DIFF_TEXT_MAX_MAX_BYTES) as usize;
+    let max_lines = arguments
+        .get("maxLines")
+        .and_then(Value::as_u64)
+        .map(|value| value.max(1) as usize);
 
     let mut args = vec!["diff"];
     if let Some(base) = base {
@@ -2957,13 +3110,69 @@ fn diff_text_payload(repo_path: &Path, arguments: &Value) -> Result<Value, JsonR
         args.push(path);
     }
 
+    let full = run_git(repo_path, &args)?;
+    let total_bytes = full.len();
+    let total_lines = full.lines().count();
+    let (diff, truncated) = truncate_diff_text(&full, max_bytes, max_lines);
+
     Ok(json!({
         "format": "text",
         "base": base,
         "head": head,
         "path": path_filter,
-        "diff": run_git(repo_path, &args)?,
+        "diff": diff,
+        "truncated": truncated,
+        "totalBytes": total_bytes,
+        "totalLines": total_lines,
+        "maxBytes": max_bytes,
     }))
+}
+
+/// Apply the optional line cap, then the byte cap, cutting on a line boundary
+/// so the agent never receives half a diff line. Returns the (possibly
+/// truncated) text and whether any truncation happened.
+fn truncate_diff_text(full: &str, max_bytes: usize, max_lines: Option<usize>) -> (String, bool) {
+    let mut text: &str = full;
+    let mut truncated = false;
+
+    if let Some(max_lines) = max_lines {
+        let mut seen = 0usize;
+        let mut cut = text.len();
+        for (index, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                seen += 1;
+                if seen == max_lines {
+                    cut = index + 1;
+                    break;
+                }
+            }
+        }
+        if cut < text.len() {
+            text = &text[..cut];
+            truncated = true;
+        }
+    }
+
+    if text.len() > max_bytes {
+        let bytes = text.as_bytes();
+        let cut = bytes[..max_bytes]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or_else(|| {
+                // No newline before the cap (one giant line): hard-cut at the
+                // nearest UTF-8 char boundary at or below the cap.
+                let mut boundary = max_bytes;
+                while boundary > 0 && !text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                boundary
+            });
+        text = &text[..cut];
+        truncated = true;
+    }
+
+    (text.to_string(), truncated)
 }
 
 fn semantic_fallback_payload(repo_path: &Path, arguments: &Value) -> Value {
@@ -3606,6 +3815,8 @@ impl ToolKind {
             "flux.latestRestorePoint" => Some(Self::FluxLatestRestorePoint),
             "flux.restorePoints" => Some(Self::FluxRestorePoints),
             "flux.restorePointDetails" => Some(Self::FluxRestorePointDetails),
+            "operation.status" => Some(Self::OperationStatus),
+            "operation.cancel" => Some(Self::OperationCancel),
             "operation.preview.merge" => Some(Self::OperationPreviewMerge),
             "operation.preview.rebase" => Some(Self::OperationPreviewRebase),
             "operation.preview.discard" => Some(Self::OperationPreviewDiscard),
@@ -3613,6 +3824,9 @@ impl ToolKind {
             "operation.preview.patch" => Some(Self::OperationPreviewPatch),
             "operation.preview.plan" => Some(Self::OperationPreviewPlan),
             "operation.preview.worktree" => Some(Self::OperationPreviewWorktree),
+            "operation.preview.commit" => Some(Self::OperationPreviewCommit),
+            "operation.preview.push" => Some(Self::OperationPreviewPush),
+            "operation.preview.branch" => Some(Self::OperationPreviewBranch),
             _ => None,
         }
     }
@@ -3628,6 +3842,7 @@ fn read_only_tools() -> Vec<ToolSpec> {
             input_schema: tool_input_schema(kind),
             annotations: Some(ToolAnnotations {
                 read_only_hint: true,
+                destructive_hint: None,
             }),
         })
         .collect()
@@ -3643,6 +3858,13 @@ fn write_handshake_tools() -> Vec<ToolSpec> {
             input_schema: tool_input_schema(kind),
             annotations: Some(ToolAnnotations {
                 read_only_hint: false,
+                // Reset and discard destroy work when approved; flag them so
+                // MCP hosts can require extra confirmation UI of their own.
+                destructive_hint: matches!(
+                    kind,
+                    ToolKind::OperationPreviewReset | ToolKind::OperationPreviewDiscard
+                )
+                .then_some(true),
             }),
         })
         .collect()
@@ -3664,6 +3886,14 @@ fn read_only_tool_names() -> Vec<&'static str> {
         .collect()
 }
 
+fn write_handshake_tool_names() -> Vec<&'static str> {
+    WRITE_HANDSHAKE_TOOL_KINDS
+        .iter()
+        .copied()
+        .map(ToolKind::as_str)
+        .collect()
+}
+
 fn tool_description(kind: ToolKind) -> &'static str {
     match kind {
         ToolKind::RepoBrief => {
@@ -3676,16 +3906,20 @@ fn tool_description(kind: ToolKind) -> &'static str {
             "Monorepo scoping: everything an agent needs about ONE subtree (e.g. packages/api) in a single read-only call — working-tree changes under the path, recent commits touching it, churn (commits and distinct authors over a window), and code owners from CODEOWNERS when present. Use it to work on a scoped task without paying for whole-repo context; pair with repo.brief for the repository-level picture."
         }
         ToolKind::SafetyTimeline => {
-            "List read-only Safety Timeline events synthesized from Flux restore points and reflog movement."
+            "List Safety Timeline events synthesized from FluxGit restore points and reflog movement — the repository's recoverability narrative. Use it for 'what happened and can we get it back?' questions; recovery itself always runs inside FluxGit with user approval. Returns ordered events with source (restore_point|reflog) and safe UI actions. Requires the FluxGit app."
         }
         ToolKind::SafetyEventDetails => {
-            "Read one Safety Timeline event and its safe UI actions without performing recovery or mutation."
+            "Read one Safety Timeline event in detail (or the latest when eventId is omitted) plus its safe UI actions, without performing any recovery or mutation. Use it to drill into an event surfaced by safety.timeline before explaining recovery options to the user. Requires the FluxGit app."
         }
         ToolKind::FleetRadar => {
-            "Summarize multiple local repositories into a read-only attention stack without fetching or mutating disk state."
+            "Summarize many local repositories into one read-only attention stack — dirty state, divergence and predictive conflict signals per repo — without fetching or mutating disk state. Use it for 'which repo needs me first?' across a fleet; it replaces opening each repo one by one. Returns prioritized entries plus an attentionStack of one-line summaries."
         }
-        ToolKind::RepoStatus => "Summarize repository cleanliness and divergence.",
-        ToolKind::RepoRefs => "List refs, remotes, tags, stashes, and HEAD.",
+        ToolKind::RepoStatus => {
+            "Summarize working-tree cleanliness and branch divergence: current branch, ahead/behind upstream and changed-file count in one compact snapshot. Use it as the cheap freshness check before recommending any operation (repo.brief gives the fuller session-start picture). Returns { branch, ahead, behind, clean, changedFiles }."
+        }
+        ToolKind::RepoRefs => {
+            "List local and remote branches, tags, stashes and where HEAD points. Use it to resolve exact ref names before proposing merges or rebases instead of guessing; it replaces git branch -a + git tag + git stash list. Returns grouped ref-name arrays."
+        }
         ToolKind::RepoBranchStack => {
             "Explain the current branch relationship to upstream, base candidates and related local branches without creating virtual branches."
         }
@@ -3696,23 +3930,43 @@ fn tool_description(kind: ToolKind) -> &'static str {
             "Read an ACTIVE merge/rebase/cherry-pick conflict as structured data instead of raw <<<<<<< markers: the in-progress operation, the two producing commits (ours/theirs with sha and subject), and per conflicted file its stage classification (both-modified, deleted-by-them, ...), the base/ours/theirs blob contents (size-capped with explicit truncated flags; binary blobs are flagged, never dumped) and the marker region line ranges from the working tree. Call it when repo.brief reports an in-progress operation or git output shows conflict markers — it replaces hand-parsing marker soup. Returns { inConflict: false } when nothing is in progress (use repo.conflictPreflight to PREDICT conflicts instead). Propose resolutions via operation.preview.patch for user approval in FluxGit — never write conflicted files directly."
         }
         ToolKind::RepoReflog => {
-            "Read the local reflog movement timeline for HEAD or another ref without recovering or mutating history."
+            "Read the local reflog movement timeline for HEAD or another ref — every commit the ref recently pointed at, with per-entry old/new commits. Use it for lost-commit and 'what did that operation actually do?' questions; recovery actions themselves go through FluxGit approval flows, never MCP. Returns up to 100 entries (limit clamps at 100)."
         }
-        ToolKind::RepoHistory => "Return paged repository history.",
-        ToolKind::CommitDetails => "Inspect commit metadata and changed files.",
-        ToolKind::WorktreeChanges => "Summarize staged, unstaged, and untracked worktree changes.",
-        ToolKind::SubmoduleStatus => "Inspect submodule state and dirtiness.",
-        ToolKind::DiffText => "Return the standard text diff payload.",
-        ToolKind::DiffSemantic => "Return the semantic diff payload or fallback metadata.",
-        ToolKind::DiffSemanticFallbacks => "List files that fell back from semantic diff.",
+        ToolKind::RepoHistory => {
+            "Return paged commit history (newest first) with hash, author and subject per commit. Use it to walk history incrementally instead of dumping the whole log; limit clamps at 200 and the returned nextCursor continues where the page ended."
+        }
+        ToolKind::CommitDetails => {
+            "Inspect one commit: full metadata (author, timestamp, parents, message) plus its changed files with status letters. Use it after repo.history when you need what a specific commit touched; it replaces git show --stat. Requires the commit hash or ref."
+        }
+        ToolKind::WorktreeChanges => {
+            "Summarize the working tree as staged, unstaged and untracked path lists with two-letter status codes. Use it to see exactly what would be committed or lost before proposing commits, patches or discards; it replaces parsing git status --porcelain by hand."
+        }
+        ToolKind::SubmoduleStatus => {
+            "List submodules recursively with their pinned commit and drift state. Use it before recommending operations in repos that vendor submodules — drifted or uninitialized submodules are a common source of surprise diffs. Returns one entry per submodule with state flag, commit and path."
+        }
+        ToolKind::DiffText => {
+            "Return the standard unified text diff between two refs (or against the working tree), optionally scoped to one path. Output is byte-capped (default 64 KiB, truncation on a line boundary reported via truncated:true plus totalBytes/totalLines) so a huge diff cannot flood the agent context; raise maxBytes (max 1 MiB) or set maxLines only when needed."
+        }
+        ToolKind::DiffSemantic => {
+            "Request a semantic (symbol-level) diff under a strict honesty contract: trust the payload only when data.supported is exactly true. Without the FluxGit semantic engine it returns supported:false plus ready-to-use textDiffArguments for a diff.text fallback — never present a text diff as semantic."
+        }
+        ToolKind::DiffSemanticFallbacks => {
+            "List which paths fell back from semantic to text diff and why. Use it after diff.semantic when reporting to the user which files got a real semantic explanation and which only got the text fallback. Returns one fallback record per affected path."
+        }
         ToolKind::FluxLatestRestorePoint => {
-            "Read the latest Flux history restore point metadata, if available."
+            "Read the newest FluxGit restore point (before/after commits, canUndo/canRedo eligibility) for a repository. Use it to tell the user whether the last risky operation is reversible; undo/redo itself requires explicit approval inside FluxGit and is never exposed through MCP. Requires the FluxGit app."
         }
         ToolKind::FluxRestorePoints => {
-            "Read available Flux history restore point metadata without performing undo/redo."
+            "List FluxGit restore point metadata for a repository without performing any recovery. Use it to explain what recovery options exist before recommending the user act inside FluxGit; limit clamps at 200. Requires the FluxGit app."
         }
         ToolKind::FluxRestorePointDetails => {
-            "Read Flux history restore point details and safety state without performing undo/redo."
+            "Read one FluxGit restore point in detail: before/after commits, branch ref, undo/redo eligibility and checkpoint metadata. Use it when the user asks exactly what a restore would do; the restore itself requires approval inside FluxGit. Requires the FluxGit app."
+        }
+        ToolKind::OperationStatus => {
+            "Check the current status of a previously proposed operation by previewId: pending, approved, completed (with the execution result), failed, rejected (with the human's reason), expired or cancelled. Use it whenever a preview call returned error 10003 after its polling window — the proposal stays open in FluxGit for up to 5 minutes, so the user may still approve after your call stopped waiting. Read-only; requires the FluxGit desktop app connection (FLUXGIT_MCP_HANDSHAKE_ADDR)."
+        }
+        ToolKind::OperationCancel => {
+            "Withdraw one of YOUR OWN still-pending operation proposals by previewId before the user decides. Use it when your plan changed and the approval card is now stale, so the user cannot approve an operation you no longer want. It only cancels proposals created by this agent, only while pending, and never touches the repository. Requires the FluxGit desktop app connection (FLUXGIT_MCP_HANDSHAKE_ADDR)."
         }
         ToolKind::OperationPreviewMerge => {
             "Propose a merge for human review inside FluxGit. The sidecar never merges; FluxGit opens a preview, the user approves or rejects, and FluxGit executes through its safety pipeline. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); the call returns the preview outcome (approved, rejected or timed out). Without the app it returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog. On completion the result includes the captured restore point (beforeCommit/afterCommit/canUndo) when one was created — tell the user the change is reversible from FluxGit Safety Timeline."
@@ -3735,12 +3989,44 @@ fn tool_description(kind: ToolKind) -> &'static str {
         ToolKind::OperationPreviewWorktree => {
             "Propose creating an isolated git worktree for a parallel task BEFORE you start changing files, so your work happens in its own checkout instead of disturbing the user's current one. Use this at the start of a task that needs its own branch (e.g. 'fix the flaky test' or 'try an alternative refactor') so you can edit, build and commit without touching the main working tree. Provide `branch` (a new or existing branch name to check out in the worktree) and a clear `reason`; `path` is optional — omit it and FluxGit picks a sane default location next to the repo. Creating a worktree is non-destructive: it never rewrites history and never deletes files, it just adds a second checkout. The sidecar never creates the worktree itself; FluxGit opens an approval card, the user approves or rejects, and FluxGit creates it through its normal pipeline. On completion the result includes the created worktree's path so you can switch your work there. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
         }
+        ToolKind::OperationPreviewCommit => {
+            "Propose a commit for human review inside FluxGit — the most frequent write in a coding session. Provide `message` (subject line first; an optional body follows after a blank line) and a clear `reason` the user reads in the approval card. Optionally provide `paths` (files FluxGit stages before committing) or set `stageAll: true` (stage every unstaged change); omit both to commit exactly what is already staged. Amending is NOT supported through this tool — it rewrites history; ask the user to amend inside FluxGit instead. Committing is non-destructive: it only adds a commit and never rewrites or deletes existing work. The sidecar never commits itself; FluxGit stages and commits through its normal pipeline (hooks, signing and commit policy included) after the user approves. On completion the result includes the new commit SHA. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
+        }
+        ToolKind::OperationPreviewPush => {
+            "Propose pushing a branch to a remote for human review inside FluxGit. Defaults: `remote` 'origin', `branch` the currently checked-out branch. Set `setUpstream: true` when publishing a branch that has no upstream yet. `forceWithLease: true` requests a --force-with-lease push — FluxGit renders the approval card as HIGH risk with an explicit force warning, exactly like its own push dialog; use it only when you intentionally need to rewrite the remote branch. The sidecar never pushes itself; FluxGit executes the push through its guarded pipeline (credential handling and recovery flows included) after the user approves. On completion the result includes the pushed ref and remote. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
+        }
+        ToolKind::OperationPreviewBranch => {
+            "Propose creating a local branch for human review inside FluxGit. Provide `name` (the new branch) and a clear `reason`; `startPoint` defaults to HEAD and `checkout: true` (the default) also checks the new branch out after creating it. Creating a branch is non-destructive: it adds a ref and never rewrites history or deletes files. The sidecar never creates the branch itself; FluxGit creates (and optionally checks out) the branch through its normal pipeline after the user approves. On completion the result includes the branch name and whether it was checked out. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
+        }
     }
 }
 
 fn tool_input_schema(kind: ToolKind) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
+
+    // operation.status / operation.cancel address an existing proposal on the
+    // gateway handshake bridge — they take a previewId, never a repoPath.
+    if matches!(kind, ToolKind::OperationStatus | ToolKind::OperationCancel) {
+        let description = if kind == ToolKind::OperationStatus {
+            "The previewId returned by an operation.preview.* call (also included in error 10003 timeout payloads)."
+        } else {
+            "The previewId of a still-pending proposal created by this agent. Only the proposing agent can cancel it."
+        };
+        properties.insert(
+            "previewId".into(),
+            json!({
+                "type": "string",
+                "description": description,
+            }),
+        );
+        return json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["previewId"],
+            "additionalProperties": true,
+        });
+    }
 
     if kind == ToolKind::FleetRadar {
         properties.insert(
@@ -3947,7 +4233,16 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             );
         }
         ToolKind::RepoHistory => {
-            properties.insert("limit".into(), json!({ "type": "integer", "minimum": 1 }));
+            properties.insert(
+                "limit".into(),
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
+                    "description": "Commits per page. Values above 200 are clamped to 200."
+                }),
+            );
             properties.insert("cursor".into(), json!({ "type": "string" }));
         }
         ToolKind::CommitDetails => {
@@ -3957,7 +4252,30 @@ fn tool_input_schema(kind: ToolKind) -> Value {
         ToolKind::SubmoduleStatus => {
             properties.insert("path".into(), json!({ "type": "string" }));
         }
-        ToolKind::DiffText | ToolKind::DiffSemantic | ToolKind::DiffSemanticFallbacks => {
+        ToolKind::DiffText => {
+            properties.insert("base".into(), json!({ "type": "string" }));
+            properties.insert("head".into(), json!({ "type": "string" }));
+            properties.insert("path".into(), json!({ "type": "string" }));
+            properties.insert(
+                "maxBytes".into(),
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": DIFF_TEXT_MAX_MAX_BYTES,
+                    "default": DIFF_TEXT_DEFAULT_MAX_BYTES,
+                    "description": "Byte cap on the returned diff text. Truncation happens on a line boundary and is reported honestly via truncated:true plus totalBytes/totalLines — the diff is never silently cut."
+                }),
+            );
+            properties.insert(
+                "maxLines".into(),
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional line cap applied before the byte cap. Useful for a quick skim of a large diff."
+                }),
+            );
+        }
+        ToolKind::DiffSemantic | ToolKind::DiffSemanticFallbacks => {
             properties.insert("base".into(), json!({ "type": "string" }));
             properties.insert("head".into(), json!({ "type": "string" }));
             properties.insert("path".into(), json!({ "type": "string" }));
@@ -3967,7 +4285,16 @@ fn tool_input_schema(kind: ToolKind) -> Value {
         }
         ToolKind::FluxRestorePoints => {
             properties.insert("runDir".into(), json!({ "type": "string" }));
-            properties.insert("limit".into(), json!({ "type": "integer", "minimum": 1 }));
+            properties.insert(
+                "limit".into(),
+                json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
+                    "description": "Restore points to return. Values above 200 are clamped to 200."
+                }),
+            );
         }
         ToolKind::FluxRestorePointDetails => {
             properties.insert("runDir".into(), json!({ "type": "string" }));
@@ -4187,6 +4514,121 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             required.push("branch");
             required.push("reason");
         }
+        ToolKind::OperationPreviewCommit => {
+            properties.insert(
+                "message".into(),
+                json!({
+                    "type": "string",
+                    "description": "Commit message. The first line is the subject; an optional body follows after a blank line."
+                }),
+            );
+            properties.insert(
+                "paths".into(),
+                json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional paths FluxGit stages before committing. Omit (or pass an empty array) to commit exactly what is already staged."
+                }),
+            );
+            properties.insert(
+                "stageAll".into(),
+                json!({
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, FluxGit stages every unstaged working-tree change before committing. Ignored when `paths` is provided."
+                }),
+            );
+            properties.insert(
+                "reason".into(),
+                json!({
+                    "type": "string",
+                    "description": "Why this commit should be created. Shown to the user in the approval modal."
+                }),
+            );
+            // Honest schema note: amend is intentionally NOT an input. Amending
+            // rewrites history and is out of scope for this proposal; the user
+            // amends inside FluxGit when needed.
+            required.push("message");
+            required.push("reason");
+        }
+        ToolKind::OperationPreviewPush => {
+            properties.insert(
+                "remote".into(),
+                json!({
+                    "type": "string",
+                    "default": "origin",
+                    "description": "Remote to push to. Defaults to 'origin'."
+                }),
+            );
+            properties.insert(
+                "branch".into(),
+                json!({
+                    "type": "string",
+                    "description": "Branch to push. Defaults to the currently checked-out branch."
+                }),
+            );
+            properties.insert(
+                "setUpstream".into(),
+                json!({
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, FluxGit pushes with --set-upstream so the branch tracks the remote branch afterwards."
+                }),
+            );
+            properties.insert(
+                "forceWithLease".into(),
+                json!({
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, FluxGit pushes with --force-with-lease. The approval card shows a HIGH risk force warning; use only when intentionally rewriting the remote branch."
+                }),
+            );
+            properties.insert(
+                "reason".into(),
+                json!({
+                    "type": "string",
+                    "description": "Why this push should happen. Shown to the user in the approval modal."
+                }),
+            );
+            required.push("reason");
+        }
+        ToolKind::OperationPreviewBranch => {
+            properties.insert(
+                "name".into(),
+                json!({
+                    "type": "string",
+                    "description": "Name of the branch to create."
+                }),
+            );
+            properties.insert(
+                "startPoint".into(),
+                json!({
+                    "type": "string",
+                    "default": "HEAD",
+                    "description": "Commit or ref the new branch starts from. Defaults to HEAD."
+                }),
+            );
+            properties.insert(
+                "checkout".into(),
+                json!({
+                    "type": "boolean",
+                    "default": true,
+                    "description": "If true (the default), FluxGit checks the new branch out after creating it."
+                }),
+            );
+            properties.insert(
+                "reason".into(),
+                json!({
+                    "type": "string",
+                    "description": "Why this branch should be created. Shown to the user in the approval modal."
+                }),
+            );
+            required.push("name");
+            required.push("reason");
+        }
+        ToolKind::OperationStatus | ToolKind::OperationCancel => {
+            unreachable!("operation.status/operation.cancel use the early previewId-only schema")
+        }
     }
 
     json!({
@@ -4216,13 +4658,28 @@ fn gateway_not_configured_error(tool: &str) -> JsonRpcError {
 fn gateway_unavailable_error(tool: &str) -> JsonRpcError {
     JsonRpcError {
         code: 10002,
-        message: "Gateway transport is not wired yet".into(),
+        message: "FluxGit gateway is configured but this call had nothing to serve it with".into(),
         data: Some(json!({
             "tool": tool,
             "gatewayConfigured": true,
-            "reason": "The first sidecar milestone only exposes MCP discovery and structured failures."
+            "reason": "The sidecar could not produce this payload: no absolute repoPath argument was provided for the local read-only fallback, and the configured FluxGit gateway did not serve the request.",
+            "agentRecommendation": "Retry the call with an absolute `repoPath` argument (the local read-only fallback works for every free-shell tool). If the tool requires FluxGit context, ask the user to confirm the FluxGit app is running and reachable at FLUXGIT_GATEWAY_ADDR.",
+            "learnMore": "https://fluxgit.com/features/mcp-agent-git/"
         })),
     }
+}
+
+/// Resolve the gateway handshake address per PLAYBOOK §14.2:
+/// `FLUXGIT_MCP_HANDSHAKE_ADDR` first, `FLUXGIT_GATEWAY_ADDR` as fallback.
+fn resolve_handshake_addr() -> Option<String> {
+    env::var("FLUXGIT_MCP_HANDSHAKE_ADDR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("FLUXGIT_GATEWAY_ADDR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 /// Dispatch any of the five `operation.preview.*` write-handshake requests through
@@ -4263,11 +4720,28 @@ fn dispatch_operation_preview_request(
         Err(_) => return None,
     };
     if !post_response.status().is_success() {
+        // The gateway answered but refused the proposal (policy 403, pending
+        // cap 429, validation 422, ...). Relay the structured, self-guiding
+        // body to the agent instead of collapsing it into the generic 10003.
+        let http_status = post_response.status().as_u16();
+        if let Ok(body) = post_response.json::<Value>() {
+            if body.get("error").is_some() {
+                return Some(operation_preview_gateway_refusal_result(
+                    tool_name,
+                    preview_id,
+                    http_status,
+                    &body,
+                ));
+            }
+        }
         return None;
     }
 
-    // Poll status every 1 second for up to 60 seconds, returning the first terminal
-    // outcome we see. `pending` keeps us polling; everything else stops.
+    // Poll status every 1 second, up to 60 polls while the proposal is
+    // pending. `approved` is PROGRESS, not a terminal state: the UI sets
+    // approved, executes the git operation, then reports completed/failed.
+    // The first pending→approved transition therefore extends the poll
+    // budget once (up to 60 more polls) so execution has time to finish.
     let poll_client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -4275,25 +4749,34 @@ fn dispatch_operation_preview_request(
         Ok(client) => client,
         Err(_) => return None,
     };
-    let max_polls = 60;
-    let mut last_status: Option<Value> = None;
+    let initial_polls = 60usize;
+    let approved_extension = 60usize;
+    let mut max_polls = initial_polls;
+    let mut budget_extended = false;
     let mut last_status_label = String::from("pending");
-    for attempt in 0..max_polls {
+    let mut attempt = 0usize;
+    while attempt < max_polls {
+        attempt += 1;
+        let sleep_if_more = |attempt: usize, max_polls: usize| {
+            if attempt < max_polls {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        };
         let response = match poll_client.get(&status_url).send() {
             Ok(response) => response,
             Err(_) => {
-                std::thread::sleep(Duration::from_secs(1));
+                sleep_if_more(attempt, max_polls);
                 continue;
             }
         };
         if !response.status().is_success() {
-            std::thread::sleep(Duration::from_secs(1));
+            sleep_if_more(attempt, max_polls);
             continue;
         }
         let parsed: Value = match response.json() {
             Ok(value) => value,
             Err(_) => {
-                std::thread::sleep(Duration::from_secs(1));
+                sleep_if_more(attempt, max_polls);
                 continue;
             }
         };
@@ -4302,7 +4785,6 @@ fn dispatch_operation_preview_request(
             .and_then(Value::as_str)
             .unwrap_or("pending")
             .to_string();
-        last_status = Some(parsed.clone());
         last_status_label = status_label.clone();
         match status_label.as_str() {
             "completed" => {
@@ -4310,7 +4792,7 @@ fn dispatch_operation_preview_request(
                     tool_name, preview_id, &parsed,
                 ));
             }
-            "approved" | "rejected" | "failed" | "expired" => {
+            "rejected" | "failed" | "expired" | "cancelled" => {
                 return Some(operation_preview_terminal_error_result(
                     tool_name,
                     op_path_suffix,
@@ -4319,20 +4801,31 @@ fn dispatch_operation_preview_request(
                     &parsed,
                 ));
             }
+            "approved" => {
+                // Execution has started. Extend the budget exactly once.
+                if !budget_extended {
+                    max_polls = attempt + approved_extension;
+                    budget_extended = true;
+                }
+                sleep_if_more(attempt, max_polls);
+            }
             _ => {
                 // pending or unknown — keep polling unless this was the last attempt.
-                if attempt + 1 < max_polls {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+                sleep_if_more(attempt, max_polls);
             }
         }
     }
 
-    // Polling timed out without a terminal status — fall back to write_handshake_pending
-    // so the agent gets the existing, well-known error contract instead of an opaque
-    // success. The caller turns `None` into the standard 10003 error.
-    let _ = (last_status, last_status_label);
-    None
+    // Polling stopped without a terminal status. The proposal is still open in
+    // FluxGit (5-minute TTL): tell the agent HOW to learn the real outcome
+    // (operation.status) instead of reporting an opaque failure for an
+    // operation the human may yet approve and complete.
+    Some(operation_preview_timeout_result(
+        tool_name,
+        op_path_suffix,
+        preview_id,
+        &last_status_label,
+    ))
 }
 
 /// Build the merge body and dispatch (PLAYBOOK §14.3).
@@ -4372,6 +4865,7 @@ fn dispatch_operation_preview_merge(
     let body = json!({
         "previewId": preview_id,
         "agentId": "external-mcp-sidecar",
+        "operationType": "merge",
         "repoPath": repo_path,
         "sourceRef": source_ref,
         "targetRef": target_ref,
@@ -4680,6 +5174,186 @@ fn dispatch_operation_preview_worktree(
     )
 }
 
+/// Build the commit body and dispatch (PLAYBOOK §14.7). `paths` is optional:
+/// when the agent omits it the field is left out of the body and FluxGit
+/// commits exactly what is already staged (or everything unstaged when
+/// `stageAll` is true). Amend is intentionally not supported.
+fn dispatch_operation_preview_commit(
+    gateway_addr: &str,
+    arguments: &Value,
+) -> Option<ToolCallResult> {
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let repo_path = arguments
+        .get("repoPath")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let message = arguments
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let paths: Option<Vec<String>> = arguments.get("paths").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
+    });
+    let stage_all = arguments
+        .get("stageAll")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reason = arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requested_at = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let mut body = json!({
+        "previewId": preview_id,
+        "agentId": "external-mcp-sidecar",
+        "operationType": "commit",
+        "repoPath": repo_path,
+        "message": message,
+        "stageAll": stage_all,
+        "reason": reason,
+        "requestedAt": requested_at,
+    });
+    if let Some(paths) = paths {
+        body["paths"] = json!(paths);
+    }
+
+    dispatch_operation_preview_request(
+        ToolKind::OperationPreviewCommit.as_str(),
+        "commit",
+        gateway_addr,
+        &preview_id,
+        &body,
+    )
+}
+
+/// Build the push body and dispatch (PLAYBOOK §14.7). `remote` defaults to
+/// "origin"; `branch` is optional (omitted → FluxGit pushes the currently
+/// checked-out branch). `forceWithLease: true` renders a HIGH risk card.
+fn dispatch_operation_preview_push(
+    gateway_addr: &str,
+    arguments: &Value,
+) -> Option<ToolCallResult> {
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let repo_path = arguments
+        .get("repoPath")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let remote = arguments
+        .get("remote")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("origin")
+        .to_string();
+    let branch = arguments
+        .get("branch")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    let set_upstream = arguments
+        .get("setUpstream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let force_with_lease = arguments
+        .get("forceWithLease")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reason = arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requested_at = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let mut body = json!({
+        "previewId": preview_id,
+        "agentId": "external-mcp-sidecar",
+        "operationType": "push",
+        "repoPath": repo_path,
+        "remote": remote,
+        "setUpstream": set_upstream,
+        "forceWithLease": force_with_lease,
+        "reason": reason,
+        "requestedAt": requested_at,
+    });
+    if let Some(branch) = branch {
+        body["branch"] = Value::String(branch);
+    }
+
+    dispatch_operation_preview_request(
+        ToolKind::OperationPreviewPush.as_str(),
+        "push",
+        gateway_addr,
+        &preview_id,
+        &body,
+    )
+}
+
+/// Build the branch-create body and dispatch (PLAYBOOK §14.7). `startPoint`
+/// is optional (omitted → HEAD); `checkout` defaults to true.
+fn dispatch_operation_preview_branch(
+    gateway_addr: &str,
+    arguments: &Value,
+) -> Option<ToolCallResult> {
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let repo_path = arguments
+        .get("repoPath")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let name = arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let start_point = arguments
+        .get("startPoint")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    let checkout = arguments
+        .get("checkout")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let reason = arguments
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let requested_at = chrono::Utc::now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let mut body = json!({
+        "previewId": preview_id,
+        "agentId": "external-mcp-sidecar",
+        "operationType": "branch",
+        "repoPath": repo_path,
+        "name": name,
+        "checkout": checkout,
+        "reason": reason,
+        "requestedAt": requested_at,
+    });
+    if let Some(start_point) = start_point {
+        body["startPoint"] = Value::String(start_point);
+    }
+
+    dispatch_operation_preview_request(
+        ToolKind::OperationPreviewBranch.as_str(),
+        "branch",
+        gateway_addr,
+        &preview_id,
+        &body,
+    )
+}
+
 fn operation_preview_success_result(
     tool_name: &'static str,
     preview_id: &str,
@@ -4719,9 +5393,7 @@ fn operation_preview_terminal_error_result(
         "rejected" => format!("User rejected the {op_label} preview inside FluxGit."),
         "failed" => format!("FluxGit reported that the {op_label} preview failed."),
         "expired" => format!("The {op_label} preview expired before the user approved it."),
-        "approved" => format!(
-            "FluxGit approved the {op_label} but execution did not reach a completed state."
-        ),
+        "cancelled" => format!("The {op_label} proposal was cancelled before a decision."),
         _ => format!(
             "FluxGit returned a non-terminal status before completing the {op_label}."
         ),
@@ -4755,6 +5427,222 @@ fn operation_preview_terminal_error_result(
         }],
         is_error: true,
     }
+}
+
+/// Poll budget exhausted without a terminal status. This is NOT a lost
+/// outcome: the proposal lives for 5 minutes on the gateway and the agent
+/// can (and should) keep checking with `operation.status`.
+fn operation_preview_timeout_result(
+    tool_name: &'static str,
+    op_label: &str,
+    preview_id: &str,
+    last_status: &str,
+) -> ToolCallResult {
+    let payload = json!({
+        "tool": tool_name,
+        "readOnly": false,
+        "source": "fluxgit-app",
+        "tier": "fluxgit-write-handshake",
+        "previewId": preview_id,
+        "status": last_status,
+        "error": {
+            "code": 10003,
+            "message": format!(
+                "The {op_label} proposal did not reach a decision before the sidecar stopped polling."
+            ),
+            "data": {
+                "previewId": preview_id,
+                "lastStatus": last_status,
+                "reason": "The proposal is still open inside FluxGit (proposals live for 5 minutes). The human may still approve it and FluxGit will execute it — this timeout does NOT mean the operation failed.",
+                "agentRecommendation": format!(
+                    "Poll operation.status with previewId '{preview_id}' to learn the real outcome before telling the user anything, or call operation.cancel with the same previewId to withdraw the proposal if it is no longer wanted."
+                ),
+            }
+        }
+    });
+    text_tool_result(payload, true)
+}
+
+/// The gateway answered the preview POST with a structured refusal
+/// (agent policy 403, per-agent pending cap 429, validation 422, ...).
+/// Relay it so the agent sees the gateway's own self-guiding message.
+fn operation_preview_gateway_refusal_result(
+    tool_name: &'static str,
+    preview_id: &str,
+    http_status: u16,
+    gateway_body: &Value,
+) -> ToolCallResult {
+    let payload = json!({
+        "tool": tool_name,
+        "readOnly": false,
+        "source": "fluxgit-app",
+        "tier": "fluxgit-write-handshake",
+        "previewId": preview_id,
+        "status": "refused",
+        "error": {
+            "code": 10006,
+            "message": "FluxGit's gateway refused the proposal before opening an approval card.",
+            "data": {
+                "httpStatus": http_status,
+                "gateway": gateway_body,
+            }
+        }
+    });
+    text_tool_result(payload, true)
+}
+
+/// `operation.status` — read-only lookup of a proposal's lifecycle through
+/// the gateway handshake bridge (PLAYBOOK §10.6).
+fn operation_status_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonRpcError> {
+    let preview_id = arguments
+        .get("previewId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid_params_error("missing previewId"))?;
+    let Some(addr) = resolve_handshake_addr() else {
+        return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true));
+    };
+    let base = format!("http://{}", addr.trim_end_matches('/'));
+    let status_url = format!("{}/v1/mcp/operation/status/{}", base, preview_id);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true)),
+    };
+    let response = match client.get(&status_url).send() {
+        Ok(response) => response,
+        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true)),
+    };
+    if response.status().as_u16() == 404 {
+        return Ok(preview_not_found_result(ToolKind::OperationStatus, preview_id, true));
+    }
+    if !response.status().is_success() {
+        return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true));
+    }
+    let body: Value = match response.json() {
+        Ok(value) => value,
+        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true)),
+    };
+    Ok(text_tool_result(
+        json!({
+            "tool": ToolKind::OperationStatus.as_str(),
+            "readOnly": true,
+            "source": "fluxgit-app",
+            "tier": "fluxgit-write-handshake",
+            "previewId": preview_id,
+            "data": body,
+        }),
+        false,
+    ))
+}
+
+/// `operation.cancel` — withdraw one of this agent's own pending proposals.
+fn operation_cancel_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonRpcError> {
+    let preview_id = arguments
+        .get("previewId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid_params_error("missing previewId"))?;
+    let Some(addr) = resolve_handshake_addr() else {
+        return Ok(handshake_unreachable_result(ToolKind::OperationCancel, false));
+    };
+    let base = format!("http://{}", addr.trim_end_matches('/'));
+    let cancel_url = format!("{}/v1/mcp/operation/cancel/{}", base, preview_id);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationCancel, false)),
+    };
+    let response = match client
+        .post(&cancel_url)
+        .json(&json!({ "agentId": "external-mcp-sidecar" }))
+        .send()
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationCancel, false)),
+    };
+    let http_status = response.status().as_u16();
+    if http_status == 404 {
+        return Ok(preview_not_found_result(ToolKind::OperationCancel, preview_id, false));
+    }
+    let body: Value = response.json().unwrap_or(Value::Null);
+    if !(200..300).contains(&http_status) {
+        // 403 (not this agent's proposal) or 409 (already decided/expired).
+        return Ok(text_tool_result(
+            json!({
+                "tool": ToolKind::OperationCancel.as_str(),
+                "readOnly": false,
+                "source": "fluxgit-app",
+                "tier": "fluxgit-write-handshake",
+                "previewId": preview_id,
+                "error": {
+                    "code": 10006,
+                    "message": "FluxGit's gateway refused to cancel this proposal.",
+                    "data": {
+                        "httpStatus": http_status,
+                        "previewId": preview_id,
+                        "gateway": body,
+                        "agentRecommendation": "Only the proposing agent can cancel, and only while the proposal is still pending. Poll operation.status with this previewId to learn its current state.",
+                    }
+                }
+            }),
+            true,
+        ));
+    }
+    Ok(text_tool_result(
+        json!({
+            "tool": ToolKind::OperationCancel.as_str(),
+            "readOnly": false,
+            "source": "fluxgit-app",
+            "tier": "fluxgit-write-handshake",
+            "previewId": preview_id,
+            "status": "cancelled",
+            "data": body,
+        }),
+        false,
+    ))
+}
+
+/// Shared "the handshake bridge is not reachable" result for
+/// operation.status / operation.cancel, reusing the well-known 10003 error.
+fn handshake_unreachable_result(kind: ToolKind, read_only: bool) -> ToolCallResult {
+    let error = write_handshake_pending_error(kind.as_str());
+    text_tool_result(
+        json!({
+            "error": error,
+            "tool": kind.as_str(),
+            "readOnly": read_only,
+            "tier": "fluxgit-write-handshake",
+        }),
+        true,
+    )
+}
+
+/// The gateway does not know this previewId (proposals are in-memory with a
+/// 5-minute TTL; a gateway restart also forgets them). Honest absence.
+fn preview_not_found_result(kind: ToolKind, preview_id: &str, read_only: bool) -> ToolCallResult {
+    text_tool_result(
+        json!({
+            "tool": kind.as_str(),
+            "readOnly": read_only,
+            "tier": "fluxgit-write-handshake",
+            "previewId": preview_id,
+            "error": {
+                "code": 10005,
+                "message": format!("No proposal with previewId '{preview_id}' exists on the gateway."),
+                "data": {
+                    "previewId": preview_id,
+                    "reason": "Proposals are kept in memory on the FluxGit gateway. They disappear after the FluxGit app restarts; expired/decided proposals are still queryable until then.",
+                    "agentRecommendation": "Double-check the previewId. If FluxGit restarted, re-propose the operation with a fresh operation.preview.* call.",
+                }
+            }
+        }),
+        true,
+    )
 }
 
 /// Error returned for write-with-UI-handshake tools (PLAYBOOK §10) that are
@@ -5019,6 +5907,9 @@ mod tests {
                 "flux.latestRestorePoint",
                 "flux.restorePoints",
                 "flux.restorePointDetails",
+                // operation.status is read-only: it inspects a proposal's
+                // lifecycle over the handshake bridge, mutating nothing.
+                "operation.status",
                 // Write-with-UI-handshake tools (PLAYBOOK §10) — advertised so agents
                 // can discover the contract, but actually executed only via FluxGit UI
                 // approval. All annotated readOnlyHint: false.
@@ -5029,10 +5920,29 @@ mod tests {
                 "operation.preview.patch",
                 "operation.preview.plan",
                 "operation.preview.worktree",
+                "operation.preview.commit",
+                "operation.preview.push",
+                "operation.preview.branch",
+                // Write-adjacent: cancels this agent's own pending proposal.
+                "operation.cancel",
             ]
         );
 
-        // Verify all 7 write-handshake tools advertise readOnlyHint: false.
+        // Advertisement counts pinned: 23 read-only + 11 write-handshake = 34
+        // (docs count them as 24 read incl. operation.status/operation.cancel
+        // + 10 operation.preview.* write proposals — same 34 tools).
+        assert_eq!(tools.len(), 34, "34 tools must be advertised");
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["annotations"]["readOnlyHint"] == true)
+                .count(),
+            23,
+            "exactly 23 tools must advertise readOnlyHint: true"
+        );
+
+        // Verify all 11 write-handshake tools advertise readOnlyHint: false
+        // (10 operation.preview.* proposals + the write-adjacent cancel).
         for handshake_name in [
             "operation.preview.merge",
             "operation.preview.rebase",
@@ -5041,6 +5951,10 @@ mod tests {
             "operation.preview.patch",
             "operation.preview.plan",
             "operation.preview.worktree",
+            "operation.preview.commit",
+            "operation.preview.push",
+            "operation.preview.branch",
+            "operation.cancel",
         ] {
             let tool = tools
                 .iter()
@@ -5067,19 +5981,65 @@ mod tests {
             );
         }
         // Read-only tools must advertise readOnlyHint: true. Write-handshake tools
-        // (operation.preview.*) honestly advertise readOnlyHint: false — they're
-        // write proposals, even though the sidecar never performs the write itself.
+        // (operation.preview.* and operation.cancel) honestly advertise
+        // readOnlyHint: false — they're write proposals / proposal mutations,
+        // even though the sidecar never performs the write itself.
         assert!(tools
             .iter()
-            .filter(|tool| !tool["name"].as_str().unwrap_or_default().starts_with("operation.preview."))
+            .filter(|tool| !tool["name"].as_str().unwrap_or_default().starts_with("operation."))
             .all(|tool| tool["annotations"]["readOnlyHint"] == true));
         assert!(tools
             .iter()
-            .filter(|tool| !tool["name"].as_str().unwrap_or_default().starts_with("operation.preview."))
+            .filter(|tool| !tool["name"].as_str().unwrap_or_default().starts_with("operation."))
             .filter(|tool| tool["name"] != "fleet.radar")
             .all(|tool| tool["inputSchema"]["required"]
                 .as_array()
                 .is_some_and(|required| required.iter().any(|item| item == "repoPath"))));
+
+        // operation.status: read-only, keyed by previewId (no repoPath).
+        let status_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "operation.status")
+            .expect("operation.status must be advertised");
+        assert_eq!(status_tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            status_tool["inputSchema"]["required"],
+            json!(["previewId"]),
+            "operation.status requires exactly previewId"
+        );
+
+        // operation.cancel: write-adjacent, keyed by previewId (no repoPath).
+        let cancel_tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "operation.cancel")
+            .expect("operation.cancel must be advertised");
+        assert_eq!(cancel_tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(cancel_tool["inputSchema"]["required"], json!(["previewId"]));
+
+        // destructiveHint: true only on the two work-destroying proposals.
+        for (name, expect_destructive) in [
+            ("operation.preview.reset", true),
+            ("operation.preview.discard", true),
+            ("operation.preview.merge", false),
+            ("operation.preview.worktree", false),
+            ("operation.preview.commit", false),
+            ("operation.preview.push", false),
+            ("operation.preview.branch", false),
+            ("repo.status", false),
+        ] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            if expect_destructive {
+                assert_eq!(
+                    tool["annotations"]["destructiveHint"], true,
+                    "{name} must advertise destructiveHint: true"
+                );
+            } else {
+                assert!(
+                    tool["annotations"].get("destructiveHint").is_none(),
+                    "{name} must not carry a destructiveHint"
+                );
+            }
+        }
         let fleet_schema = tools
             .iter()
             .find(|tool| tool["name"] == "fleet.radar")
@@ -5189,8 +6149,20 @@ mod tests {
 
         let error = &response["error"];
         assert_eq!(error["code"], -32602);
-        assert!(error["message"].as_str().unwrap().contains("whitelist"));
+        assert!(error["message"].as_str().unwrap().contains("Unknown tool"));
+        assert!(error["message"].as_str().unwrap().contains("repo.delete"));
         assert_eq!(error["data"]["tool"], "repo.delete");
+        // The error self-describes both surfaces (read + write proposals).
+        assert!(error["data"]["readOnlyTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "repo.status"));
+        assert!(error["data"]["writeProposalTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "operation.preview.merge"));
     }
 
     #[test]
@@ -5244,7 +6216,7 @@ mod tests {
             assert_eq!(response["error"]["data"]["tool"], blocked_tool);
             assert!(response["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("whitelist")));
+                .is_some_and(|message| message.contains("Unknown tool")));
         }
     }
 
@@ -5284,7 +6256,7 @@ mod tests {
         assert_eq!(event["sidecarReadOnly"], true);
         assert!(event["args_fingerprint"]
             .as_str()
-            .is_some_and(|fingerprint| fingerprint.starts_with("fnv1a64:")));
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
     }
 
     #[test]
@@ -5313,7 +6285,7 @@ mod tests {
         let lines = fs::read_to_string(&audit_log).unwrap();
         let event: Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
         let repo_scope = event["repo_scope"].as_str().unwrap();
-        assert!(repo_scope.starts_with("repoPath:fnv1a64:"));
+        assert!(repo_scope.starts_with("repoPath:sha256:"));
         assert!(!repo_scope.contains(&repo.path().to_string_lossy().to_string()));
     }
 
@@ -5350,7 +6322,7 @@ mod tests {
         assert_eq!(event["sidecarReadOnly"], true);
         assert!(event["args_fingerprint"]
             .as_str()
-            .is_some_and(|fingerprint| fingerprint.starts_with("fnv1a64:")));
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
     }
 
     #[test]
@@ -6798,6 +7770,35 @@ mod tests {
                     "reason": "isolate the flaky-test fix in its own checkout"
                 }),
             ),
+            (
+                "operation.preview.commit",
+                &["message", "reason"],
+                json!({
+                    "repoPath": "/tmp/x", "message": "fix: handle empty refs",
+                    "stageAll": true, "reason": "task is done; commit the staged fix"
+                }),
+            ),
+            (
+                "operation.preview.push",
+                &["reason"],
+                json!({
+                    "repoPath": "/tmp/x", "remote": "origin", "branch": "agent/fix",
+                    "reason": "publish the reviewed fix branch"
+                }),
+            ),
+            (
+                "operation.preview.branch",
+                &["name", "reason"],
+                json!({
+                    "repoPath": "/tmp/x", "name": "agent/fix-empty-refs",
+                    "reason": "start the fix on its own branch"
+                }),
+            ),
+            (
+                "operation.cancel",
+                &["previewId"],
+                json!({ "previewId": "p-cancel-schema" }),
+            ),
         ];
 
         for (name, must_require, args) in cases {
@@ -7499,6 +8500,858 @@ mod tests {
         );
         assert_eq!(payload["tier"], "fluxgit-write-handshake");
         assert_eq!(payload["readOnly"], false);
+    }
+
+    // ---------------------------------------------------------------------
+    // operation.preview.{commit,push,branch} gateway dispatch (PLAYBOOK
+    // §14.7, extended 2026-07-06). Mirror the worktree tests: POST to the
+    // op-specific path, poll the shared status endpoint; the body must
+    // include the explicit operationType field.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn operation_preview_commit_dispatches_when_gateway_configured() {
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "commit",
+            "completed",
+            json!({
+                "commitSha": "c0ffee1",
+            }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.commit",
+            json!({
+                "repoPath": "/tmp/example",
+                "message": "fix: handle empty refs\n\nGuards the ref parser against empty input.",
+                "paths": ["src/refs.rs", "src/refs_test.rs"],
+                "reason": "The fix is complete and its tests pass locally"
+            }),
+            true,
+        );
+
+        assert_eq!(
+            response["result"]["isError"], false,
+            "completed status must return isError: false; full response: {response:?}"
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["tool"], "operation.preview.commit");
+        assert_eq!(payload["source"], "fluxgit-app");
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["status"], "completed");
+        let preview_id = payload["previewId"]
+            .as_str()
+            .expect("previewId must be a string");
+        assert!(!preview_id.is_empty(), "previewId must be non-empty");
+        assert_eq!(payload["data"]["result"]["commitSha"], "c0ffee1");
+
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
+        assert_eq!(
+            dispatched["operationType"], "commit",
+            "commit body must include operationType"
+        );
+        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["message"],
+            "fix: handle empty refs\n\nGuards the ref parser against empty input."
+        );
+        assert_eq!(dispatched["paths"], json!(["src/refs.rs", "src/refs_test.rs"]));
+        assert_eq!(dispatched["stageAll"], false, "stageAll must default to false");
+        assert_eq!(
+            dispatched["reason"],
+            "The fix is complete and its tests pass locally"
+        );
+        assert!(
+            dispatched["requestedAt"].is_string(),
+            "requestedAt must be an ISO-8601 string"
+        );
+    }
+
+    #[test]
+    fn operation_preview_commit_omits_paths_when_not_supplied() {
+        // Omitted `paths` means "commit exactly what is already staged" — the
+        // sidecar must not send an empty array the gateway could misread as
+        // an explicit (empty) selection.
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "commit",
+            "completed",
+            json!({ "commitSha": "c0ffee2" }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.commit",
+            json!({
+                "repoPath": "/tmp/example",
+                "message": "chore: commit staged work",
+                "stageAll": true,
+                "reason": "Wrap up the staged changes"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], false);
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert!(
+            dispatched.get("paths").is_none(),
+            "paths must be omitted when the agent does not supply them"
+        );
+        assert_eq!(dispatched["stageAll"], true);
+    }
+
+    #[test]
+    fn operation_preview_commit_falls_back_to_pending_when_gateway_unreachable() {
+        let _env = GatewayEnvGuard::set("127.0.0.1:1");
+
+        let response = call_tool(
+            "operation.preview.commit",
+            json!({
+                "repoPath": "/tmp/example",
+                "message": "fix: handle empty refs",
+                "reason": "Commit the staged fix"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            payload["error"]["code"], 10003,
+            "unreachable gateway must fall back to write_handshake_pending"
+        );
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["readOnly"], false);
+    }
+
+    #[test]
+    fn operation_preview_push_dispatches_when_gateway_configured() {
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "push",
+            "completed",
+            json!({
+                "pushedRef": "origin/agent/fix-empty-refs",
+                "remote": "origin",
+            }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.push",
+            json!({
+                "repoPath": "/tmp/example",
+                "remote": "origin",
+                "branch": "agent/fix-empty-refs",
+                "setUpstream": true,
+                "reason": "Publish the reviewed fix branch"
+            }),
+            true,
+        );
+
+        assert_eq!(
+            response["result"]["isError"], false,
+            "completed status must return isError: false; full response: {response:?}"
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["tool"], "operation.preview.push");
+        assert_eq!(payload["source"], "fluxgit-app");
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["status"], "completed");
+        let preview_id = payload["previewId"]
+            .as_str()
+            .expect("previewId must be a string");
+        assert!(!preview_id.is_empty(), "previewId must be non-empty");
+        assert_eq!(
+            payload["data"]["result"]["pushedRef"],
+            "origin/agent/fix-empty-refs"
+        );
+
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
+        assert_eq!(
+            dispatched["operationType"], "push",
+            "push body must include operationType"
+        );
+        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(dispatched["remote"], "origin");
+        assert_eq!(dispatched["branch"], "agent/fix-empty-refs");
+        assert_eq!(dispatched["setUpstream"], true);
+        assert_eq!(
+            dispatched["forceWithLease"], false,
+            "forceWithLease must default to false"
+        );
+        assert_eq!(dispatched["reason"], "Publish the reviewed fix branch");
+        assert!(
+            dispatched["requestedAt"].is_string(),
+            "requestedAt must be an ISO-8601 string"
+        );
+    }
+
+    #[test]
+    fn operation_preview_push_defaults_remote_and_omits_branch_when_not_supplied() {
+        // Omitted `remote` defaults to origin; omitted `branch` means "the
+        // currently checked-out branch" and must not travel as an empty string.
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "push",
+            "completed",
+            json!({ "pushedRef": "origin/main", "remote": "origin" }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.push",
+            json!({
+                "repoPath": "/tmp/example",
+                "reason": "Push the current branch"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], false);
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["remote"], "origin", "remote must default to origin");
+        assert!(
+            dispatched.get("branch").is_none(),
+            "branch must be omitted when the agent does not supply it"
+        );
+    }
+
+    #[test]
+    fn operation_preview_push_falls_back_to_pending_when_gateway_unreachable() {
+        let _env = GatewayEnvGuard::set("127.0.0.1:1");
+
+        let response = call_tool(
+            "operation.preview.push",
+            json!({
+                "repoPath": "/tmp/example",
+                "reason": "Push the current branch"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            payload["error"]["code"], 10003,
+            "unreachable gateway must fall back to write_handshake_pending"
+        );
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["readOnly"], false);
+    }
+
+    #[test]
+    fn operation_preview_branch_dispatches_when_gateway_configured() {
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "branch",
+            "completed",
+            json!({
+                "branch": "agent/fix-empty-refs",
+                "checkedOut": true,
+            }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.branch",
+            json!({
+                "repoPath": "/tmp/example",
+                "name": "agent/fix-empty-refs",
+                "startPoint": "origin/main",
+                "checkout": true,
+                "reason": "Start the fix on its own branch"
+            }),
+            true,
+        );
+
+        assert_eq!(
+            response["result"]["isError"], false,
+            "completed status must return isError: false; full response: {response:?}"
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["tool"], "operation.preview.branch");
+        assert_eq!(payload["source"], "fluxgit-app");
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["status"], "completed");
+        let preview_id = payload["previewId"]
+            .as_str()
+            .expect("previewId must be a string");
+        assert!(!preview_id.is_empty(), "previewId must be non-empty");
+        assert_eq!(payload["data"]["result"]["branch"], "agent/fix-empty-refs");
+
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
+        assert_eq!(
+            dispatched["operationType"], "branch",
+            "branch body must include operationType"
+        );
+        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(dispatched["name"], "agent/fix-empty-refs");
+        assert_eq!(dispatched["startPoint"], "origin/main");
+        assert_eq!(dispatched["checkout"], true);
+        assert_eq!(dispatched["reason"], "Start the fix on its own branch");
+        assert!(
+            dispatched["requestedAt"].is_string(),
+            "requestedAt must be an ISO-8601 string"
+        );
+    }
+
+    #[test]
+    fn operation_preview_branch_omits_start_point_and_defaults_checkout() {
+        // Omitted `startPoint` means HEAD (the gateway applies the default);
+        // omitted `checkout` defaults to true.
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "branch",
+            "completed",
+            json!({ "branch": "agent/try-refactor", "checkedOut": true }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.branch",
+            json!({
+                "repoPath": "/tmp/example",
+                "name": "agent/try-refactor",
+                "reason": "Branch off HEAD for the refactor"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], false);
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert!(
+            dispatched.get("startPoint").is_none(),
+            "startPoint must be omitted when the agent does not supply it"
+        );
+        assert_eq!(dispatched["checkout"], true, "checkout must default to true");
+    }
+
+    #[test]
+    fn operation_preview_branch_falls_back_to_pending_when_gateway_unreachable() {
+        let _env = GatewayEnvGuard::set("127.0.0.1:1");
+
+        let response = call_tool(
+            "operation.preview.branch",
+            json!({
+                "repoPath": "/tmp/example",
+                "name": "agent/fix-empty-refs",
+                "reason": "Start the fix on its own branch"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            payload["error"]["code"], 10003,
+            "unreachable gateway must fall back to write_handshake_pending"
+        );
+        assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        assert_eq!(payload["readOnly"], false);
+    }
+
+    // ---------------------------------------------------------------------
+    // Hardening pass: approved-is-progress polling, gateway refusal relay,
+    // operation.status / operation.cancel, diff.text caps, audit labels.
+    // ---------------------------------------------------------------------
+
+    /// Mock gateway whose GET /status responses walk a fixed status sequence
+    /// (one step per GET; the last status repeats). Used to prove that
+    /// `approved` keeps the sidecar polling instead of failing terminally.
+    fn spawn_status_sequence_gateway_mock(
+        op_path_suffix: &'static str,
+        statuses: &'static [&'static str],
+        result: Value,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind sequence mock");
+        let addr = listener.local_addr().unwrap();
+        let expected_post_path = format!("/v1/mcp/operation/preview/{}", op_path_suffix);
+
+        thread::spawn(move || {
+            let mut status_index = 0usize;
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length = 0_usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).is_err() {
+                        break;
+                    }
+                    let trimmed = header.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = trimmed
+                        .to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let parts: Vec<&str> = request_line.split_whitespace().collect();
+                let method = parts.first().copied().unwrap_or("");
+                let path = parts.get(1).copied().unwrap_or("");
+                if method == "POST" && path.starts_with(&expected_post_path) {
+                    let mut body_buf = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body_buf);
+                    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"accepted\":true}\n";
+                    let _ = stream.write_all(response);
+                } else if method == "GET" && path.starts_with("/v1/mcp/operation/status/") {
+                    let preview_id = path.trim_start_matches("/v1/mcp/operation/status/");
+                    let status = statuses[status_index.min(statuses.len() - 1)];
+                    let served_last = status_index >= statuses.len() - 1;
+                    if !served_last {
+                        status_index += 1;
+                    }
+                    let body = json!({
+                        "previewId": preview_id,
+                        "status": status,
+                        "result": result,
+                    });
+                    let body_text = serde_json::to_string(&body).unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body_text.len(),
+                        body_text
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    if served_last
+                        && matches!(status, "completed" | "rejected" | "failed" | "expired" | "cancelled")
+                    {
+                        return;
+                    }
+                } else {
+                    let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(response);
+                }
+            }
+        });
+
+        format!("{}:{}", addr.ip(), addr.port())
+    }
+
+    /// Single-shot mock that answers ANY request with the given HTTP status
+    /// and JSON body. Used for gateway refusals (429 cap / 403 policy) and
+    /// for cancel responses.
+    fn spawn_single_response_gateway_mock(http_status: u16, body: Value) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind single-response mock");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let reason = match http_status {
+                200 => "OK",
+                403 => "Forbidden",
+                404 => "Not Found",
+                409 => "Conflict",
+                422 => "Unprocessable Entity",
+                429 => "Too Many Requests",
+                _ => "OK",
+            };
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).is_err() {
+                        break;
+                    }
+                    let trimmed = header.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = trimmed
+                        .to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body_buf = vec![0u8; content_length];
+                let _ = reader.read_exact(&mut body_buf);
+                let body_text = serde_json::to_string(&body).unwrap();
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    http_status,
+                    reason,
+                    body_text.len(),
+                    body_text
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                return;
+            }
+        });
+        format!("{}:{}", addr.ip(), addr.port())
+    }
+
+    #[test]
+    fn operation_preview_approved_status_keeps_polling_until_completed() {
+        // Regression for the approved-race bug: `approved` is a TRANSIENT
+        // state (UI approved, execution running). A poll landing in that
+        // window must keep polling — never report a terminal 10004 failure
+        // for an operation that goes on to succeed.
+        let addr = spawn_status_sequence_gateway_mock(
+            "merge",
+            &["pending", "approved", "completed"],
+            json!({ "mergeCommit": "cafe123", "restorePointId": "rp-approved-race" }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.merge",
+            json!({
+                "repoPath": "/tmp/example",
+                "sourceRef": "feature/x",
+                "targetRef": "main",
+                "reason": "approved-race regression"
+            }),
+            true,
+        );
+
+        assert_eq!(
+            response["result"]["isError"], false,
+            "approved must be treated as progress, not terminal; got {response:?}"
+        );
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["data"]["result"]["mergeCommit"], "cafe123");
+    }
+
+    #[test]
+    fn operation_preview_gateway_refusal_is_relayed_as_structured_error() {
+        // A 429 (per-agent pending cap) or 403 (policy) from the gateway must
+        // reach the agent with the gateway's own self-guiding body — not be
+        // collapsed into the generic 10003.
+        let addr = spawn_single_response_gateway_mock(
+            429,
+            json!({
+                "error": "agent_pending_cap_exceeded",
+                "message": "Agent 'external-mcp-sidecar' already has 10 pending proposals awaiting review.",
+                "agentRecommendation": "Wait for the user to decide, or cancel stale proposals with operation.cancel.",
+            }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.merge",
+            json!({
+                "repoPath": "/tmp/example",
+                "sourceRef": "feature/x",
+                "targetRef": "main",
+                "reason": "cap relay test"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["error"]["code"], 10006);
+        assert_eq!(payload["error"]["data"]["httpStatus"], 429);
+        assert_eq!(
+            payload["error"]["data"]["gateway"]["error"],
+            "agent_pending_cap_exceeded"
+        );
+    }
+
+    #[test]
+    fn operation_status_returns_proposal_status_via_gateway() {
+        let (addr, _rx) = spawn_operation_gateway_mock(
+            "merge",
+            "rejected",
+            json!({}),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool("operation.status", json!({ "previewId": "p-lost-1" }), true);
+        assert_eq!(response["result"]["isError"], false, "{response:?}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["tool"], "operation.status");
+        assert_eq!(payload["readOnly"], true);
+        assert_eq!(payload["previewId"], "p-lost-1");
+        assert_eq!(payload["data"]["status"], "rejected");
+    }
+
+    #[test]
+    fn operation_status_without_handshake_addr_returns_10003() {
+        let _env = GatewayEnvGuard::unset();
+        let response = call_tool("operation.status", json!({ "previewId": "p-1" }), false);
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["error"]["code"], 10003);
+        assert_eq!(payload["readOnly"], true);
+    }
+
+    #[test]
+    fn operation_status_requires_preview_id() {
+        let _env = GatewayEnvGuard::unset();
+        let response = call_tool("operation.status", json!({}), false);
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("previewId"));
+    }
+
+    #[test]
+    fn operation_status_unknown_preview_id_reports_honest_absence() {
+        let addr = spawn_single_response_gateway_mock(404, json!({ "error": "previewId not found" }));
+        let _env = GatewayEnvGuard::set(&addr);
+        let response = call_tool("operation.status", json!({ "previewId": "ghost" }), true);
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["error"]["code"], 10005);
+        assert_eq!(payload["previewId"], "ghost");
+    }
+
+    #[test]
+    fn operation_cancel_dispatches_and_reports_cancelled() {
+        let addr = spawn_single_response_gateway_mock(
+            200,
+            json!({ "previewId": "p-stale-9", "status": "cancelled" }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+        let response = call_tool("operation.cancel", json!({ "previewId": "p-stale-9" }), true);
+        assert_eq!(response["result"]["isError"], false, "{response:?}");
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["tool"], "operation.cancel");
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["readOnly"], false);
+    }
+
+    #[test]
+    fn operation_cancel_refusal_is_relayed_with_code_10006() {
+        let addr = spawn_single_response_gateway_mock(
+            403,
+            json!({ "error": "previewId belongs to a different agent" }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+        let response = call_tool("operation.cancel", json!({ "previewId": "p-foreign" }), true);
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["error"]["code"], 10006);
+        assert_eq!(payload["error"]["data"]["httpStatus"], 403);
+    }
+
+    #[test]
+    fn operation_cancel_without_handshake_addr_returns_10003() {
+        let _env = GatewayEnvGuard::unset();
+        let response = call_tool("operation.cancel", json!({ "previewId": "p-1" }), false);
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["error"]["code"], 10003);
+    }
+
+    #[test]
+    fn diff_text_truncates_at_max_bytes_on_a_line_boundary() {
+        let repo = fixture_repo();
+        let content: String = (0..200)
+            .map(|i| format!("line number {i} with enough padding to add up quickly\n"))
+            .collect();
+        fs::write(repo.path().join("tracked.txt"), &content).unwrap();
+
+        let payload = tool_payload(&call_tool(
+            "diff.text",
+            json!({ "repoPath": repo.path(), "path": "tracked.txt", "maxBytes": 512 }),
+            false,
+        ));
+        let data = &payload["data"];
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["maxBytes"], 512);
+        let diff = data["diff"].as_str().unwrap();
+        assert!(diff.len() <= 512, "diff must respect maxBytes, got {}", diff.len());
+        assert!(diff.ends_with('\n'), "truncation must land on a line boundary");
+        assert!(
+            data["totalBytes"].as_u64().unwrap() > 512,
+            "totalBytes must report the FULL diff size"
+        );
+    }
+
+    #[test]
+    fn diff_text_respects_max_lines_before_max_bytes() {
+        let repo = fixture_repo();
+        let content: String = (0..50).map(|i| format!("row {i}\n")).collect();
+        fs::write(repo.path().join("tracked.txt"), &content).unwrap();
+
+        let payload = tool_payload(&call_tool(
+            "diff.text",
+            json!({ "repoPath": repo.path(), "path": "tracked.txt", "maxLines": 6 }),
+            false,
+        ));
+        let data = &payload["data"];
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["diff"].as_str().unwrap().lines().count(), 6);
+        assert!(data["totalLines"].as_u64().unwrap() > 6);
+    }
+
+    #[test]
+    fn diff_text_leaves_small_diffs_untouched_with_default_cap() {
+        let repo = fixture_repo();
+        fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+        let payload = tool_payload(&call_tool(
+            "diff.text",
+            json!({ "repoPath": repo.path(), "path": "tracked.txt" }),
+            false,
+        ));
+        let data = &payload["data"];
+        assert_eq!(data["truncated"], false);
+        assert_eq!(data["maxBytes"], 65536);
+        assert_eq!(
+            data["totalBytes"].as_u64().unwrap() as usize,
+            data["diff"].as_str().unwrap().len()
+        );
+        assert!(data["diff"].as_str().unwrap().contains("+changed"));
+    }
+
+    #[test]
+    fn truncate_diff_text_hard_cuts_a_single_giant_line_on_char_boundary() {
+        // One line larger than the cap and no newline before it: the cut must
+        // still land on a UTF-8 char boundary instead of panicking.
+        let giant = "é".repeat(100); // 200 bytes, no newline
+        let (text, truncated) = truncate_diff_text(&giant, 33, None);
+        assert!(truncated);
+        assert!(text.len() <= 33);
+        assert!(giant.starts_with(&text));
+    }
+
+    #[test]
+    fn write_proposal_tools_are_audited_with_honest_labels() {
+        // Regression: write-handshake tools were mislabeled readOnly:true /
+        // risk:none / approval:not_required because from_name matched them
+        // into the read path.
+        let _env = GatewayEnvGuard::unset();
+        let audit_dir = TestDir::new("fluxgit-mcp-write-proposal-audit");
+        let audit_log = audit_dir.path().join("mcp.jsonl");
+        let server = McpSidecar::new_for_tests_with_audit(true, audit_log.clone());
+
+        for (tool, args) in [
+            (
+                "operation.preview.merge",
+                json!({ "repoPath": "/tmp/x", "sourceRef": "a", "targetRef": "b", "reason": "audit label test" }),
+            ),
+            (
+                "operation.preview.reset",
+                json!({ "repoPath": "/tmp/x", "targetRef": "HEAD~1", "mode": "hard", "reason": "audit label test" }),
+            ),
+            (
+                "operation.preview.commit",
+                json!({ "repoPath": "/tmp/x", "message": "fix: x", "reason": "audit label test" }),
+            ),
+            (
+                "operation.preview.push",
+                json!({ "repoPath": "/tmp/x", "reason": "audit label test" }),
+            ),
+            (
+                "operation.preview.branch",
+                json!({ "repoPath": "/tmp/x", "name": "agent/x", "reason": "audit label test" }),
+            ),
+        ] {
+            let response = server
+                .handle_value(json!({
+                    "jsonrpc": "2.0",
+                    "id": 950,
+                    "method": "tools/call",
+                    "params": { "name": tool, "arguments": args }
+                }))
+                .unwrap();
+            let response = serde_json::to_value(response).unwrap();
+            // Without a handshake address the call errors (10003), but the
+            // audit event must still label it as a write proposal.
+            assert_eq!(response["result"]["isError"], true);
+        }
+
+        let lines = fs::read_to_string(&audit_log).unwrap();
+        let events: Vec<Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 5);
+
+        let merge_event = &events[0];
+        assert_eq!(merge_event["tool"], "operation.preview.merge");
+        assert_eq!(merge_event["event_type"], "write_proposal");
+        assert_eq!(merge_event["readOnly"], false);
+        assert_eq!(merge_event["approval"], "ui_handshake");
+        assert_eq!(merge_event["risk"], "medium");
+        assert_eq!(merge_event["result"], "error");
+
+        let reset_event = &events[1];
+        assert_eq!(reset_event["event_type"], "write_proposal");
+        assert_eq!(reset_event["risk"], "high", "reset must be labeled high risk");
+
+        // The three 2026-07 write proposals carry honest per-op risk labels:
+        // commit/branch only add state (low); push mutates remote refs (medium).
+        for (event, tool, risk) in [
+            (&events[2], "operation.preview.commit", "low"),
+            (&events[3], "operation.preview.push", "medium"),
+            (&events[4], "operation.preview.branch", "low"),
+        ] {
+            assert_eq!(event["tool"], tool);
+            assert_eq!(event["event_type"], "write_proposal");
+            assert_eq!(event["readOnly"], false);
+            assert_eq!(event["approval"], "ui_handshake");
+            assert_eq!(event["risk"], risk, "{tool} must be labeled {risk} risk");
+        }
+    }
+
+    #[test]
+    fn arguments_fingerprint_is_sha256_of_serialized_arguments() {
+        use sha2::{Digest, Sha256};
+        let args = json!({ "repoPath": "/tmp/x", "limit": 5 });
+        let fingerprint = arguments_fingerprint(&args).expect("fingerprint for non-null args");
+        let digest = Sha256::digest(serde_json::to_vec(&args).unwrap());
+        let mut expected = String::from("sha256:");
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(expected, "{:02x}", byte);
+        }
+        assert_eq!(fingerprint, expected);
+        assert_eq!(fingerprint.len(), "sha256:".len() + 64);
+        assert!(arguments_fingerprint(&Value::Null).is_none());
     }
 
     // ---------------------------------------------------------------------
