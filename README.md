@@ -186,7 +186,7 @@ Paste the generic block below into any MCP host config. No client-specific insta
 
 > A result may only be called *semantic* if `data.supported` is exactly `true`.
 
-When the FluxGit semantic engine is not available, `diff.semantic` returns:
+When the FluxGit semantic engine is not available (FluxGit app not running, gateway address not configured, or the repository not registered in FluxGit), `diff.semantic` returns:
 
 ```json
 {
@@ -201,10 +201,49 @@ When the FluxGit semantic engine is not available, `diff.semantic` returns:
 }
 ```
 
+With the FluxGit app running and the repository registered in FluxGit, the same call is served by the FluxGit diff-engine through the gateway's read-only bridge and returns `supported: true` with per-file semantic hunks:
+
+```json
+{
+  "tool": "diff.semantic",
+  "readOnly": true,
+  "source": "fluxgit-gateway",
+  "data": {
+    "supported": true,
+    "engine": "fluxgit-diff-engine",
+    "files": [
+      {
+        "path": "src/main.rs",
+        "fallbackToText": false,
+        "hunks": [{
+          "header": "fn main",
+          "lines": [{
+            "type": "modified", "oldLine": 3, "newLine": 3,
+            "content": "let x = 2;", "oldContent": "let x = 1;",
+            "changedTokens": ["2"], "oldChangedTokens": ["1"]
+          }]
+        }]
+      },
+      {
+        "path": "logo.bin",
+        "fallbackToText": true,
+        "hunks": [],
+        "reason": "The semantic engine could not parse this file (unsupported language, binary or unreadable source); use a text diff for it.",
+        "textDiffArguments": { "repoPath": "...", "base": "...", "head": "...", "path": "logo.bin" }
+      }
+    ],
+    "changedFiles": 2,
+    "filesTruncated": false
+  }
+}
+```
+
+Honesty is per file, not just per call: files the engine could not parse arrive with `fallbackToText: true`, a reason, and ready-to-use `textDiffArguments` — never as synthesized semantic hunks. `diff.semanticFallbacks` follows the same split and, when connected, lists the engine's real per-file fallback records.
+
 Connected agents must:
 1. Call `diff.semantic`.
 2. Read `data.supported`.
-3. If `true`, use the semantic payload and label results as semantic.
+3. If `true`, use the semantic payload and label results as semantic — except entries with `fallbackToText: true`, which must be presented as text fallbacks.
 4. If `false`, call `diff.text` with `data.textDiffArguments` and present results as a text-diff fallback.
 5. Never infer function- or class-level moves from a text patch alone.
 

@@ -849,6 +849,40 @@ impl McpSidecar {
             return Ok(render_fleet_radar_tool_result(arguments));
         }
 
+        // Hybrid semantic tier (PLAYBOOK §4): when the FluxGit gateway is
+        // reachable — the same handshake-address resolution the write tools
+        // use (FLUXGIT_MCP_HANDSHAKE_ADDR, then FLUXGIT_GATEWAY_ADDR) — and
+        // the repository is registered in FluxGit, diff.semantic and
+        // diff.semanticFallbacks are served from the real diff-engine through
+        // the gateway's read-only bridge. ANY failure along the way (env
+        // unset, gateway unreachable, repo not registered, HTTP or parse
+        // error) falls through to the exact same honest local fallback as
+        // before: supported:false plus textDiffArguments, never a synthetic
+        // "semantic" answer.
+        if matches!(
+            kind,
+            ToolKind::DiffSemantic | ToolKind::DiffSemanticFallbacks
+        ) {
+            if let (Some(addr), Some(repo_path)) =
+                (resolve_handshake_addr(), repo_path_from_arguments(arguments))
+            {
+                if let Some(payload) =
+                    semantic_gateway_tool_payload(kind, &addr, &repo_path, arguments)
+                {
+                    return Ok(text_tool_result(
+                        json!({
+                            "tool": kind.as_str(),
+                            "readOnly": true,
+                            "source": "fluxgit-gateway",
+                            "repoPath": repo_path,
+                            "data": payload,
+                        }),
+                        false,
+                    ));
+                }
+            }
+        }
+
         if let Some(repo_path) = repo_path_from_arguments(arguments) {
             return Ok(render_local_tool_result(kind, arguments, &repo_path));
         }
@@ -3195,11 +3229,204 @@ fn semantic_fallbacks_payload(repo_path: &Path, arguments: &Value) -> Value {
             "from": "diff.semantic",
             "to": "diff.text",
             "supported": false,
-            "reason": "Local fallback uses git diff text because no semantic diff engine is wired in the sidecar.",
+            "reason": "Local fallback uses git diff text because the FluxGit semantic diff engine was not reachable for this call (FluxGit app not running, gateway address not configured, or repository not registered in FluxGit).",
             "repoPath": repo_path,
             "path": diff_path_filter(arguments, repo_path),
         }],
     })
+}
+
+/// Cap on changed files sent to the semantic-diff bridge per call. Reported
+/// honestly via `filesTruncated: true` when exceeded — the agent can narrow
+/// the selection with `path`.
+const SEMANTIC_DIFF_MAX_FILES: usize = 25;
+
+/// Map the diff.text-style (base, head) selector onto the diff-engine's
+/// (old_ref, new_ref) pair, preserving `git diff` positional semantics:
+/// - base + head        → base..head (tree to tree)
+/// - base only          → base vs working tree
+/// - head only          → head vs working tree (git treats the single
+///                        positional rev as the OLD side)
+/// - neither            → index vs working tree
+fn semantic_engine_refs(base: Option<&str>, head: Option<&str>) -> (String, String) {
+    match (base, head) {
+        (Some(base), Some(head)) => (base.to_string(), head.to_string()),
+        (Some(base), None) => (base.to_string(), String::new()),
+        (None, Some(head)) => (head.to_string(), String::new()),
+        (None, None) => (String::new(), String::new()),
+    }
+}
+
+/// Enumerate the changed paths for the same selection diff.text would show,
+/// capped at [`SEMANTIC_DIFF_MAX_FILES`]. Returns `None` when git itself
+/// rejects the selection (bad ref, etc.) so the caller degrades to the
+/// documented fallback instead of erroring on a path the fallback contract
+/// never errored on.
+fn semantic_changed_paths(
+    repo_path: &Path,
+    base: Option<&str>,
+    head: Option<&str>,
+    path_filter: Option<&str>,
+) -> Option<(Vec<String>, bool)> {
+    let mut args = vec!["diff", "--name-only"];
+    if let Some(base) = base {
+        args.push(base);
+    }
+    if let Some(head) = head {
+        args.push(head);
+    }
+    if let Some(path) = path_filter {
+        args.push("--");
+        args.push(path);
+    }
+    let output = run_git(repo_path, &args).ok()?;
+    let mut paths: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let truncated = paths.len() > SEMANTIC_DIFF_MAX_FILES;
+    paths.truncate(SEMANTIC_DIFF_MAX_FILES);
+    Some((paths, truncated))
+}
+
+/// POST the semantic-diff request to the gateway's read-only bridge
+/// (`/v1/mcp/diff/semantic`) and return its parsed body. `None` on any
+/// transport, HTTP or parse failure — the caller falls back honestly.
+fn fetch_semantic_diff_from_gateway(
+    gateway_addr: &str,
+    repo_id: &str,
+    repo_path: &Path,
+    old_ref: &str,
+    new_ref: &str,
+    paths: &[String],
+) -> Option<Value> {
+    let base = format!("http://{}", gateway_addr.trim_end_matches('/'));
+    let url = format!("{}/v1/mcp/diff/semantic", base);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .post(&url)
+        .json(&json!({
+            "repoId": repo_id,
+            "repoPath": repo_path,
+            "baseRef": old_ref,
+            "headRef": new_ref,
+            "paths": paths,
+        }))
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<Value>().ok()
+}
+
+/// Build the enriched `data` payload for diff.semantic /
+/// diff.semanticFallbacks from the gateway bridge, or `None` when the
+/// enriched path is unavailable so the caller keeps today's honest local
+/// fallback byte-for-byte.
+fn semantic_gateway_tool_payload(
+    kind: ToolKind,
+    gateway_addr: &str,
+    repo_path: &Path,
+    arguments: &Value,
+) -> Option<Value> {
+    ensure_git_repo(repo_path).ok()?;
+    // The diff-engine resolves repositories through the FluxGit run-dir
+    // registry; enrichment therefore requires the repo to be registered
+    // (opened) in FluxGit, or an explicit repoId argument.
+    let repo_id = repo_id_from_arguments_or_registry(arguments, repo_path)?;
+    let base = arguments.get("base").and_then(Value::as_str);
+    let head = arguments.get("head").and_then(Value::as_str);
+    let path_filter = diff_path_filter(arguments, repo_path);
+    let (paths, files_truncated) =
+        semantic_changed_paths(repo_path, base, head, path_filter.as_deref())?;
+    let (old_ref, new_ref) = semantic_engine_refs(base, head);
+    let gateway_body = fetch_semantic_diff_from_gateway(
+        gateway_addr,
+        &repo_id,
+        repo_path,
+        &old_ref,
+        &new_ref,
+        &paths,
+    )?;
+    let files = gateway_body.get("files")?.as_array()?.clone();
+
+    match kind {
+        ToolKind::DiffSemantic => {
+            let files: Vec<Value> = files
+                .into_iter()
+                .map(|mut file| {
+                    // Per-file honesty: every file the engine could not parse
+                    // ships ready-to-use diff.text arguments, mirroring the
+                    // whole-call fallback contract.
+                    let fell_back = file
+                        .get("fallbackToText")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if fell_back {
+                        if let Some(object) = file.as_object_mut() {
+                            let file_path = object.get("path").cloned().unwrap_or(Value::Null);
+                            object.insert(
+                                "textDiffArguments".into(),
+                                json!({
+                                    "repoPath": repo_path,
+                                    "base": base,
+                                    "head": head,
+                                    "path": file_path,
+                                }),
+                            );
+                        }
+                    }
+                    file
+                })
+                .collect();
+            Some(json!({
+                "supported": true,
+                "engine": "fluxgit-diff-engine",
+                "base": base,
+                "head": head,
+                "path": path_filter,
+                "files": files,
+                "changedFiles": paths.len(),
+                "filesTruncated": files_truncated,
+            }))
+        }
+        ToolKind::DiffSemanticFallbacks => {
+            let fallbacks: Vec<Value> = files
+                .iter()
+                .filter(|file| {
+                    file.get("fallbackToText").and_then(Value::as_bool) == Some(true)
+                })
+                .map(|file| {
+                    json!({
+                        "from": "diff.semantic",
+                        "to": "diff.text",
+                        "supported": false,
+                        "path": file.get("path").cloned().unwrap_or(Value::Null),
+                        "reason": file
+                            .get("reason")
+                            .cloned()
+                            .unwrap_or_else(|| json!(
+                                "The semantic engine could not parse this file; use diff.text for it."
+                            )),
+                        "repoPath": repo_path,
+                    })
+                })
+                .collect();
+            Some(json!({
+                "fallbacks": fallbacks,
+                "engine": "fluxgit-diff-engine",
+                "analyzedFiles": paths.len(),
+                "filesTruncated": files_truncated,
+            }))
+        }
+        _ => None,
+    }
 }
 
 fn flux_latest_restore_point_payload(repo_path: &Path, arguments: &Value) -> Value {
@@ -3948,10 +4175,10 @@ fn tool_description(kind: ToolKind) -> &'static str {
             "Return the standard unified text diff between two refs (or against the working tree), optionally scoped to one path. Output is byte-capped (default 64 KiB, truncation on a line boundary reported via truncated:true plus totalBytes/totalLines) so a huge diff cannot flood the agent context; raise maxBytes (max 1 MiB) or set maxLines only when needed."
         }
         ToolKind::DiffSemantic => {
-            "Request a semantic (symbol-level) diff under a strict honesty contract: trust the payload only when data.supported is exactly true. Without the FluxGit semantic engine it returns supported:false plus ready-to-use textDiffArguments for a diff.text fallback — never present a text diff as semantic."
+            "Request a semantic (syntax-aware) diff under a strict honesty contract: trust the payload only when data.supported is exactly true. With the FluxGit app running (FLUXGIT_MCP_HANDSHAKE_ADDR or FLUXGIT_GATEWAY_ADDR set) and the repository registered in FluxGit, it returns supported:true with per-file semantic hunks from the FluxGit diff engine — line-level change types (added/deleted/modified) plus the exact tokens that changed — and an honest per-file fallbackToText flag (with ready-to-use textDiffArguments) for files the engine could not parse. Without that connection it returns supported:false plus ready-to-use textDiffArguments for a diff.text fallback — never present a text diff as semantic."
         }
         ToolKind::DiffSemanticFallbacks => {
-            "List which paths fell back from semantic to text diff and why. Use it after diff.semantic when reporting to the user which files got a real semantic explanation and which only got the text fallback. Returns one fallback record per affected path."
+            "List which paths fell back from semantic to text diff and why. With the FluxGit gateway connected it reports the diff engine's real per-file fallbacks for the same base/head selection; without it, it reports the single documented not-connected fallback record. Use it after diff.semantic when reporting to the user which files got a real semantic explanation and which only got the text fallback. Returns one fallback record per affected path."
         }
         ToolKind::FluxLatestRestorePoint => {
             "Read the newest FluxGit restore point (before/after commits, canUndo/canRedo eligibility) for a repository. Use it to tell the user whether the last risky operation is reversible; undo/redo itself requires explicit approval inside FluxGit and is never exposed through MCP. Requires the FluxGit app."
@@ -7159,6 +7386,9 @@ mod tests {
 
     #[test]
     fn semantic_diff_reports_explicit_text_fallback() {
+        // Hold the env guard: diff.semantic now reads the handshake address,
+        // so a parallel test setting FLUXGIT_GATEWAY_ADDR must not leak in.
+        let _env = GatewayEnvGuard::unset();
         let repo = fixture_repo();
         let result = call_tool(
             "diff.semantic",
@@ -7591,6 +7821,9 @@ mod tests {
 
     #[test]
     fn diff_semantic_returns_fallback_payload_without_gateway() {
+        // Hold the env guard: diff.semantic now reads the handshake address,
+        // so a parallel test setting FLUXGIT_GATEWAY_ADDR must not leak in.
+        let _env = GatewayEnvGuard::unset();
         let repo = fixture_repo();
         let response = call_tool(
             "diff.semantic",
@@ -7604,6 +7837,303 @@ mod tests {
         assert_eq!(payload["data"]["supported"], false);
         assert_eq!(payload["data"]["fallback"], "diff.text");
         assert!(payload["data"]["textDiffArguments"].is_object());
+    }
+
+    // ---------------------------------------------------------------------
+    // diff.semantic enriched tier: served from the FluxGit diff-engine
+    // through the gateway's read-only bridge (POST /v1/mcp/diff/semantic).
+    // ---------------------------------------------------------------------
+
+    /// Tiny single-shot HTTP mock for the read-only semantic-diff bridge:
+    /// accepts one POST /v1/mcp/diff/semantic, captures its JSON body, and
+    /// answers 200 with the canned gateway response.
+    fn spawn_semantic_diff_gateway_mock(
+        response_body: Value,
+    ) -> (String, std::sync::mpsc::Receiver<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind semantic mock gateway");
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                return;
+            }
+            let mut content_length = 0_usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).is_err() {
+                    break;
+                }
+                let trimmed = header.trim_end_matches(['\r', '\n']);
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some(value) = trimmed
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let parts: Vec<&str> = request_line.split_whitespace().collect();
+            let method = parts.first().copied().unwrap_or("");
+            let path = parts.get(1).copied().unwrap_or("");
+            if method != "POST" || !path.starts_with("/v1/mcp/diff/semantic") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                return;
+            }
+            let mut body_buf = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body_buf);
+            let parsed: Value = serde_json::from_slice(&body_buf).unwrap_or(Value::Null);
+            let _ = tx.send(parsed);
+            let body_text = serde_json::to_string(&response_body).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_text.len(),
+                body_text
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (format!("{}:{}", addr.ip(), addr.port()), rx)
+    }
+
+    #[test]
+    fn diff_semantic_enriches_with_gateway_semantic_payload() {
+        let repo = fixture_repo();
+        fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+        git(&repo.path, &["add", "tracked.txt"]);
+        git(&repo.path, &["commit", "-m", "second"]);
+
+        let (addr, body_rx) = spawn_semantic_diff_gateway_mock(json!({
+            "repoId": "repo-sem",
+            "files": [{
+                "path": "tracked.txt",
+                "fallbackToText": false,
+                "hunks": [{
+                    "header": "@@ tracked.txt",
+                    "lines": [{
+                        "type": "modified",
+                        "oldLine": 1,
+                        "newLine": 1,
+                        "content": "changed",
+                        "oldContent": "initial",
+                        "changedTokens": ["changed"],
+                    }],
+                }],
+                "linesTruncated": false,
+            }],
+            "pathsTruncated": false,
+        }));
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let payload = tool_payload(&call_tool(
+            "diff.semantic",
+            json!({
+                "repoPath": repo.path(),
+                "repoId": "repo-sem",
+                "base": "HEAD~1",
+                "head": "HEAD",
+            }),
+            true,
+        ));
+
+        assert_eq!(payload["tool"], "diff.semantic");
+        assert_eq!(payload["readOnly"], true);
+        assert_eq!(payload["source"], "fluxgit-gateway");
+        assert_eq!(payload["data"]["supported"], true);
+        assert_eq!(payload["data"]["engine"], "fluxgit-diff-engine");
+        assert_eq!(payload["data"]["changedFiles"], 1);
+        assert_eq!(payload["data"]["filesTruncated"], false);
+        let file = &payload["data"]["files"][0];
+        assert_eq!(file["path"], "tracked.txt");
+        assert_eq!(file["fallbackToText"], false);
+        assert_eq!(file["hunks"][0]["header"], "@@ tracked.txt");
+        let line = &file["hunks"][0]["lines"][0];
+        assert_eq!(line["type"], "modified");
+        assert_eq!(line["oldContent"], "initial");
+        assert_eq!(line["changedTokens"][0], "changed");
+
+        // The sidecar enumerated the changed paths locally and dispatched
+        // the documented bridge body to the gateway.
+        let dispatched = body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the semantic bridge POST in time");
+        assert_eq!(dispatched["repoId"], "repo-sem");
+        assert_eq!(dispatched["baseRef"], "HEAD~1");
+        assert_eq!(dispatched["headRef"], "HEAD");
+        assert_eq!(dispatched["paths"], json!(["tracked.txt"]));
+    }
+
+    #[test]
+    fn diff_semantic_enriched_response_reports_per_file_text_fallback() {
+        let repo = fixture_repo();
+        fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+        fs::write(repo.path().join("logo.bin"), [0u8, 159, 146, 150]).unwrap();
+        git(&repo.path, &["add", "."]);
+        git(&repo.path, &["commit", "-m", "second"]);
+
+        let (addr, _body_rx) = spawn_semantic_diff_gateway_mock(json!({
+            "repoId": "repo-sem",
+            "files": [
+                {
+                    "path": "logo.bin",
+                    "fallbackToText": true,
+                    "hunks": [],
+                    "reason": "The semantic engine could not parse this file (unsupported language, binary or unreadable source); use a text diff for it.",
+                },
+                {
+                    "path": "tracked.txt",
+                    "fallbackToText": false,
+                    "hunks": [],
+                    "linesTruncated": false,
+                }
+            ],
+            "pathsTruncated": false,
+        }));
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let payload = tool_payload(&call_tool(
+            "diff.semantic",
+            json!({
+                "repoPath": repo.path(),
+                "repoId": "repo-sem",
+                "base": "HEAD~1",
+                "head": "HEAD",
+            }),
+            true,
+        ));
+
+        // The call as a whole is semantic, with per-file honesty inside it.
+        assert_eq!(payload["data"]["supported"], true);
+        let files = payload["data"]["files"].as_array().unwrap();
+        let binary = files.iter().find(|f| f["path"] == "logo.bin").unwrap();
+        assert_eq!(binary["fallbackToText"], true);
+        assert!(binary["reason"].as_str().unwrap().contains("could not parse"));
+        // Fallback files carry ready-to-use diff.text arguments, mirroring
+        // the whole-call fallback contract.
+        assert_eq!(binary["textDiffArguments"]["path"], "logo.bin");
+        assert_eq!(binary["textDiffArguments"]["base"], "HEAD~1");
+        assert_eq!(binary["textDiffArguments"]["head"], "HEAD");
+        let parsed = files.iter().find(|f| f["path"] == "tracked.txt").unwrap();
+        assert_eq!(parsed["fallbackToText"], false);
+        assert!(parsed.get("textDiffArguments").is_none());
+    }
+
+    #[test]
+    fn diff_semantic_fallbacks_enriched_lists_only_engine_fallbacks() {
+        let repo = fixture_repo();
+        fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+        fs::write(repo.path().join("logo.bin"), [0u8, 159, 146, 150]).unwrap();
+        git(&repo.path, &["add", "."]);
+        git(&repo.path, &["commit", "-m", "second"]);
+
+        let (addr, _body_rx) = spawn_semantic_diff_gateway_mock(json!({
+            "repoId": "repo-sem",
+            "files": [
+                {
+                    "path": "logo.bin",
+                    "fallbackToText": true,
+                    "hunks": [],
+                    "reason": "The semantic engine could not parse this file (unsupported language, binary or unreadable source); use a text diff for it.",
+                },
+                {
+                    "path": "tracked.txt",
+                    "fallbackToText": false,
+                    "hunks": [],
+                    "linesTruncated": false,
+                }
+            ],
+            "pathsTruncated": false,
+        }));
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let payload = tool_payload(&call_tool(
+            "diff.semanticFallbacks",
+            json!({
+                "repoPath": repo.path(),
+                "repoId": "repo-sem",
+                "base": "HEAD~1",
+                "head": "HEAD",
+            }),
+            true,
+        ));
+
+        assert_eq!(payload["source"], "fluxgit-gateway");
+        assert_eq!(payload["data"]["analyzedFiles"], 2);
+        let fallbacks = payload["data"]["fallbacks"].as_array().unwrap();
+        assert_eq!(fallbacks.len(), 1, "only the unparsed file falls back");
+        assert_eq!(fallbacks[0]["path"], "logo.bin");
+        assert_eq!(fallbacks[0]["from"], "diff.semantic");
+        assert_eq!(fallbacks[0]["to"], "diff.text");
+        assert_eq!(fallbacks[0]["supported"], false);
+        assert!(fallbacks[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not parse"));
+    }
+
+    #[test]
+    fn diff_semantic_keeps_honest_fallback_when_gateway_unreachable() {
+        // Port 1 is reserved; nothing listens there. The enriched path must
+        // degrade to the EXACT documented local fallback, never an error and
+        // never a synthesized semantic payload.
+        let _env = GatewayEnvGuard::set("127.0.0.1:1");
+        let repo = fixture_repo();
+        fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+
+        let payload = tool_payload(&call_tool(
+            "diff.semantic",
+            json!({
+                "repoPath": repo.path(),
+                "repoId": "repo-sem",
+                "path": "tracked.txt",
+            }),
+            true,
+        ));
+
+        assert_eq!(payload["source"], "local-git");
+        assert_eq!(payload["data"]["supported"], false);
+        assert_eq!(payload["data"]["fallback"], "diff.text");
+        assert_eq!(
+            payload["data"]["reason"],
+            "Semantic diff is not available in local sidecar fallback mode."
+        );
+        assert_eq!(payload["data"]["textDiffArguments"]["path"], "tracked.txt");
+    }
+
+    #[test]
+    fn diff_semantic_keeps_honest_fallback_when_repo_not_registered() {
+        // Gateway address is set but the repo has no repoId argument and no
+        // FluxGit registry entry: the diff-engine could not resolve it, so
+        // the sidecar must not even dispatch — it keeps the honest fallback.
+        let (addr, body_rx) = spawn_semantic_diff_gateway_mock(json!({ "files": [] }));
+        let _env = GatewayEnvGuard::set(&addr);
+        // The fixture lives at a unique temp path that can never appear in
+        // the FluxGit run-dir registry, and the call omits repoId.
+        let repo = fixture_repo();
+        fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+
+        let payload = tool_payload(&call_tool(
+            "diff.semantic",
+            json!({ "repoPath": repo.path(), "path": "tracked.txt" }),
+            true,
+        ));
+
+        assert_eq!(payload["source"], "local-git");
+        assert_eq!(payload["data"]["supported"], false);
+        assert!(
+            body_rx.try_recv().is_err(),
+            "sidecar must not dispatch to the gateway without a resolvable repoId"
+        );
     }
 
     // ---------------------------------------------------------------------
