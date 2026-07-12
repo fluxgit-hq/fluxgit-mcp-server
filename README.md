@@ -1,4 +1,5 @@
 # fluxgit-mcp-sidecar
+<!-- mcp-name: io.github.fluxgit-hq/fluxgit-mcp-server -->
 
 **Safety-first read-only Model Context Protocol (MCP) server for Git.**
 
@@ -48,7 +49,7 @@ Other MCP Git servers face a choice: stay strictly read-only (limited utility) o
 
 ### 11 write-with-UI-handshake tools
 
-All 6 operations dispatch through the FluxGit gateway when configured (the original 5 as of 2026-05-28; `plan` added 2026-06-10). The sidecar POSTs the proposal to the gateway's handshake server, the FluxGit app renders an "🤖 Requested by AI agent" approval card per operation type, and the sidecar polls until the user approves, rejects, or the proposal expires. When the gateway is not reachable, the sidecar returns `write_handshake_pending` (code 10003) so the agent can recommend the user perform the action in FluxGit UI.
+All 10 `operation.preview.*` proposals dispatch through the FluxGit gateway when configured (the original 5 as of 2026-05-28; `plan`, `worktree`, `commit`, `push` and `branch` added since). The sidecar POSTs the proposal to the gateway's handshake server, the FluxGit app renders an "🤖 Requested by AI agent" approval card per operation type, and the sidecar polls until the user approves, rejects, or the proposal expires. When the gateway is not reachable, the sidecar returns `write_handshake_pending` (code 10003) so the agent can recommend the user perform the action in FluxGit UI.
 
 | Tool | Purpose | Gateway dispatch |
 |---|---|---|
@@ -120,7 +121,7 @@ Host: 127.0.0.1:59647
 
 The sidecar returns the result to the agent as `isError: false`. Any terminal status other than `completed` (`rejected`, `failed`, `expired`) returns `isError: true` with the structured payload, so the agent can report the rejection reason cleanly without inventing an outcome.
 
-The same pattern applies to all 6 operations. Only the request body fields and the `result` shape differ; the polling, state machine, and error semantics are shared. The full per-operation contract lives in §14 of the [Master Playbook](https://github.com/FluxGit/fluxgit/blob/main/product/mcp/PLAYBOOK.md).
+The same pattern applies to all 10 `operation.preview.*` tools. Only the request body fields and the `result` shape differ; the polling, state machine, and error semantics are shared. The full per-operation contract ships with the FluxGit desktop app and is summarized at [fluxgit.com/features/mcp-agent-git](https://fluxgit.com/features/mcp-agent-git/).
 
 ---
 
@@ -133,11 +134,19 @@ Tier classification:
 - **Free shell** — work with local `git` only: `repo.brief`, `repo.scope`, `repo.status`, `repo.refs`, `repo.branchStack`, `repo.history`, `repo.reflog`, `commit.details`, `worktree.changes`, `worktree.list`, `submodule.status`, `diff.text`, `conflict.read`.
 - **Hybrid** — work locally with documented fallback, enriched by FluxGit: `fleet.radar`, `diff.semantic`, `diff.semanticFallbacks`, `repo.conflictPreflight`.
 - **FluxGit-required** — return `gateway_not_configured` without FluxGit because synthesizing them from local refs alone would mislead the agent: `safety.timeline`, `safety.eventDetails`, `flux.latestRestorePoint`, `flux.restorePoints`, `flux.restorePointDetails`.
-- **Write handshake** — route through FluxGit UI approval via the gateway handshake server (as of 2026-05-28); return `write_handshake_pending` (code 10003) only when the gateway is unreachable or polling times out: the 6 `operation.preview.*` tools above.
+- **Write handshake** — route through FluxGit UI approval via the gateway handshake server (as of 2026-05-28); return `write_handshake_pending` (code 10003) only when the gateway is unreachable or polling times out: the 10 `operation.preview.*` tools above, plus `operation.cancel`.
 
 ---
 
 ## Quick start
+
+One-line install (puts `fluxgit-mcp-sidecar` on your PATH):
+
+```bash
+cargo install --git https://github.com/fluxgit-hq/fluxgit-mcp-server fluxgit-mcp-sidecar
+```
+
+Or build from a clone:
 
 ```bash
 # Build
@@ -271,7 +280,7 @@ Error codes:
 
 ## Status
 
-This is a working MCP server. The read-only surface is implemented and tested. The write-with-UI-handshake protocol is **live as of 2026-05-28**: all 5 `operation.preview.*` tools dispatch through the gateway handshake server, render an "🤖 Requested by AI agent" approval card in the FluxGit app, and complete through the existing safety pipeline (restore points + audit). Clients see structured terminal results (`completed | rejected | failed | expired`) instead of a placeholder error. The contract is forward-stable.
+This is a working MCP server. The read-only surface is implemented and tested. The write-with-UI-handshake protocol is **live as of 2026-05-28**: all 10 `operation.preview.*` tools dispatch through the gateway handshake server, render an "🤖 Requested by AI agent" approval card in the FluxGit app, and complete through the existing safety pipeline (restore points + audit). Clients see structured terminal results (`completed | rejected | failed | expired`) instead of a placeholder error. The contract is forward-stable.
 
 ## Roadmap
 
@@ -287,5 +296,4 @@ Apache-2.0. See `LICENSE`.
 ## Related
 
 - [FluxGit](https://fluxgit.com) — the desktop app that produces the FluxGit-powered context.
-- [Master Playbook](https://github.com/FluxGit/fluxgit/blob/main/product/mcp/PLAYBOOK.md) — internal source of truth for positioning, tool catalog, contracts and roadmap.
-- [Agent Client Guide](https://github.com/FluxGit/fluxgit/blob/main/AGENT_MCP_CLIENT_GUIDE.md) — technical rules for connected agents.
+- [MCP for agents — feature page](https://fluxgit.com/features/mcp-agent-git/) — capabilities, write-handshake contract and roadmap.
