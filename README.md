@@ -1,11 +1,62 @@
 # fluxgit-mcp-sidecar
 <!-- mcp-name: io.github.fluxgit-hq/fluxgit-mcp-server -->
 
-**Safety-first read-only Model Context Protocol (MCP) server for Git.**
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Glama score](https://glama.ai/mcp/servers/fluxgit-hq/fluxgit-mcp-server/badges/score.svg)](https://glama.ai/mcp/servers/fluxgit-hq/fluxgit-mcp-server)
+[![MCP](https://img.shields.io/badge/MCP-2024--11--05-6E56CF.svg)](https://modelcontextprotocol.io)
 
-> AI agents inspect. FluxGit keeps control.
+**The Git MCP server that lets your AI agent read everything and change nothing without your approval.**
 
-A Rust MCP server that exposes 34 carefully designed tools for AI code agents to navigate Git repositories without ever being able to silently mutate them. Built as the bridge between MCP-compatible agents and the [FluxGit](https://fluxgit.com) desktop application.
+Reads are open. Every write is a proposal you review and approve (or reject) in the FluxGit desktop app before a single ref moves.
+
+![An AI agent proposes a merge; FluxGit shows the diff, the reason and a conflict preflight, and waits for the human to approve or reject.](docs/demo-approve.gif)
+
+## What it is
+
+`fluxgit-mcp-sidecar` is a Rust MCP server that gives MCP-compatible agents (Claude Code, Cursor, Codex, and any other MCP host) rich, structured Git context (branch state, diffs, reflog, conflicts, lost commits) without ever letting them silently mutate your repository. Reads are unrestricted. Writes never execute from the agent directly: the agent proposes, FluxGit renders an approval card with a full preview, and the change runs through FluxGit's safety pipeline (restore points + audit) only after you click approve. That is the whole idea: **approve-before-it-runs**, not clean-up-after.
+
+## 30-second quickstart
+
+One-line install (puts `fluxgit-mcp-sidecar` on your PATH):
+
+```bash
+cargo install --git https://github.com/fluxgit-hq/fluxgit-mcp-server fluxgit-mcp-sidecar
+```
+
+Then point any MCP host at it. No client-specific install required:
+
+```json
+{
+  "mcpServers": {
+    "fluxgit": {
+      "command": "/absolute/path/to/fluxgit-mcp-sidecar",
+      "env": {
+        "FLUXGIT_GATEWAY_ADDR": "127.0.0.1:14660",
+        "FLUXGIT_MCP_AUDIT_LOG": "/optional/path/to/audit.jsonl"
+      }
+    }
+  }
+}
+```
+
+`FLUXGIT_GATEWAY_ADDR` connects the sidecar to the FluxGit desktop app and unlocks the write-approval flow plus real semantic diffs; without it the read-only tier still works standalone against local `git`. `FLUXGIT_MCP_AUDIT_LOG` enables an append-only, optionally Ed25519-signed audit log of every call (arguments are hashed, never stored verbatim).
+
+## What your agent gets
+
+**23 read-only tools, built for context budgets.** Instead of shelling out 6-10 raw `git` commands and flooding the context window, an agent opens a session with one `repo.brief` call: branch, ahead/behind, in-progress operation, working-tree summary, stashes, submodule drift, recent commits and detected conventions. In a measured comparison that single call returned the same situational awareness for **607 tokens** where the equivalent raw git output ran **1,886** — about a third of the context. `diff.semantic` adds precision: real per-file, per-token structural hunks instead of a text patch the agent has to re-parse. The full catalog is in [What's exposed](#whats-exposed) below.
+
+**11 write tools, every one gated by a human.** merge, rebase, reset, discard, patch, commit, push and branch, plus a multi-step `plan` and a `cancel` — all of them are proposals. Each requires a free-text `reason`, dispatches to the FluxGit app as the approval card shown above, and only executes after you approve. Destructive modes force stronger confirmation; completed merges, rebases and resets return a restore point, so the change stays reversible from FluxGit's Safety Timeline.
+
+## Free shell vs FluxGit desktop — stated honestly
+
+- **Free shell (this repo, Apache-2.0, no account):** the free-tier read-only tools — 13 of them, from `repo.status`, `repo.refs`, `repo.history`, `repo.reflog`, `diff.text`, `conflict.read`, `commit.details`, `worktree.list` and `submodule.status` up to `repo.brief`/`repo.scope` — run standalone against your local `git`. Nothing to buy, nothing to sign up for.
+- **With the FluxGit desktop app running:** the 11 write tools become approvable actions, `diff.semantic` serves real structural payloads from FluxGit's diff engine, and the FluxGit-only tools (safety timeline, restore points) light up. Without the app they degrade honestly: FluxGit-required tools return `gateway_not_configured` and write tools return `write_handshake_pending` (code 10003), never a fake success.
+
+## Made for the agents you already use
+
+- **Claude Code** → [fluxgit.com/for/claude-code](https://fluxgit.com/for/claude-code)
+- **Cursor** → [fluxgit.com/for/cursor](https://fluxgit.com/for/cursor)
+- **Codex** → [fluxgit.com/for/codex](https://fluxgit.com/for/codex)
 
 ---
 
@@ -138,15 +189,7 @@ Tier classification:
 
 ---
 
-## Quick start
-
-One-line install (puts `fluxgit-mcp-sidecar` on your PATH):
-
-```bash
-cargo install --git https://github.com/fluxgit-hq/fluxgit-mcp-server fluxgit-mcp-sidecar
-```
-
-Or build from a clone:
+## Build from a clone
 
 ```bash
 # Build
@@ -156,27 +199,7 @@ cargo build --release
 ./target/release/fluxgit-mcp-sidecar
 ```
 
-### Connect any MCP-compatible agent
-
-Paste the generic block below into any MCP host config. No client-specific install required.
-
-```json
-{
-  "mcpServers": {
-    "fluxgit": {
-      "command": "/absolute/path/to/fluxgit-mcp-sidecar",
-      "env": {
-        "FLUXGIT_GATEWAY_ADDR": "127.0.0.1:14660",
-        "FLUXGIT_MCP_AUDIT_LOG": "/optional/path/to/audit.jsonl"
-      }
-    }
-  }
-}
-```
-
-`FLUXGIT_GATEWAY_ADDR` unlocks the FluxGit-powered tier. Without it, the free-shell tier still works.
-
-`FLUXGIT_MCP_AUDIT_LOG` enables an append-only JSONL audit log of every `tools/call`. Arguments are hashed; raw paths and identifiers are never written verbatim.
+See [30-second quickstart](#30-second-quickstart) above for the one-line install and the MCP host config block.
 
 ---
 
