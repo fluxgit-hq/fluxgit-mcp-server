@@ -2586,6 +2586,9 @@ fn repo_conflict_preflight_payload(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid_params_error("repo.conflictPreflight requires targetRef"))?;
+    // Both are interpolated into a rev spec below and handed to git as argv.
+    let current_ref = checked_rev(current_ref, "currentRef")?;
+    let target_ref = checked_rev(target_ref, "targetRef")?;
 
     let current_spec = format!("{current_ref}^{{commit}}");
     let target_spec = format!("{target_ref}^{{commit}}");
@@ -2904,6 +2907,7 @@ fn repo_reflog_payload(repo_path: &Path, arguments: &Value) -> Result<Value, Jso
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("HEAD");
+    let ref_name = checked_rev(ref_name, "refName")?;
     let limit = arguments
         .get("limit")
         .and_then(Value::as_u64)
@@ -2994,6 +2998,7 @@ fn commit_details_payload(repo_path: &Path, arguments: &Value) -> Result<Value, 
         .get("commit")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_params_error("missing commit"))?;
+    let commit = checked_rev(commit, "commit")?;
     let details = run_git(
         repo_path,
         &[
@@ -3133,10 +3138,10 @@ fn diff_text_payload(repo_path: &Path, arguments: &Value) -> Result<Value, JsonR
         .map(|value| value.max(1) as usize);
 
     let mut args = vec!["diff"];
-    if let Some(base) = base {
+    if let Some(base) = checked_rev_opt(base, "base")? {
         args.push(base);
     }
-    if let Some(head) = head {
+    if let Some(head) = checked_rev_opt(head, "head")? {
         args.push(head);
     }
     if let Some(path) = path_filter.as_deref() {
@@ -3269,10 +3274,13 @@ fn semantic_changed_paths(
     path_filter: Option<&str>,
 ) -> Option<(Vec<String>, bool)> {
     let mut args = vec!["diff", "--name-only"];
-    if let Some(base) = base {
+    // Unchecked revs here would be `git diff --output=<file>` — see `checked_rev`.
+    // This helper returns Option, so a rejected rev degrades to the documented
+    // fallback rather than erroring, consistent with the rest of the function.
+    if let Some(base) = checked_rev_opt(base, "base").ok()? {
         args.push(base);
     }
-    if let Some(head) = head {
+    if let Some(head) = checked_rev_opt(head, "head").ok()? {
         args.push(head);
     }
     if let Some(path) = path_filter {
@@ -3340,8 +3348,10 @@ fn semantic_gateway_tool_payload(
     // registry; enrichment therefore requires the repo to be registered
     // (opened) in FluxGit, or an explicit repoId argument.
     let repo_id = repo_id_from_arguments_or_registry(arguments, repo_path)?;
-    let base = arguments.get("base").and_then(Value::as_str);
-    let head = arguments.get("head").and_then(Value::as_str);
+    // This path degrades to the documented fallback rather than erroring, so a
+    // rejected rev bails out to `None` like any other unusable selection.
+    let base = checked_rev_opt(arguments.get("base").and_then(Value::as_str), "base").ok()?;
+    let head = checked_rev_opt(arguments.get("head").and_then(Value::as_str), "head").ok()?;
     let path_filter = diff_path_filter(arguments, repo_path);
     let (paths, files_truncated) =
         semantic_changed_paths(repo_path, base, head, path_filter.as_deref())?;
@@ -3892,6 +3902,40 @@ fn invalid_params_error(details: &str) -> JsonRpcError {
         code: -32602,
         message: "Invalid params".into(),
         data: Some(json!({ "details": details })),
+    }
+}
+
+/// Rejects a caller-supplied revision/ref that git would read as an option.
+///
+/// This is what keeps the read-only guarantee actually true. Every tool here is
+/// annotated `read_only_hint: true` and listed in `READ_ONLY_TOOL_KINDS`, but
+/// the git commands underneath take option-like positional values: `git diff`,
+/// `git log` and `git show` all accept `--output=<file>`, which truncates and
+/// writes that file. Without this guard an agent could call `diff.text` with
+/// `base: "--output=/home/user/.zshrc"` and turn a read-only tool into an
+/// arbitrary file write. git-core guards its own argv the same way (see
+/// `commitish_arg_for_repo`); the sidecar had no equivalent.
+///
+/// Anything starting with `-` is refused outright. A legitimate revision never
+/// does — `git rev-parse` itself will not resolve one — so this rejects no real
+/// input. Callers that need a literal path use the `--` separator instead.
+fn checked_rev<'a>(value: &'a str, field: &str) -> Result<&'a str, JsonRpcError> {
+    if value.starts_with('-') {
+        return Err(invalid_params_error(&format!(
+            "{field} must not start with '-': git would read it as an option rather than a revision"
+        )));
+    }
+    Ok(value)
+}
+
+/// `checked_rev` for optional arguments: `None` stays `None`, `Some` is checked.
+fn checked_rev_opt<'a>(
+    value: Option<&'a str>,
+    field: &str,
+) -> Result<Option<&'a str>, JsonRpcError> {
+    match value {
+        Some(value) => checked_rev(value, field).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -6087,6 +6131,73 @@ mod tests {
 
         let frame = read_frame(&mut input).unwrap().unwrap();
         assert_eq!(frame, body);
+    }
+
+    // A "read-only" tool that hands an agent-supplied rev straight to git as
+    // positional argv is not read-only: `git diff`, `git log` and `git show` all
+    // accept `--output=<file>`, which truncates and writes that file. These
+    // tests pin the guard that keeps the READ_ONLY_TOOL_KINDS promise true.
+    #[test]
+    fn checked_rev_rejects_option_like_revisions() {
+        // The exact shape of the escape: a write dressed as a revision.
+        let error = checked_rev("--output=/tmp/pwned", "base").unwrap_err();
+        assert_eq!(error.code, -32602);
+        let details = error.data.unwrap()["details"].as_str().unwrap().to_string();
+        assert!(details.contains("base"), "error names the offending field: {details}");
+        assert!(details.contains("'-'"), "error explains the rule: {details}");
+
+        assert!(checked_rev("-n1", "commit").is_err());
+        assert!(checked_rev("--upload-pack=sh", "head").is_err());
+    }
+
+    #[test]
+    fn checked_rev_accepts_real_revisions() {
+        // Nothing a genuine revision looks like may be rejected.
+        for rev in [
+            "HEAD",
+            "HEAD~3",
+            "HEAD^{commit}",
+            "main",
+            "origin/main",
+            "refs/heads/feature/login",
+            "v1.2.3",
+            "9fceb02d0ae598e95dc970b74767f19372d61af8",
+            "main@{yesterday}",
+        ] {
+            assert!(checked_rev(rev, "rev").is_ok(), "rejected a real revision: {rev}");
+        }
+
+        // The optional variant leaves absent arguments absent.
+        assert_eq!(checked_rev_opt(None, "base").unwrap(), None);
+        assert_eq!(checked_rev_opt(Some("HEAD"), "base").unwrap(), Some("HEAD"));
+        assert!(checked_rev_opt(Some("--output=/tmp/pwned"), "base").is_err());
+    }
+
+    #[test]
+    fn read_only_tools_reject_option_like_revisions_before_reaching_git() {
+        let repo = Path::new("/nonexistent-repo-path");
+
+        // Each of these would otherwise reach git's argv as a positional value.
+        // The guard must fire first, so the error is "invalid params", never a
+        // git invocation — note the repo path does not even exist, so anything
+        // that got as far as running git would fail differently.
+        let cases: Vec<(&str, Value)> = vec![
+            ("diff.text base", json!({ "base": "--output=/tmp/pwned" })),
+            ("diff.text head", json!({ "head": "--output=/tmp/pwned" })),
+            ("commit.details", json!({ "commit": "--output=/tmp/pwned" })),
+            ("repo.reflog", json!({ "refName": "--output=/tmp/pwned" })),
+        ];
+
+        for (label, arguments) in cases {
+            let result = match label {
+                l if l.starts_with("diff.text") => diff_text_payload(repo, &arguments),
+                "commit.details" => commit_details_payload(repo, &arguments),
+                "repo.reflog" => repo_reflog_payload(repo, &arguments),
+                other => panic!("unhandled case {other}"),
+            };
+            let error = result.expect_err(&format!("{label} accepted an option-like revision"));
+            assert_eq!(error.code, -32602, "{label} did not fail as invalid params");
+        }
     }
 
     #[test]
