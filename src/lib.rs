@@ -21,6 +21,16 @@ pub struct McpSidecar {
     gateway_state: GatewayState,
     audit_log: Option<PathBuf>,
     audit_signer: Option<AuditSigner>,
+    /// The connected agent's own name, taken from `clientInfo.name` in the MCP
+    /// `initialize` request.
+    ///
+    /// Every dispatch used to send a hardcoded "external-mcp-sidecar", so the
+    /// per-agent policy in PLAYBOOK §14.10 could never match a real agent — a
+    /// rule for `agent-claude` was dead text — and all connected agents shared
+    /// one MAX_PENDING_PER_AGENT budget, letting a chatty agent starve another.
+    /// It is a self-declared name, not an authenticated identity: it makes
+    /// policy and quotas addressable, and is not a security boundary.
+    client_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Per-install Ed25519 audit signer. Loaded once at startup from
@@ -523,6 +533,7 @@ impl McpSidecar {
             gateway_state,
             audit_log: mcp_audit_log_path(),
             audit_signer: load_audit_signer_from_env(),
+            client_id: Default::default(),
         }
     }
 
@@ -535,6 +546,7 @@ impl McpSidecar {
             },
             audit_log: None,
             audit_signer: None,
+            client_id: Default::default(),
         }
     }
 
@@ -547,6 +559,7 @@ impl McpSidecar {
             },
             audit_log: Some(audit_log),
             audit_signer: None,
+            client_id: Default::default(),
         }
     }
 
@@ -565,6 +578,7 @@ impl McpSidecar {
             },
             audit_log: Some(audit_log),
             audit_signer: Some(signer),
+            client_id: Default::default(),
         }
     }
 
@@ -583,6 +597,19 @@ impl McpSidecar {
 
         output.flush()?;
         Ok(())
+    }
+
+    /// The agent id sent to the gateway on every dispatch.
+    ///
+    /// Falls back to the old constant when a client did not identify itself, so
+    /// an existing `external-mcp-sidecar` policy rule keeps working rather than
+    /// silently ceasing to match.
+    fn agent_id(&self) -> String {
+        self.client_id
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "external-mcp-sidecar".to_string())
     }
 
     pub fn handle_frame(&self, frame: &[u8]) -> Option<Vec<u8>> {
@@ -652,12 +679,29 @@ impl McpSidecar {
 
         let id = request.id.unwrap_or(Value::Null);
         let response = match request.method.as_str() {
-            "initialize" => JsonRpcResponse {
+            "initialize" => {
+                // MCP sends the agent's own name here. Capturing it is what
+                // makes per-agent policy and per-agent quotas addressable at
+                // all; before this every agent arrived as one hardcoded id.
+                if let Some(name) = request
+                    .params
+                    .get("clientInfo")
+                    .and_then(|c| c.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                {
+                    if let Ok(mut slot) = self.client_id.lock() {
+                        *slot = Some(name.to_string());
+                    }
+                }
+                JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
                 result: Some(json!(InitializeResult::new())),
                 error: None,
-            },
+                }
+            }
             "tools/list" => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -743,7 +787,7 @@ impl McpSidecar {
             return operation_status_tool_call(arguments);
         }
         if kind == ToolKind::OperationCancel {
-            return operation_cancel_tool_call(arguments);
+            return operation_cancel_tool_call(&self.agent_id(), arguments);
         }
 
         // Write-with-UI-handshake tools (PLAYBOOK §10, §14.2, §14.7):
@@ -759,34 +803,34 @@ impl McpSidecar {
             if let Some(addr) = resolve_handshake_addr() {
                 let dispatched = match kind {
                     ToolKind::OperationPreviewMerge => {
-                        dispatch_operation_preview_merge(&addr, arguments)
+                        dispatch_operation_preview_merge(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewRebase => {
-                        dispatch_operation_preview_rebase(&addr, arguments)
+                        dispatch_operation_preview_rebase(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewDiscard => {
-                        dispatch_operation_preview_discard(&addr, arguments)
+                        dispatch_operation_preview_discard(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewReset => {
-                        dispatch_operation_preview_reset(&addr, arguments)
+                        dispatch_operation_preview_reset(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewPatch => {
-                        dispatch_operation_preview_patch(&addr, arguments)
+                        dispatch_operation_preview_patch(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewPlan => {
-                        dispatch_operation_preview_plan(&addr, arguments)
+                        dispatch_operation_preview_plan(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewWorktree => {
-                        dispatch_operation_preview_worktree(&addr, arguments)
+                        dispatch_operation_preview_worktree(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewCommit => {
-                        dispatch_operation_preview_commit(&addr, arguments)
+                        dispatch_operation_preview_commit(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewPush => {
-                        dispatch_operation_preview_push(&addr, arguments)
+                        dispatch_operation_preview_push(&addr, &self.agent_id(), arguments)
                     }
                     ToolKind::OperationPreviewBranch => {
-                        dispatch_operation_preview_branch(&addr, arguments)
+                        dispatch_operation_preview_branch(&addr, &self.agent_id(), arguments)
                     }
                     _ => None,
                 };
@@ -1130,6 +1174,22 @@ fn operation_risk(kind: ToolKind) -> &'static str {
 /// without leaking paths or ref names. Labeled `sha256:` so verifiers know
 /// the algorithm (the pre-hardening `fnv1a64:` label is retired — FNV-1a is
 /// not collision-resistant and must not anchor an audit trail).
+/// A stable idempotency key for one logical operation.
+///
+/// The gateway has always had `find_active_by_idempotency` and an
+/// `idempotency_key` field on every request struct — tested, correct, and dead,
+/// because the sidecar never sent one. Without it a retrying agent minted a
+/// fresh previewId per attempt, producing ten separate approval cards for one
+/// intention and then a 429: the exact approval fatigue the per-agent cap exists
+/// to prevent.
+///
+/// Derived from the tool name and the arguments, so the same request retried
+/// yields the same key while a genuinely different request does not.
+fn idempotency_key_for(tool: &str, arguments: &Value) -> Option<String> {
+    let fingerprint = arguments_fingerprint(arguments)?;
+    Some(format!("{tool}:{fingerprint}"))
+}
+
 fn arguments_fingerprint(arguments: &Value) -> Option<String> {
     use sha2::{Digest, Sha256};
     if arguments.is_null() {
@@ -3536,7 +3596,27 @@ fn find_repo_id_by_path(repo_path: &Path) -> Option<String> {
     None
 }
 
+/// A repo id is a file name component here, never a path.
+///
+/// `flux_checkpoint_path` joins it straight into `<runDir>/rebase/<id>.json`,
+/// and both `repoId` and `runDir` arrive verbatim from agent arguments. A
+/// `repoId` of `../../secret` therefore read any JSON file on the machine and
+/// echoed its `plan` object back — from tools annotated `readOnlyHint: true`.
+/// `repo.scope` already rejected `..` in paths; this is the same guard where it
+/// was missing.
+fn is_safe_repo_id_component(repo_id: &str) -> bool {
+    !repo_id.is_empty()
+        && !repo_id.contains('/')
+        && !repo_id.contains('\\')
+        && !repo_id.contains('\0')
+        && repo_id != "."
+        && repo_id != ".."
+}
+
 fn flux_checkpoint_path(repo_id: &str, arguments: &Value) -> Option<PathBuf> {
+    if !is_safe_repo_id_component(repo_id) {
+        return None;
+    }
     let run_dir = arguments
         .get("runDir")
         .and_then(Value::as_str)
@@ -3726,6 +3806,13 @@ fn diff_path_filter(arguments: &Value, repo_path: &Path) -> Option<String> {
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, JsonRpcError> {
     let output = Command::new("git")
+        // The one place "read everything and change nothing" was literally
+        // false: `git status` and `git diff` opportunistically refresh the stat
+        // cache, which rewrites .git/index and takes index.lock. Measured — the
+        // index sha256 changed after repo.status. Harmless to content, but it
+        // is a write inside .git and the lock can collide with a human
+        // operation in progress while an agent polls.
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(repo_path)
         .args(args)
@@ -3746,6 +3833,13 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, JsonRpcError> {
 /// lossy UTF-8 conversion before binary detection would corrupt the signal.
 fn run_git_bytes(repo_path: &Path, args: &[&str]) -> Result<Vec<u8>, JsonRpcError> {
     let output = Command::new("git")
+        // The one place "read everything and change nothing" was literally
+        // false: `git status` and `git diff` opportunistically refresh the stat
+        // cache, which rewrites .git/index and takes index.lock. Measured — the
+        // index sha256 changed after repo.status. Harmless to content, but it
+        // is a write inside .git and the lock can collide with a human
+        // operation in progress while an agent polls.
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(repo_path)
         .args(args)
@@ -5102,6 +5196,7 @@ fn dispatch_operation_preview_request(
 /// Build the merge body and dispatch (PLAYBOOK §14.3).
 fn dispatch_operation_preview_merge(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5135,7 +5230,8 @@ fn dispatch_operation_preview_merge(
 
     let body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("merge", arguments),
         "operationType": "merge",
         "repoPath": repo_path,
         "sourceRef": source_ref,
@@ -5157,6 +5253,7 @@ fn dispatch_operation_preview_merge(
 /// Build the rebase body and dispatch (PLAYBOOK §14.7).
 fn dispatch_operation_preview_rebase(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5189,7 +5286,8 @@ fn dispatch_operation_preview_rebase(
 
     let body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("rebase", arguments),
         "operationType": "rebase",
         "repoPath": repo_path,
         "currentRef": current_ref,
@@ -5211,6 +5309,7 @@ fn dispatch_operation_preview_rebase(
 /// Build the discard body and dispatch (PLAYBOOK §14.7).
 fn dispatch_operation_preview_discard(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5238,7 +5337,8 @@ fn dispatch_operation_preview_discard(
 
     let body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("discard", arguments),
         "operationType": "discard",
         "repoPath": repo_path,
         "paths": paths,
@@ -5258,6 +5358,7 @@ fn dispatch_operation_preview_discard(
 /// Build the reset body and dispatch (PLAYBOOK §14.7).
 fn dispatch_operation_preview_reset(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5286,7 +5387,8 @@ fn dispatch_operation_preview_reset(
 
     let body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("reset", arguments),
         "operationType": "reset",
         "repoPath": repo_path,
         "targetRef": target_ref,
@@ -5307,6 +5409,7 @@ fn dispatch_operation_preview_reset(
 /// Build the patch body and dispatch (PLAYBOOK §14.7).
 fn dispatch_operation_preview_patch(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5334,7 +5437,8 @@ fn dispatch_operation_preview_patch(
 
     let body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("patch", arguments),
         "operationType": "patch",
         "repoPath": repo_path,
         "patchContent": patch_content,
@@ -5354,6 +5458,7 @@ fn dispatch_operation_preview_patch(
 
 fn dispatch_operation_preview_plan(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5375,7 +5480,8 @@ fn dispatch_operation_preview_plan(
 
     let body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("plan", arguments),
         "operationType": "plan",
         "repoPath": repo_path,
         "steps": steps,
@@ -5397,6 +5503,7 @@ fn dispatch_operation_preview_plan(
 /// out of the body and FluxGit picks a sane default location.
 fn dispatch_operation_preview_worktree(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5425,7 +5532,8 @@ fn dispatch_operation_preview_worktree(
 
     let mut body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("worktree", arguments),
         "operationType": "worktree",
         "repoPath": repo_path,
         "branch": branch,
@@ -5451,6 +5559,7 @@ fn dispatch_operation_preview_worktree(
 /// `stageAll` is true). Amend is intentionally not supported.
 fn dispatch_operation_preview_commit(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5483,7 +5592,8 @@ fn dispatch_operation_preview_commit(
 
     let mut body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("commit", arguments),
         "operationType": "commit",
         "repoPath": repo_path,
         "message": message,
@@ -5509,6 +5619,7 @@ fn dispatch_operation_preview_commit(
 /// checked-out branch). `forceWithLease: true` renders a HIGH risk card.
 fn dispatch_operation_preview_push(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5546,7 +5657,8 @@ fn dispatch_operation_preview_push(
 
     let mut body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("push", arguments),
         "operationType": "push",
         "repoPath": repo_path,
         "remote": remote,
@@ -5572,6 +5684,7 @@ fn dispatch_operation_preview_push(
 /// is optional (omitted → HEAD); `checkout` defaults to true.
 fn dispatch_operation_preview_branch(
     gateway_addr: &str,
+    agent_id: &str,
     arguments: &Value,
 ) -> Option<ToolCallResult> {
     let preview_id = uuid::Uuid::new_v4().to_string();
@@ -5604,7 +5717,8 @@ fn dispatch_operation_preview_branch(
 
     let mut body = json!({
         "previewId": preview_id,
-        "agentId": "external-mcp-sidecar",
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("branch", arguments),
         "operationType": "branch",
         "repoPath": repo_path,
         "name": name,
@@ -5810,7 +5924,7 @@ fn operation_status_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonR
 }
 
 /// `operation.cancel` — withdraw one of this agent's own pending proposals.
-fn operation_cancel_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonRpcError> {
+fn operation_cancel_tool_call(agent_id: &str, arguments: &Value) -> Result<ToolCallResult, JsonRpcError> {
     let preview_id = arguments
         .get("previewId")
         .and_then(Value::as_str)
@@ -5830,7 +5944,7 @@ fn operation_cancel_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonR
     };
     let response = match client
         .post(&cancel_url)
-        .json(&json!({ "agentId": "external-mcp-sidecar" }))
+        .json(&json!({ "agentId": agent_id }))
         .send()
     {
         Ok(response) => response,
@@ -6174,6 +6288,90 @@ mod tests {
     }
 
     #[test]
+    fn the_same_request_retried_carries_the_same_idempotency_key() {
+        // The gateway's find_active_by_idempotency was correct and dead: the
+        // sidecar never sent a key, so a retrying agent produced one approval
+        // card per attempt and then a 429 — the approval fatigue the per-agent
+        // cap exists to prevent.
+        let args = json!({ "repoPath": "/tmp/r", "sourceRef": "feature", "targetRef": "main" });
+        let a = idempotency_key_for("merge", &args).expect("a key");
+        let b = idempotency_key_for("merge", &args).expect("a key");
+        assert_eq!(a, b, "the same request must reuse its card, not mint a new one");
+
+        // A different operation over identical arguments is a different card.
+        let other_op = idempotency_key_for("rebase", &args).expect("a key");
+        assert_ne!(a, other_op);
+
+        // And a different request is genuinely different.
+        let other_args = json!({ "repoPath": "/tmp/r", "sourceRef": "other", "targetRef": "main" });
+        assert_ne!(a, idempotency_key_for("merge", &other_args).expect("a key"));
+
+        // Null arguments carry no key rather than a misleading constant one.
+        assert!(idempotency_key_for("merge", &Value::Null).is_none());
+    }
+
+
+    #[test]
+    fn the_connected_agent_identifies_itself_instead_of_sharing_one_id() {
+        // Every dispatch sent a hardcoded "external-mcp-sidecar", so a policy
+        // rule for a named agent could never match, and all agents shared one
+        // MAX_PENDING_PER_AGENT budget.
+        let sidecar = McpSidecar::new_for_tests(true);
+        assert_eq!(
+            sidecar.agent_id(),
+            "external-mcp-sidecar",
+            "an agent that never identified itself keeps the old id, so existing rules still match"
+        );
+
+        let init = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "clientInfo": { "name": "claude-code", "version": "1.0" } }
+        }))
+        .unwrap();
+        sidecar.handle_frame(&init);
+        assert_eq!(sidecar.agent_id(), "claude-code");
+
+        // A blank or absent name must not overwrite a good one with junk.
+        let blank = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "initialize",
+            "params": { "clientInfo": { "name": "   " } }
+        }))
+        .unwrap();
+        sidecar.handle_frame(&blank);
+        assert_eq!(sidecar.agent_id(), "claude-code");
+    }
+
+
+    #[test]
+    fn a_repo_id_cannot_escape_the_run_directory() {
+        // Demonstrated against the real binary before the fix: repoId
+        // "../../secret" made flux.restorePoints return restoreCount 1 and echo
+        // the target file's entire `plan` object — arbitrary JSON read from a
+        // tool annotated readOnlyHint: true, plus a file-existence oracle.
+        let args = json!({ "runDir": "/tmp/flux-run" });
+        for hostile in [
+            "../../secret",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "",
+        ] {
+            assert!(
+                flux_checkpoint_path(hostile, &args).is_none(),
+                "repoId {hostile:?} was allowed to build a path"
+            );
+        }
+
+        // A normal id still resolves, or the tools would simply stop working.
+        let ok = flux_checkpoint_path("repo-1", &args).expect("a plain id must resolve");
+        assert!(ok.ends_with("rebase/repo-1.json"), "got {ok:?}");
+    }
+
+
+    #[test]
     fn read_only_tools_reject_option_like_revisions_before_reaching_git() {
         let repo = Path::new("/nonexistent-repo-path");
 
@@ -6186,6 +6384,16 @@ mod tests {
             ("diff.text head", json!({ "head": "--output=/tmp/pwned" })),
             ("commit.details", json!({ "commit": "--output=/tmp/pwned" })),
             ("repo.reflog", json!({ "refName": "--output=/tmp/pwned" })),
+            // These two were guarded in code but pinned by nothing, so a future
+            // edit could drop checked_rev on them without failing a test.
+            (
+                "repo.conflictPreflight currentRef",
+                json!({ "currentRef": "--output=/tmp/pwned", "targetRef": "main" }),
+            ),
+            (
+                "repo.conflictPreflight targetRef",
+                json!({ "currentRef": "main", "targetRef": "--output=/tmp/pwned" }),
+            ),
         ];
 
         for (label, arguments) in cases {
@@ -6193,6 +6401,9 @@ mod tests {
                 l if l.starts_with("diff.text") => diff_text_payload(repo, &arguments),
                 "commit.details" => commit_details_payload(repo, &arguments),
                 "repo.reflog" => repo_reflog_payload(repo, &arguments),
+                l if l.starts_with("repo.conflictPreflight") => {
+                    repo_conflict_preflight_payload(repo, &arguments)
+                }
                 other => panic!("unhandled case {other}"),
             };
             let error = result.expect_err(&format!("{label} accepted an option-like revision"));

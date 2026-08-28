@@ -281,17 +281,30 @@ Every `tools/call` is optionally appended to a JSONL file pointed at by `FLUXGIT
 
 ```json
 {
-  "ts": "...",
+  "id": "mcp-1712345678901-repo.status",
+  "timestamp": 1712345678901,
+  "event_type": "tool_call",
   "tool": "repo.status",
-  "tier": "free" | "fluxgit" | "fluxgit-write-handshake",
-  "ok": true,
-  "argumentsHash": "sha256:...",
-  "repoScope": "...",
+  "readOnly": true,
+  "sidecarReadOnly": true,
+  "risk": "read",
+  "approval": "none",
+  "result": "ok",
+  "args_fingerprint": "sha256:...",
+  "repo_scope": "...",
   "summary": "...",
+  "duration_ms": 12,
+  "session_id": "...",
   "signature": "base64url-ed25519",
   "signatureKeyId": "1a2b3c4d5e6f7a8b"
 }
 ```
+
+Field names are the ones the code actually emits, verified against
+`audit_event` in `src/lib.rs`. An earlier version of this sample used `ts`,
+`ok`, `tier`, `argumentsHash` and `repoScope` — none of which exist — so a
+verifier written from these docs would have matched nothing.
+
 
 Sensitive paths and identifiers are hashed, never stored verbatim.
 
@@ -346,7 +359,7 @@ This is a working MCP server. The read-only surface is implemented and tested. T
 
 ## Roadmap
 
-- **End-to-end demo video** — public recording of the agent-proposes → user-approves → FluxGit-executes loop, captured from a live install. See `product/mcp/DEMO_SCRIPT.md` for the script.
+- **End-to-end demo video** — public recording of the agent-proposes → user-approves → FluxGit-executes loop, captured from a live install.
 - **Audit log exportable CSV/JSON** — shipped: per-entry Ed25519 signing (2026-05-28). Remaining: exportable CSV/JSON and retention policy for the FluxGit app's audit panel.
 - **HTTP / SSE transport** — for cloud / shared MCP host deployments.
 - **MCP registry entry** — submission to the official MCP server registry once the public release ships.
