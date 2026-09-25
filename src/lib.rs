@@ -120,7 +120,10 @@ impl fmt::Display for AuditSignerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "cannot read audit signing key file: {err}"),
-            Self::Parse(msg) => write!(f, "audit signing key is not a valid PEM PKCS8 Ed25519 key: {msg}"),
+            Self::Parse(msg) => write!(
+                f,
+                "audit signing key is not a valid PEM PKCS8 Ed25519 key: {msg}"
+            ),
         }
     }
 }
@@ -146,8 +149,12 @@ impl fmt::Display for AuditVerificationError {
         match self {
             Self::NotAnObject => write!(f, "audit event must be a JSON object"),
             Self::MissingSignature => write!(f, "audit event has no signature field"),
-            Self::MalformedSignature(msg) => write!(f, "signature field is not valid base64url: {msg}"),
-            Self::InvalidSignatureLength(n) => write!(f, "signature has wrong length: {n} (expected 64)"),
+            Self::MalformedSignature(msg) => {
+                write!(f, "signature field is not valid base64url: {msg}")
+            }
+            Self::InvalidSignatureLength(n) => {
+                write!(f, "signature has wrong length: {n} (expected 64)")
+            }
         }
     }
 }
@@ -521,9 +528,7 @@ fn is_fluxgit_required(kind: ToolKind) -> bool {
 
 impl McpSidecar {
     pub fn from_env() -> Self {
-        let gateway_state = if env::var("FLUXGIT_GATEWAY_ADDR").is_ok()
-            || env::var("FLUXGIT_GATEWAY_URL").is_ok()
-        {
+        let gateway_state = if resolve_handshake_addr().is_some() {
             GatewayState::Configured
         } else {
             GatewayState::NotConfigured
@@ -696,10 +701,10 @@ impl McpSidecar {
                     }
                 }
                 JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(json!(InitializeResult::new())),
-                error: None,
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(json!(InitializeResult::new())),
+                    error: None,
                 }
             }
             "tools/list" => JsonRpcResponse {
@@ -791,7 +796,7 @@ impl McpSidecar {
         }
 
         // Write-with-UI-handshake tools (PLAYBOOK §10, §14.2, §14.7):
-        // All five `operation.preview.*` tools dispatch through the gateway HTTP
+        // All ten `operation.preview.*` tools dispatch through the gateway HTTP
         // bridge when the handshake address is configured. Resolution order per
         // playbook §14.2:
         //   1. FLUXGIT_MCP_HANDSHAKE_ADDR (canonical for the handshake server)
@@ -907,9 +912,10 @@ impl McpSidecar {
             kind,
             ToolKind::DiffSemantic | ToolKind::DiffSemanticFallbacks
         ) {
-            if let (Some(addr), Some(repo_path)) =
-                (resolve_handshake_addr(), repo_path_from_arguments(arguments))
-            {
+            if let (Some(addr), Some(repo_path)) = (
+                resolve_handshake_addr(),
+                repo_path_from_arguments(arguments),
+            ) {
                 if let Some(payload) =
                     semantic_gateway_tool_payload(kind, &addr, &repo_path, arguments)
                 {
@@ -964,7 +970,10 @@ impl McpSidecar {
             _ => "read-only",
         };
         let summary = if result.is_error {
-            format!("MCP {noun} tool {} returned a structured error.", context.tool)
+            format!(
+                "MCP {noun} tool {} returned a structured error.",
+                context.tool
+            )
         } else {
             format!("MCP {noun} tool {} completed.", context.tool)
         };
@@ -1723,12 +1732,8 @@ fn fleet_radar_entry(input: FleetRepoInput) -> Value {
     let changed_files = status_payload["changedFiles"].as_u64().unwrap_or_default();
     let conflict_operation = active_conflict_operation(&repo_path);
     let conflict_active = conflict_operation.is_some();
-    let potential_conflict_paths = predict_upstream_conflict_paths(
-        &repo_path,
-        upstream.as_deref(),
-        ahead,
-        behind,
-    );
+    let potential_conflict_paths =
+        predict_upstream_conflict_paths(&repo_path, upstream.as_deref(), ahead, behind);
     let potential_conflict_active = !potential_conflict_paths.is_empty();
     let potential_conflict_count = potential_conflict_paths.len();
     let head = run_git(&repo_path, &["rev-parse", "HEAD"])
@@ -2083,7 +2088,10 @@ fn repo_scope_payload(repo_path: &Path, arguments: &Value) -> Result<Value, Json
         ],
     )
     .map(|output| {
-        let authors: Vec<&str> = output.lines().filter(|line| !line.trim().is_empty()).collect();
+        let authors: Vec<&str> = output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
         let distinct: std::collections::HashSet<&str> = authors.iter().copied().collect();
         json!({
             "days": churn_days,
@@ -2157,12 +2165,17 @@ fn codeowners_for_scope(repo_path: &Path, scope: &str) -> Option<Value> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let Some(pattern) = parts.next() else { continue };
+        let Some(pattern) = parts.next() else {
+            continue;
+        };
         let owners: Vec<String> = parts.map(str::to_string).collect();
         if owners.is_empty() {
             continue;
         }
-        let normalized = pattern.trim_matches('/').trim_end_matches("/**").trim_end_matches("/*");
+        let normalized = pattern
+            .trim_matches('/')
+            .trim_end_matches("/**")
+            .trim_end_matches("/*");
         // A pattern matches when it covers the scope or an ancestor of it.
         // A pattern DEEPER than the scope (e.g. `api/handlers` vs scope `api`)
         // must not claim ownership of the whole scope.
@@ -2332,8 +2345,8 @@ fn repo_brief_payload(repo_path: &Path, arguments: &Value) -> Result<Value, Json
                 "attentionTruncated": false,
             })
         });
-    let submodules_needing_attention = submodules["total"].as_u64().unwrap_or(0)
-        - submodules["clean"].as_u64().unwrap_or(0);
+    let submodules_needing_attention =
+        submodules["total"].as_u64().unwrap_or(0) - submodules["clean"].as_u64().unwrap_or(0);
 
     let recent_commits: Vec<Value> = run_git_optional(
         repo_path,
@@ -2358,23 +2371,26 @@ fn repo_brief_payload(repo_path: &Path, arguments: &Value) -> Result<Value, Json
     // shape (standard conventional-commits types or a repo-specific lowercase
     // prefix), plus the default branch when origin/HEAD is known.
     let conventional_commit_ratio =
-        run_git_optional(repo_path, &["log", "--pretty=format:%s", "-n50"])
-            .and_then(|output| {
-                let subjects: Vec<&str> =
-                    output.lines().filter(|line| !line.trim().is_empty()).collect();
-                if subjects.is_empty() {
-                    return None;
-                }
-                let matches = subjects
-                    .iter()
-                    .filter(|subject| subject_is_conventional(subject))
-                    .count();
-                Some((matches as f64 / subjects.len() as f64 * 100.0).round() / 100.0)
-            });
-    let default_branch =
-        run_git_optional(repo_path, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-            .map(|out| out.trim().trim_start_matches("origin/").to_string())
-            .filter(|name| !name.is_empty());
+        run_git_optional(repo_path, &["log", "--pretty=format:%s", "-n50"]).and_then(|output| {
+            let subjects: Vec<&str> = output
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            if subjects.is_empty() {
+                return None;
+            }
+            let matches = subjects
+                .iter()
+                .filter(|subject| subject_is_conventional(subject))
+                .count();
+            Some((matches as f64 / subjects.len() as f64 * 100.0).round() / 100.0)
+        });
+    let default_branch = run_git_optional(
+        repo_path,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .map(|out| out.trim().trim_start_matches("origin/").to_string())
+    .filter(|name| !name.is_empty());
 
     // Self-guiding hints, ordered by priority, max 3. The agent should follow
     // the first hint before proposing anything.
@@ -2660,10 +2676,14 @@ fn repo_conflict_preflight_payload(
         .to_string();
     let merge_base_oid = run_git_optional(repo_path, &["merge-base", &current_oid, &target_oid]);
 
-    let target_is_ancestor =
-        run_git_status(repo_path, &["merge-base", "--is-ancestor", &target_oid, &current_oid]);
-    let current_is_ancestor =
-        run_git_status(repo_path, &["merge-base", "--is-ancestor", &current_oid, &target_oid]);
+    let target_is_ancestor = run_git_status(
+        repo_path,
+        &["merge-base", "--is-ancestor", &target_oid, &current_oid],
+    );
+    let current_is_ancestor = run_git_status(
+        repo_path,
+        &["merge-base", "--is-ancestor", &current_oid, &target_oid],
+    );
 
     let (status, conflicting_paths, guidance) = if merge_base_oid.is_none() {
         (
@@ -2685,7 +2705,10 @@ fn repo_conflict_preflight_payload(
         )
     } else {
         let merge_base = merge_base_oid.as_deref().unwrap_or_default();
-        let merge_tree = run_git(repo_path, &["merge-tree", merge_base, &current_oid, &target_oid])?;
+        let merge_tree = run_git(
+            repo_path,
+            &["merge-tree", merge_base, &current_oid, &target_oid],
+        )?;
         let paths = conflict_paths_from_merge_tree(&merge_tree);
         if paths.is_empty() {
             (
@@ -2767,7 +2790,10 @@ fn conflict_read_payload(repo_path: &Path, arguments: &Value) -> Result<Value, J
     let mut order: Vec<String> = Vec::new();
     let mut stages_by_path: std::collections::HashMap<String, [Option<String>; 3]> =
         std::collections::HashMap::new();
-    for entry in unmerged_output.split('\0').filter(|entry| !entry.is_empty()) {
+    for entry in unmerged_output
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+    {
         let Some((meta, path)) = entry.split_once('\t') else {
             continue;
         };
@@ -2833,7 +2859,11 @@ fn conflict_read_result(
     let mut files = Vec::with_capacity(order.len().min(max_files));
     for path in order.iter().take(max_files) {
         let slots = &stages_by_path[path];
-        let (base, ours, theirs) = (slots[0].as_deref(), slots[1].as_deref(), slots[2].as_deref());
+        let (base, ours, theirs) = (
+            slots[0].as_deref(),
+            slots[1].as_deref(),
+            slots[2].as_deref(),
+        );
         files.push(json!({
             "path": path,
             "kind": conflict_stage_kind(base.is_some(), ours.is_some(), theirs.is_some()),
@@ -3114,7 +3144,7 @@ fn worktree_list_payload(repo_path: &Path) -> Result<Value, JsonRpcError> {
     let mut worktrees: Vec<Value> = Vec::new();
     let mut current: Option<Map<String, Value>> = None;
 
-    let mut flush = |entry: Option<Map<String, Value>>, out: &mut Vec<Value>| {
+    let flush = |entry: Option<Map<String, Value>>, out: &mut Vec<Value>| {
         if let Some(map) = entry {
             if !map.is_empty() {
                 out.push(Value::Object(map));
@@ -3139,7 +3169,9 @@ fn worktree_list_payload(repo_path: &Path) -> Result<Value, JsonRpcError> {
             current = Some(map);
             continue;
         }
-        let Some(map) = current.as_mut() else { continue };
+        let Some(map) = current.as_mut() else {
+            continue;
+        };
         if let Some(sha) = line.strip_prefix("HEAD ") {
             map.insert("headSha".into(), json!(sha.get(..12).unwrap_or(sha)));
         } else if let Some(branch) = line.strip_prefix("branch ") {
@@ -3372,10 +3404,7 @@ fn fetch_semantic_diff_from_gateway(
 ) -> Option<Value> {
     let base = format!("http://{}", gateway_addr.trim_end_matches('/'));
     let url = format!("{}/v1/mcp/diff/semantic", base);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .ok()?;
+    let client = loopback_bridge_client(Duration::from_secs(10)).ok()?;
     let response = client
         .post(&url)
         .json(&json!({
@@ -5012,8 +5041,8 @@ fn gateway_not_configured_error(tool: &str) -> JsonRpcError {
             "tool": tool,
             "tier": "fluxgit",
             "gatewayConfigured": false,
-            "reason": "This tool produces FluxGit-powered context (restore points, safety timeline, predictive preflight or multi-repo radar) and requires a running FluxGit app with the MCP gateway configured.",
-            "upgradeHint": "Ask the user to install or launch FluxGit, then ensure FLUXGIT_GATEWAY_ADDR is set in the MCP host config. The in-app Agents / MCP settings panel provides a copy-ready config block.",
+            "reason": "This tool produces FluxGit-only context from restore points or the safety timeline and requires a running FluxGit app with the MCP gateway configured.",
+            "upgradeHint": "Ask the user to install or launch FluxGit, then ensure FLUXGIT_MCP_HANDSHAKE_ADDR is set in the MCP host config. The in-app Agents / MCP settings panel provides a copy-ready config block.",
             "learnMore": "https://fluxgit.com/features/mcp-agent-git/",
             "freeShellAlternative": "Use repo.status, repo.refs, repo.history, repo.reflog, commit.details, worktree.changes, submodule.status, diff.text or diff.semantic (with supported=false fallback) for read-only inspection without FluxGit."
         })),
@@ -5028,28 +5057,80 @@ fn gateway_unavailable_error(tool: &str) -> JsonRpcError {
             "tool": tool,
             "gatewayConfigured": true,
             "reason": "The sidecar could not produce this payload: no absolute repoPath argument was provided for the local read-only fallback, and the configured FluxGit gateway did not serve the request.",
-            "agentRecommendation": "Retry the call with an absolute `repoPath` argument (the local read-only fallback works for every free-shell tool). If the tool requires FluxGit context, ask the user to confirm the FluxGit app is running and reachable at FLUXGIT_GATEWAY_ADDR.",
+            "agentRecommendation": "Retry the call with an absolute `repoPath` argument (the local read-only fallback works for every free-shell tool). If the tool requires FluxGit context, ask the user to confirm the FluxGit app is running and reachable at FLUXGIT_MCP_HANDSHAKE_ADDR.",
             "learnMore": "https://fluxgit.com/features/mcp-agent-git/"
         })),
     }
 }
 
 /// Resolve the gateway handshake address per PLAYBOOK §14.2:
-/// `FLUXGIT_MCP_HANDSHAKE_ADDR` first, `FLUXGIT_GATEWAY_ADDR` as fallback.
+/// `FLUXGIT_MCP_HANDSHAKE_ADDR` first, then the two legacy gateway names.
 fn resolve_handshake_addr() -> Option<String> {
-    env::var("FLUXGIT_MCP_HANDSHAKE_ADDR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            env::var("FLUXGIT_GATEWAY_ADDR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
+    [
+        "FLUXGIT_MCP_HANDSHAKE_ADDR",
+        "FLUXGIT_GATEWAY_ADDR",
+        "FLUXGIT_GATEWAY_URL",
+    ]
+    .iter()
+    .find_map(|name| {
+        env::var(name)
+            .ok()
+            .and_then(|value| normalize_loopback_gateway_addr(&value))
+    })
 }
 
-/// Dispatch any of the five `operation.preview.*` write-handshake requests through
+/// Normalize the bridge address and reject non-loopback targets. The bridge
+/// carries repository paths, diffs and proposal intent, so environment values
+/// must never turn it into an outbound HTTP client.
+fn normalize_loopback_gateway_addr(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let url = reqwest::Url::parse(&candidate).ok()?;
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?.trim_matches(['[', ']']);
+    let address = host.parse::<std::net::IpAddr>().ok()?;
+    if !address.is_loopback() {
+        return None;
+    }
+    let port = url.port()?;
+    if address.is_ipv6() {
+        Some(format!("[{address}]:{port}"))
+    } else {
+        Some(format!("{address}:{port}"))
+    }
+}
+
+/// Build bridge clients with the same local-only transport boundary.
+fn loopback_bridge_client(
+    request_timeout: Duration,
+) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
+        .build()
+}
+
+/// Dispatch any of the ten `operation.preview.*` write-handshake requests through
 /// the FluxGit gateway over HTTP and poll for its outcome (PLAYBOOK §10 MVP for
-/// merge, §14.7 for the remaining four).
+/// merge, §14.7 for the remaining operations).
 ///
 /// The caller is responsible for assembling the operation-specific body. This
 /// helper only handles the transport: POST to `/v1/mcp/operation/preview/<op>`,
@@ -5072,10 +5153,7 @@ fn dispatch_operation_preview_request(
     let dispatch_url = format!("{}/v1/mcp/operation/preview/{}", base, op_path_suffix);
     let status_url = format!("{}/v1/mcp/operation/status/{}", base, preview_id);
 
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
+    let client = match loopback_bridge_client(Duration::from_secs(5)) {
         Ok(client) => client,
         Err(_) => return None,
     };
@@ -5107,10 +5185,7 @@ fn dispatch_operation_preview_request(
     // approved, executes the git operation, then reports completed/failed.
     // The first pending→approved transition therefore extends the poll
     // budget once (up to 60 more polls) so execution has time to finish.
-    let poll_client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
+    let poll_client = match loopback_bridge_client(Duration::from_secs(5)) {
         Ok(client) => client,
         Err(_) => return None,
     };
@@ -5225,8 +5300,7 @@ fn dispatch_operation_preview_merge(
         .and_then(Value::as_str)
         .unwrap_or("merge")
         .to_string();
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let body = json!({
         "previewId": preview_id,
@@ -5281,8 +5355,7 @@ fn dispatch_operation_preview_rebase(
         .get("interactive")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let body = json!({
         "previewId": preview_id,
@@ -5332,8 +5405,7 @@ fn dispatch_operation_preview_discard(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let body = json!({
         "previewId": preview_id,
@@ -5382,8 +5454,7 @@ fn dispatch_operation_preview_reset(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let body = json!({
         "previewId": preview_id,
@@ -5432,8 +5503,7 @@ fn dispatch_operation_preview_patch(
         .get("applyToIndex")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let body = json!({
         "previewId": preview_id,
@@ -5474,9 +5544,11 @@ fn dispatch_operation_preview_plan(
         .to_string();
     // Steps are passed through verbatim; the gateway validates the shape and
     // bounds (1..=10) and the UI renders each step in the approval card.
-    let steps = arguments.get("steps").cloned().unwrap_or(Value::Array(vec![]));
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let steps = arguments
+        .get("steps")
+        .cloned()
+        .unwrap_or(Value::Array(vec![]));
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let body = json!({
         "previewId": preview_id,
@@ -5527,8 +5599,7 @@ fn dispatch_operation_preview_worktree(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let mut body = json!({
         "previewId": preview_id,
@@ -5587,8 +5658,7 @@ fn dispatch_operation_preview_commit(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let mut body = json!({
         "previewId": preview_id,
@@ -5652,8 +5722,7 @@ fn dispatch_operation_preview_push(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let mut body = json!({
         "previewId": preview_id,
@@ -5712,8 +5781,7 @@ fn dispatch_operation_preview_branch(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let requested_at = chrono::Utc::now()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let mut body = json!({
         "previewId": preview_id,
@@ -5779,9 +5847,7 @@ fn operation_preview_terminal_error_result(
         "failed" => format!("FluxGit reported that the {op_label} preview failed."),
         "expired" => format!("The {op_label} preview expired before the user approved it."),
         "cancelled" => format!("The {op_label} proposal was cancelled before a decision."),
-        _ => format!(
-            "FluxGit returned a non-terminal status before completing the {op_label}."
-        ),
+        _ => format!("FluxGit returned a non-terminal status before completing the {op_label}."),
     };
     let payload = json!({
         "tool": tool_name,
@@ -5885,30 +5951,52 @@ fn operation_status_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonR
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid_params_error("missing previewId"))?;
     let Some(addr) = resolve_handshake_addr() else {
-        return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true));
+        return Ok(handshake_unreachable_result(
+            ToolKind::OperationStatus,
+            true,
+        ));
     };
     let base = format!("http://{}", addr.trim_end_matches('/'));
     let status_url = format!("{}/v1/mcp/operation/status/{}", base, preview_id);
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
+    let client = match loopback_bridge_client(Duration::from_secs(5)) {
         Ok(client) => client,
-        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true)),
+        Err(_) => {
+            return Ok(handshake_unreachable_result(
+                ToolKind::OperationStatus,
+                true,
+            ))
+        }
     };
     let response = match client.get(&status_url).send() {
         Ok(response) => response,
-        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true)),
+        Err(_) => {
+            return Ok(handshake_unreachable_result(
+                ToolKind::OperationStatus,
+                true,
+            ))
+        }
     };
     if response.status().as_u16() == 404 {
-        return Ok(preview_not_found_result(ToolKind::OperationStatus, preview_id, true));
+        return Ok(preview_not_found_result(
+            ToolKind::OperationStatus,
+            preview_id,
+            true,
+        ));
     }
     if !response.status().is_success() {
-        return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true));
+        return Ok(handshake_unreachable_result(
+            ToolKind::OperationStatus,
+            true,
+        ));
     }
     let body: Value = match response.json() {
         Ok(value) => value,
-        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationStatus, true)),
+        Err(_) => {
+            return Ok(handshake_unreachable_result(
+                ToolKind::OperationStatus,
+                true,
+            ))
+        }
     };
     Ok(text_tool_result(
         json!({
@@ -5924,23 +6012,31 @@ fn operation_status_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonR
 }
 
 /// `operation.cancel` — withdraw one of this agent's own pending proposals.
-fn operation_cancel_tool_call(agent_id: &str, arguments: &Value) -> Result<ToolCallResult, JsonRpcError> {
+fn operation_cancel_tool_call(
+    agent_id: &str,
+    arguments: &Value,
+) -> Result<ToolCallResult, JsonRpcError> {
     let preview_id = arguments
         .get("previewId")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid_params_error("missing previewId"))?;
     let Some(addr) = resolve_handshake_addr() else {
-        return Ok(handshake_unreachable_result(ToolKind::OperationCancel, false));
+        return Ok(handshake_unreachable_result(
+            ToolKind::OperationCancel,
+            false,
+        ));
     };
     let base = format!("http://{}", addr.trim_end_matches('/'));
     let cancel_url = format!("{}/v1/mcp/operation/cancel/{}", base, preview_id);
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
+    let client = match loopback_bridge_client(Duration::from_secs(5)) {
         Ok(client) => client,
-        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationCancel, false)),
+        Err(_) => {
+            return Ok(handshake_unreachable_result(
+                ToolKind::OperationCancel,
+                false,
+            ))
+        }
     };
     let response = match client
         .post(&cancel_url)
@@ -5948,11 +6044,20 @@ fn operation_cancel_tool_call(agent_id: &str, arguments: &Value) -> Result<ToolC
         .send()
     {
         Ok(response) => response,
-        Err(_) => return Ok(handshake_unreachable_result(ToolKind::OperationCancel, false)),
+        Err(_) => {
+            return Ok(handshake_unreachable_result(
+                ToolKind::OperationCancel,
+                false,
+            ))
+        }
     };
     let http_status = response.status().as_u16();
     if http_status == 404 {
-        return Ok(preview_not_found_result(ToolKind::OperationCancel, preview_id, false));
+        return Ok(preview_not_found_result(
+            ToolKind::OperationCancel,
+            preview_id,
+            false,
+        ));
     }
     let body: Value = response.json().unwrap_or(Value::Null);
     if !(200..300).contains(&http_status) {
@@ -6030,17 +6135,17 @@ fn preview_not_found_result(kind: ToolKind, preview_id: &str, read_only: bool) -
     )
 }
 
-/// Error returned for write-with-UI-handshake tools (PLAYBOOK §10) that are
-/// advertised in `tools/list` but whose gateway dispatch is not yet implemented.
-/// The agent should tell the user to perform the action inside FluxGit's UI.
+/// Error returned when a write proposal cannot reach the FluxGit handshake
+/// bridge or does not receive a terminal decision within its polling window.
 fn write_handshake_pending_error(tool: &str) -> JsonRpcError {
+    let gateway_configured = resolve_handshake_addr().is_some();
     JsonRpcError {
         code: 10003,
         message: "FluxGit desktop is not connected for the write handshake".into(),
         data: Some(json!({
             "tool": tool,
             "tier": "fluxgit-write-handshake",
-            "gatewayConfigured": false,
+            "gatewayConfigured": gateway_configured,
             "reason": "This tool proposes a write that FluxGit must preview and the user must approve in the desktop UI. The sidecar could not reach the FluxGit handshake endpoint: either the FluxGit app is not running, FLUXGIT_MCP_HANDSHAKE_ADDR is not set for this MCP server, or the request timed out before the user decided.",
             "agentRecommendation": "Tell the user: 'Open FluxGit and connect this agent from Operations > Agent Control (Quick Connect sets the handshake address), then I can propose this change for your approval.' Retry only after the user confirms FluxGit is running and connected.",
             "learnMore": "https://fluxgit.com/features/mcp-agent-git/"
@@ -6146,38 +6251,128 @@ mod tests {
 
     static TEST_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    /// Serializes mutation of process-wide env vars (FLUXGIT_GATEWAY_ADDR) across the
-    /// operation.preview.merge dispatch tests so they can't race each other when cargo
-    /// runs the test suite in parallel.
+    /// Serializes mutation of the process-wide bridge variables so dispatch and
+    /// configuration tests cannot race when cargo runs the suite in parallel.
     static GATEWAY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    const GATEWAY_ENV_VARS: [&str; 3] = [
+        "FLUXGIT_MCP_HANDSHAKE_ADDR",
+        "FLUXGIT_GATEWAY_ADDR",
+        "FLUXGIT_GATEWAY_URL",
+    ];
+
     struct GatewayEnvGuard {
-        previous: Option<String>,
+        previous: Vec<(&'static str, Option<String>)>,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl GatewayEnvGuard {
         fn set(value: &str) -> Self {
-            let guard = GATEWAY_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = env::var("FLUXGIT_GATEWAY_ADDR").ok();
-            env::set_var("FLUXGIT_GATEWAY_ADDR", value);
-            Self { previous, _guard: guard }
+            Self::set_named("FLUXGIT_GATEWAY_ADDR", value)
+        }
+
+        fn set_canonical(value: &str) -> Self {
+            Self::set_named("FLUXGIT_MCP_HANDSHAKE_ADDR", value)
+        }
+
+        fn set_named(name: &'static str, value: &str) -> Self {
+            let guard = GATEWAY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = GATEWAY_ENV_VARS
+                .iter()
+                .map(|variable| (*variable, env::var(variable).ok()))
+                .collect();
+            for variable in GATEWAY_ENV_VARS {
+                env::remove_var(variable);
+            }
+            env::set_var(name, value);
+            Self {
+                previous,
+                _guard: guard,
+            }
         }
 
         fn unset() -> Self {
-            let guard = GATEWAY_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = env::var("FLUXGIT_GATEWAY_ADDR").ok();
-            env::remove_var("FLUXGIT_GATEWAY_ADDR");
-            Self { previous, _guard: guard }
+            let guard = GATEWAY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = GATEWAY_ENV_VARS
+                .iter()
+                .map(|variable| (*variable, env::var(variable).ok()))
+                .collect();
+            for variable in GATEWAY_ENV_VARS {
+                env::remove_var(variable);
+            }
+            Self {
+                previous,
+                _guard: guard,
+            }
         }
     }
 
     impl Drop for GatewayEnvGuard {
         fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => env::set_var("FLUXGIT_GATEWAY_ADDR", value),
-                None => env::remove_var("FLUXGIT_GATEWAY_ADDR"),
+            for (name, value) in &self.previous {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
             }
+        }
+    }
+
+    #[test]
+    fn canonical_handshake_address_marks_gateway_configured() {
+        let _env = GatewayEnvGuard::set_canonical("127.0.0.1:59647");
+        let server = McpSidecar::from_env();
+        assert!(matches!(server.gateway_state, GatewayState::Configured));
+        assert_eq!(resolve_handshake_addr().as_deref(), Some("127.0.0.1:59647"));
+    }
+
+    #[test]
+    fn blank_gateway_addresses_are_not_configured() {
+        let _env = GatewayEnvGuard::set_canonical("   ");
+        let server = McpSidecar::from_env();
+        assert!(matches!(server.gateway_state, GatewayState::NotConfigured));
+        assert_eq!(resolve_handshake_addr(), None);
+    }
+
+    #[test]
+    fn gateway_resolution_prefers_canonical_then_supports_legacy_url() {
+        let _env = GatewayEnvGuard::unset();
+        env::set_var("FLUXGIT_MCP_HANDSHAKE_ADDR", "127.0.0.1:59647");
+        env::set_var("FLUXGIT_GATEWAY_ADDR", "127.0.0.1:59648");
+        assert_eq!(resolve_handshake_addr().as_deref(), Some("127.0.0.1:59647"));
+
+        env::remove_var("FLUXGIT_MCP_HANDSHAKE_ADDR");
+        env::remove_var("FLUXGIT_GATEWAY_ADDR");
+        env::set_var("FLUXGIT_GATEWAY_URL", "http://127.0.0.1:59649/");
+        assert_eq!(resolve_handshake_addr().as_deref(), Some("127.0.0.1:59649"));
+    }
+
+    #[test]
+    fn gateway_address_resolution_is_loopback_only() {
+        assert_eq!(
+            normalize_loopback_gateway_addr("http://127.0.0.1:59647/"),
+            Some("127.0.0.1:59647".into())
+        );
+        assert_eq!(
+            normalize_loopback_gateway_addr("[::1]:59647"),
+            Some("[::1]:59647".into())
+        );
+        for rejected in [
+            "https://127.0.0.1:59647",
+            "http://localhost:59647",
+            "http://192.0.2.1:59647",
+            "http://127.0.0.1:59647/path",
+            "http://user@127.0.0.1:59647",
+        ] {
+            assert_eq!(
+                normalize_loopback_gateway_addr(rejected),
+                None,
+                "{rejected} must be rejected"
+            );
         }
     }
 
@@ -6257,8 +6452,14 @@ mod tests {
         let error = checked_rev("--output=/tmp/pwned", "base").unwrap_err();
         assert_eq!(error.code, -32602);
         let details = error.data.unwrap()["details"].as_str().unwrap().to_string();
-        assert!(details.contains("base"), "error names the offending field: {details}");
-        assert!(details.contains("'-'"), "error explains the rule: {details}");
+        assert!(
+            details.contains("base"),
+            "error names the offending field: {details}"
+        );
+        assert!(
+            details.contains("'-'"),
+            "error explains the rule: {details}"
+        );
 
         assert!(checked_rev("-n1", "commit").is_err());
         assert!(checked_rev("--upload-pack=sh", "head").is_err());
@@ -6278,7 +6479,10 @@ mod tests {
             "9fceb02d0ae598e95dc970b74767f19372d61af8",
             "main@{yesterday}",
         ] {
-            assert!(checked_rev(rev, "rev").is_ok(), "rejected a real revision: {rev}");
+            assert!(
+                checked_rev(rev, "rev").is_ok(),
+                "rejected a real revision: {rev}"
+            );
         }
 
         // The optional variant leaves absent arguments absent.
@@ -6296,7 +6500,10 @@ mod tests {
         let args = json!({ "repoPath": "/tmp/r", "sourceRef": "feature", "targetRef": "main" });
         let a = idempotency_key_for("merge", &args).expect("a key");
         let b = idempotency_key_for("merge", &args).expect("a key");
-        assert_eq!(a, b, "the same request must reuse its card, not mint a new one");
+        assert_eq!(
+            a, b,
+            "the same request must reuse its card, not mint a new one"
+        );
 
         // A different operation over identical arguments is a different card.
         let other_op = idempotency_key_for("rebase", &args).expect("a key");
@@ -6309,7 +6516,6 @@ mod tests {
         // Null arguments carry no key rather than a misleading constant one.
         assert!(idempotency_key_for("merge", &Value::Null).is_none());
     }
-
 
     #[test]
     fn the_connected_agent_identifies_itself_instead_of_sharing_one_id() {
@@ -6343,7 +6549,6 @@ mod tests {
         assert_eq!(sidecar.agent_id(), "claude-code");
     }
 
-
     #[test]
     fn a_repo_id_cannot_escape_the_run_directory() {
         // Demonstrated against the real binary before the fix: repoId
@@ -6351,14 +6556,7 @@ mod tests {
         // the target file's entire `plan` object — arbitrary JSON read from a
         // tool annotated readOnlyHint: true, plus a file-existence oracle.
         let args = json!({ "runDir": "/tmp/flux-run" });
-        for hostile in [
-            "../../secret",
-            "..",
-            ".",
-            "a/b",
-            "a\\b",
-            "",
-        ] {
+        for hostile in ["../../secret", "..", ".", "a/b", "a\\b", ""] {
             assert!(
                 flux_checkpoint_path(hostile, &args).is_none(),
                 "repoId {hostile:?} was allowed to build a path"
@@ -6369,7 +6567,6 @@ mod tests {
         let ok = flux_checkpoint_path("repo-1", &args).expect("a plain id must resolve");
         assert!(ok.ends_with("rebase/repo-1.json"), "got {ok:?}");
     }
-
 
     #[test]
     fn read_only_tools_reject_option_like_revisions_before_reaching_git() {
@@ -6477,9 +6674,8 @@ mod tests {
             ]
         );
 
-        // Advertisement counts pinned: 23 read-only + 11 write-handshake = 34
-        // (docs count them as 24 read incl. operation.status/operation.cancel
-        // + 10 operation.preview.* write proposals — same 34 tools).
+        // Advertisement counts pinned: 23 read-only + 10 write proposals
+        // + operation.cancel = 34 tools.
         assert_eq!(tools.len(), 34, "34 tools must be advertised");
         assert_eq!(
             tools
@@ -6490,8 +6686,7 @@ mod tests {
             "exactly 23 tools must advertise readOnlyHint: true"
         );
 
-        // Verify all 11 write-handshake tools advertise readOnlyHint: false
-        // (10 operation.preview.* proposals + the write-adjacent cancel).
+        // Verify all ten proposals plus cancellation advertise readOnlyHint: false.
         for handshake_name in [
             "operation.preview.merge",
             "operation.preview.rebase",
@@ -6535,11 +6730,17 @@ mod tests {
         // even though the sidecar never performs the write itself.
         assert!(tools
             .iter()
-            .filter(|tool| !tool["name"].as_str().unwrap_or_default().starts_with("operation."))
+            .filter(|tool| !tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("operation."))
             .all(|tool| tool["annotations"]["readOnlyHint"] == true));
         assert!(tools
             .iter()
-            .filter(|tool| !tool["name"].as_str().unwrap_or_default().starts_with("operation."))
+            .filter(|tool| !tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("operation."))
             .filter(|tool| tool["name"] != "fleet.radar")
             .all(|tool| tool["inputSchema"]["required"]
                 .as_array()
@@ -6915,7 +7116,9 @@ mod tests {
         let data = &payload["data"];
 
         // HEAD identity and working tree summary.
-        assert!(data["head"]["sha"].as_str().is_some_and(|sha| !sha.is_empty()));
+        assert!(data["head"]["sha"]
+            .as_str()
+            .is_some_and(|sha| !sha.is_empty()));
         assert_eq!(data["head"]["detached"], false);
         assert_eq!(data["workingTree"]["clean"], false);
         assert_eq!(data["workingTree"]["unstaged"], 1);
@@ -6933,7 +7136,9 @@ mod tests {
         // Recent commits as one-liners with sha + subject.
         let commits = data["recentCommits"].as_array().unwrap();
         assert!(!commits.is_empty());
-        assert!(commits[0]["sha"].as_str().is_some_and(|sha| !sha.is_empty()));
+        assert!(commits[0]["sha"]
+            .as_str()
+            .is_some_and(|sha| !sha.is_empty()));
         assert!(commits[0]["subject"].as_str().is_some());
 
         // Hints are present (array, possibly empty for a clean repo).
@@ -6959,11 +7164,7 @@ mod tests {
             .args(["merge", "side"])
             .output();
 
-        let result = call_tool(
-            "repo.brief",
-            json!({ "repoPath": path }),
-            false,
-        );
+        let result = call_tool("repo.brief", json!({ "repoPath": path }), false);
         assert_eq!(result["result"]["isError"], false);
         let data = tool_payload(&result)["data"].clone();
 
@@ -6996,7 +7197,10 @@ mod tests {
         let ratio = data["conventions"]["conventionalCommitRatio"]
             .as_f64()
             .expect("ratio present");
-        assert!(ratio > 0.5, "expected mostly conventional subjects, got {ratio}");
+        assert!(
+            ratio > 0.5,
+            "expected mostly conventional subjects, got {ratio}"
+        );
     }
 
     #[test]
@@ -7041,10 +7245,7 @@ mod tests {
 
         let commits = data["recentCommits"].as_array().unwrap();
         assert_eq!(commits.len(), 2);
-        assert!(commits[0]["subject"]
-            .as_str()
-            .unwrap()
-            .contains("api"));
+        assert!(commits[0]["subject"].as_str().unwrap().contains("api"));
 
         assert_eq!(data["churn"]["commits"], 2);
         assert_eq!(data["churn"]["authors"], 1);
@@ -7112,7 +7313,11 @@ mod tests {
         git(path, &["add", "."]);
         git(path, &["commit", "-m", "add api"]);
 
-        let result = call_tool("repo.scope", json!({ "repoPath": path, "path": "api" }), false);
+        let result = call_tool(
+            "repo.scope",
+            json!({ "repoPath": path, "path": "api" }),
+            false,
+        );
         let data = tool_payload(&result)["data"].clone();
         // The pattern is DEEPER than the scope; it must not own the scope.
         assert_eq!(data["owners"]["matchedPattern"], Value::Null);
@@ -7128,7 +7333,10 @@ mod tests {
         let path = repo.path();
         for i in 0..30 {
             fs::write(path.join("tracked.txt"), format!("rev {i}\n")).unwrap();
-            git(path, &["commit", "-am", &format!("feat: change number {i}")]);
+            git(
+                path,
+                &["commit", "-am", &format!("feat: change number {i}")],
+            );
         }
         fs::write(path.join("untracked.txt"), "new\n").unwrap();
 
@@ -7166,7 +7374,9 @@ mod tests {
         assert_eq!(data["total"], 2);
         let worktrees = data["worktrees"].as_array().unwrap();
         assert_eq!(worktrees[0]["isMain"], true);
-        assert!(worktrees[0]["headSha"].as_str().is_some_and(|sha| !sha.is_empty()));
+        assert!(worktrees[0]["headSha"]
+            .as_str()
+            .is_some_and(|sha| !sha.is_empty()));
         assert_eq!(worktrees[1]["isMain"], false);
         assert_eq!(worktrees[1]["branch"], "agent/task-1");
         assert_eq!(worktrees[1]["detached"], false);
@@ -7259,22 +7469,42 @@ mod tests {
         let base_commit = git_output(repo.path(), &["rev-parse", "HEAD"])
             .trim()
             .to_string();
-        git(repo.path(), &["remote", "add", "origin", "https://example.invalid/repo.git"]);
-        git(repo.path(), &["update-ref", "refs/remotes/origin/main", &base_commit]);
-        git(repo.path(), &["branch", "--set-upstream-to=origin/main", "main"]);
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", &base_commit],
+        );
+        git(
+            repo.path(),
+            &["branch", "--set-upstream-to=origin/main", "main"],
+        );
 
         fs::write(repo.path().join("tracked.txt"), "local\n").unwrap();
         git(repo.path(), &["add", "tracked.txt"]);
         git(repo.path(), &["commit", "-m", "local change"]);
 
-        git(repo.path(), &["checkout", "-b", "remote-work", &base_commit]);
+        git(
+            repo.path(),
+            &["checkout", "-b", "remote-work", &base_commit],
+        );
         fs::write(repo.path().join("tracked.txt"), "remote\n").unwrap();
         git(repo.path(), &["add", "tracked.txt"]);
         git(repo.path(), &["commit", "-m", "remote change"]);
         let remote_commit = git_output(repo.path(), &["rev-parse", "HEAD"])
             .trim()
             .to_string();
-        git(repo.path(), &["update-ref", "refs/remotes/origin/main", &remote_commit]);
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", &remote_commit],
+        );
         git(repo.path(), &["checkout", "main"]);
 
         let payload = tool_payload(&call_tool(
@@ -8132,8 +8362,7 @@ mod tests {
             "submodule.status",
         ];
         for tool in free_tools {
-            let response =
-                call_tool(tool, json!({ "repoPath": repo.path() }), false);
+            let response = call_tool(tool, json!({ "repoPath": repo.path() }), false);
             assert_eq!(
                 response["result"]["isError"], false,
                 "tool {tool} should work without gateway"
@@ -8195,10 +8424,7 @@ mod tests {
                 if trimmed.is_empty() {
                     break;
                 }
-                if let Some(value) = trimmed
-                    .to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                {
+                if let Some(value) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
                     content_length = value.trim().parse().unwrap_or(0);
                 }
             }
@@ -8255,7 +8481,7 @@ mod tests {
             }],
             "pathsTruncated": false,
         }));
-        let _env = GatewayEnvGuard::set(&addr);
+        let _env = GatewayEnvGuard::set_canonical(&addr);
 
         let payload = tool_payload(&call_tool(
             "diff.semantic",
@@ -8339,7 +8565,10 @@ mod tests {
         let files = payload["data"]["files"].as_array().unwrap();
         let binary = files.iter().find(|f| f["path"] == "logo.bin").unwrap();
         assert_eq!(binary["fallbackToText"], true);
-        assert!(binary["reason"].as_str().unwrap().contains("could not parse"));
+        assert!(binary["reason"]
+            .as_str()
+            .unwrap()
+            .contains("could not parse"));
         // Fallback files carry ready-to-use diff.text arguments, mirroring
         // the whole-call fallback contract.
         assert_eq!(binary["textDiffArguments"]["path"], "logo.bin");
@@ -8548,12 +8777,12 @@ mod tests {
     }
 
     #[test]
-    fn all_five_write_handshake_operations_return_pending_with_proper_schemas() {
+    fn all_ten_write_handshake_operations_return_pending_with_proper_schemas() {
         // Each operation must:
         // 1. Be advertised in tools/list with readOnlyHint: false
         // 2. Require its operation-specific fields plus a `reason`
         // 3. Return write_handshake_pending (code 10003) when no handshake
-        //    address is configured (all five dispatch when it is).
+        //    address is configured (all ten dispatch when it is).
         // Schema requirements per PLAYBOOK §10.
         let _env = GatewayEnvGuard::unset();
         let server = McpSidecar::new_for_tests(true);
@@ -8691,7 +8920,7 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // operation.preview.* gateway dispatch (PLAYBOOK §10).
-    // All five operations round-trip through the gateway when the handshake
+    // All ten proposal operations round-trip through the gateway when the handshake
     // address is configured; without it they fall back to code 10003.
     // ---------------------------------------------------------------------
 
@@ -8699,9 +8928,8 @@ mod tests {
     ///   POST /v1/mcp/operation/preview/<op_path_suffix> -> 200 {"accepted": true}
     ///   GET  /v1/mcp/operation/status/<id>              -> 200 {"previewId": "...", "status": "<status>", "result": {...}}
     /// Returns the parsed POST body via a oneshot channel so tests can assert the
-    /// exact JSON the sidecar dispatched. Generalized in 2026-05-28 to accept any
-    /// of the five operation path suffixes (merge|rebase|discard|reset|patch) so
-    /// the four new operation.preview.* tests reuse the same harness.
+    /// exact JSON the sidecar dispatched. It accepts every proposal path suffix
+    /// so all operation.preview.* tests reuse the same harness.
     fn spawn_operation_gateway_mock(
         op_path_suffix: &'static str,
         status: &'static str,
@@ -8735,9 +8963,8 @@ mod tests {
                     if trimmed.is_empty() {
                         break;
                     }
-                    if let Some(value) = trimmed
-                        .to_ascii_lowercase()
-                        .strip_prefix("content-length:")
+                    if let Some(value) =
+                        trimmed.to_ascii_lowercase().strip_prefix("content-length:")
                     {
                         content_length = value.trim().parse().unwrap_or(0);
                     }
@@ -8748,8 +8975,7 @@ mod tests {
                 if method == "POST" && path.starts_with(&expected_post_path) {
                     let mut body_buf = vec![0u8; content_length];
                     let _ = reader.read_exact(&mut body_buf);
-                    let parsed: Value = serde_json::from_slice(&body_buf)
-                        .unwrap_or(Value::Null);
+                    let parsed: Value = serde_json::from_slice(&body_buf).unwrap_or(Value::Null);
                     post_body = Some(parsed.clone());
                     let _ = tx.send(parsed);
                     let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"accepted\":true}\n";
@@ -8777,7 +9003,8 @@ mod tests {
                         return;
                     }
                 } else {
-                    let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response =
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(response);
                 }
             }
@@ -8839,7 +9066,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(dispatched["repoPath"], "/tmp/example");
         assert_eq!(dispatched["sourceRef"], "feature/login");
@@ -8933,7 +9163,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "rebase",
@@ -9016,7 +9249,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "discard",
@@ -9100,7 +9336,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "reset",
@@ -9184,7 +9423,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "patch",
@@ -9277,7 +9519,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "worktree",
@@ -9402,7 +9647,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "commit",
@@ -9413,8 +9661,14 @@ mod tests {
             dispatched["message"],
             "fix: handle empty refs\n\nGuards the ref parser against empty input."
         );
-        assert_eq!(dispatched["paths"], json!(["src/refs.rs", "src/refs_test.rs"]));
-        assert_eq!(dispatched["stageAll"], false, "stageAll must default to false");
+        assert_eq!(
+            dispatched["paths"],
+            json!(["src/refs.rs", "src/refs_test.rs"])
+        );
+        assert_eq!(
+            dispatched["stageAll"], false,
+            "stageAll must default to false"
+        );
         assert_eq!(
             dispatched["reason"],
             "The fix is complete and its tests pass locally"
@@ -9430,11 +9684,8 @@ mod tests {
         // Omitted `paths` means "commit exactly what is already staged" — the
         // sidecar must not send an empty array the gateway could misread as
         // an explicit (empty) selection.
-        let (addr, post_body_rx) = spawn_operation_gateway_mock(
-            "commit",
-            "completed",
-            json!({ "commitSha": "c0ffee2" }),
-        );
+        let (addr, post_body_rx) =
+            spawn_operation_gateway_mock("commit", "completed", json!({ "commitSha": "c0ffee2" }));
         let _env = GatewayEnvGuard::set(&addr);
 
         let response = call_tool(
@@ -9530,7 +9781,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "push",
@@ -9575,7 +9829,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["remote"], "origin", "remote must default to origin");
+        assert_eq!(
+            dispatched["remote"], "origin",
+            "remote must default to origin"
+        );
         assert!(
             dispatched.get("branch").is_none(),
             "branch must be omitted when the agent does not supply it"
@@ -9649,7 +9906,10 @@ mod tests {
         let dispatched = post_body_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("mock gateway did not receive the dispatch POST in time");
-        assert_eq!(dispatched["previewId"], Value::String(preview_id.to_string()));
+        assert_eq!(
+            dispatched["previewId"],
+            Value::String(preview_id.to_string())
+        );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
         assert_eq!(
             dispatched["operationType"], "branch",
@@ -9695,7 +9955,10 @@ mod tests {
             dispatched.get("startPoint").is_none(),
             "startPoint must be omitted when the agent does not supply it"
         );
-        assert_eq!(dispatched["checkout"], true, "checkout must default to true");
+        assert_eq!(
+            dispatched["checkout"], true,
+            "checkout must default to true"
+        );
     }
 
     #[test]
@@ -9762,9 +10025,8 @@ mod tests {
                     if trimmed.is_empty() {
                         break;
                     }
-                    if let Some(value) = trimmed
-                        .to_ascii_lowercase()
-                        .strip_prefix("content-length:")
+                    if let Some(value) =
+                        trimmed.to_ascii_lowercase().strip_prefix("content-length:")
                     {
                         content_length = value.trim().parse().unwrap_or(0);
                     }
@@ -9798,12 +10060,16 @@ mod tests {
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                     if served_last
-                        && matches!(status, "completed" | "rejected" | "failed" | "expired" | "cancelled")
+                        && matches!(
+                            status,
+                            "completed" | "rejected" | "failed" | "expired" | "cancelled"
+                        )
                     {
                         return;
                     }
                 } else {
-                    let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let response =
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = stream.write_all(response);
                 }
             }
@@ -9848,9 +10114,8 @@ mod tests {
                     if trimmed.is_empty() {
                         break;
                     }
-                    if let Some(value) = trimmed
-                        .to_ascii_lowercase()
-                        .strip_prefix("content-length:")
+                    if let Some(value) =
+                        trimmed.to_ascii_lowercase().strip_prefix("content-length:")
                     {
                         content_length = value.trim().parse().unwrap_or(0);
                     }
@@ -9946,11 +10211,7 @@ mod tests {
 
     #[test]
     fn operation_status_returns_proposal_status_via_gateway() {
-        let (addr, _rx) = spawn_operation_gateway_mock(
-            "merge",
-            "rejected",
-            json!({}),
-        );
+        let (addr, _rx) = spawn_operation_gateway_mock("merge", "rejected", json!({}));
         let _env = GatewayEnvGuard::set(&addr);
 
         let response = call_tool("operation.status", json!({ "previewId": "p-lost-1" }), true);
@@ -9987,7 +10248,8 @@ mod tests {
 
     #[test]
     fn operation_status_unknown_preview_id_reports_honest_absence() {
-        let addr = spawn_single_response_gateway_mock(404, json!({ "error": "previewId not found" }));
+        let addr =
+            spawn_single_response_gateway_mock(404, json!({ "error": "previewId not found" }));
         let _env = GatewayEnvGuard::set(&addr);
         let response = call_tool("operation.status", json!({ "previewId": "ghost" }), true);
         assert_eq!(response["result"]["isError"], true);
@@ -10004,7 +10266,11 @@ mod tests {
             json!({ "previewId": "p-stale-9", "status": "cancelled" }),
         );
         let _env = GatewayEnvGuard::set(&addr);
-        let response = call_tool("operation.cancel", json!({ "previewId": "p-stale-9" }), true);
+        let response = call_tool(
+            "operation.cancel",
+            json!({ "previewId": "p-stale-9" }),
+            true,
+        );
         assert_eq!(response["result"]["isError"], false, "{response:?}");
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
@@ -10020,7 +10286,11 @@ mod tests {
             json!({ "error": "previewId belongs to a different agent" }),
         );
         let _env = GatewayEnvGuard::set(&addr);
-        let response = call_tool("operation.cancel", json!({ "previewId": "p-foreign" }), true);
+        let response = call_tool(
+            "operation.cancel",
+            json!({ "previewId": "p-foreign" }),
+            true,
+        );
         assert_eq!(response["result"]["isError"], true);
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
@@ -10055,8 +10325,15 @@ mod tests {
         assert_eq!(data["truncated"], true);
         assert_eq!(data["maxBytes"], 512);
         let diff = data["diff"].as_str().unwrap();
-        assert!(diff.len() <= 512, "diff must respect maxBytes, got {}", diff.len());
-        assert!(diff.ends_with('\n'), "truncation must land on a line boundary");
+        assert!(
+            diff.len() <= 512,
+            "diff must respect maxBytes, got {}",
+            diff.len()
+        );
+        assert!(
+            diff.ends_with('\n'),
+            "truncation must land on a line boundary"
+        );
         assert!(
             data["totalBytes"].as_u64().unwrap() > 512,
             "totalBytes must report the FULL diff size"
@@ -10173,7 +10450,10 @@ mod tests {
 
         let reset_event = &events[1];
         assert_eq!(reset_event["event_type"], "write_proposal");
-        assert_eq!(reset_event["risk"], "high", "reset must be labeled high risk");
+        assert_eq!(
+            reset_event["risk"], "high",
+            "reset must be labeled high risk"
+        );
 
         // The three 2026-07 write proposals carry honest per-op risk labels:
         // commit/branch only add state (low); push mutates remote refs (medium).
@@ -10226,11 +10506,8 @@ mod tests {
 
         let audit_dir = TestDir::new("fluxgit-mcp-signed-audit");
         let audit_log = audit_dir.path().join("mcp.jsonl");
-        let server = McpSidecar::new_for_tests_with_signed_audit(
-            false,
-            audit_log.clone(),
-            signer.clone(),
-        );
+        let server =
+            McpSidecar::new_for_tests_with_signed_audit(false, audit_log.clone(), signer.clone());
 
         let repo = fixture_repo();
         let response = server
@@ -10278,11 +10555,7 @@ mod tests {
 
         let audit_dir = TestDir::new("fluxgit-mcp-tamper-audit");
         let audit_log = audit_dir.path().join("mcp.jsonl");
-        let server = McpSidecar::new_for_tests_with_signed_audit(
-            false,
-            audit_log.clone(),
-            signer,
-        );
+        let server = McpSidecar::new_for_tests_with_signed_audit(false, audit_log.clone(), signer);
 
         let repo = fixture_repo();
         server
@@ -10330,10 +10603,7 @@ mod tests {
                 // as "tampered". This guarantees backward compatibility
                 // with logs written before signing was enabled.
             }
-            other => panic!(
-                "expected MissingSignature, got {:?}",
-                other
-            ),
+            other => panic!("expected MissingSignature, got {:?}", other),
         }
     }
 
@@ -10345,11 +10615,8 @@ mod tests {
 
         let audit_dir = TestDir::new("fluxgit-mcp-wrongkey-audit");
         let audit_log = audit_dir.path().join("mcp.jsonl");
-        let server = McpSidecar::new_for_tests_with_signed_audit(
-            false,
-            audit_log.clone(),
-            signer.clone(),
-        );
+        let server =
+            McpSidecar::new_for_tests_with_signed_audit(false, audit_log.clone(), signer.clone());
 
         let repo = fixture_repo();
         server
@@ -10379,9 +10646,7 @@ mod tests {
         );
 
         // Sanity: the original key still verifies.
-        assert!(
-            verify_audit_event_signature(&event, &signer.verifying_key()).unwrap()
-        );
+        assert!(verify_audit_event_signature(&event, &signer.verifying_key()).unwrap());
     }
 
     #[test]
@@ -10432,8 +10697,7 @@ mod tests {
         let bytes = canonical_json_bytes(&event);
         let s = String::from_utf8(bytes).unwrap();
         assert_eq!(
-            s,
-            r#"{"a":{"b":3,"y":2},"m":[{"a":2,"z":1},4],"z":1}"#,
+            s, r#"{"a":{"b":3,"y":2},"m":[{"a":2,"z":1},4],"z":1}"#,
             "canonical form must sort object keys lexicographically and preserve array order"
         );
     }

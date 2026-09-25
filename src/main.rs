@@ -84,7 +84,10 @@ fn verify_audit_cli(args: Vec<String>) -> ExitCode {
     let pem = match std::fs::read_to_string(&pubkey_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("verify-audit: cannot read pubkey {}: {e}", pubkey_path.display());
+            eprintln!(
+                "verify-audit: cannot read pubkey {}: {e}",
+                pubkey_path.display()
+            );
             return ExitCode::from(2);
         }
     };

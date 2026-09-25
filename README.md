@@ -13,7 +13,7 @@ Reads are open. Every write is a proposal you review and approve (or reject) in 
 
 ## What it is
 
-`fluxgit-mcp-sidecar` is a Rust MCP server that gives MCP-compatible agents (Claude Code, Cursor, Codex, and any other MCP host) rich, structured Git context (branch state, diffs, reflog, conflicts, lost commits) without ever letting them silently mutate your repository. Reads are unrestricted. Writes never execute from the agent directly: the agent proposes, FluxGit renders an approval card with a full preview, and the change runs through FluxGit's safety pipeline (restore points + audit) only after you click approve. That is the whole idea: **approve-before-it-runs**, not clean-up-after.
+`fluxgit-mcp-sidecar` is a Rust MCP server that gives MCP-compatible agents (Claude Code, Cursor, Codex, and any other MCP host) rich, structured Git context (branch state, diffs, reflog, conflicts, lost commits) without ever letting them silently mutate your repository. Reads are unrestricted. Writes never execute from the agent directly: the agent proposes, FluxGit renders an operation-specific approval card, and the change runs through FluxGit's safety pipeline only after you click approve. Recovery information is reported for the operations that actually capture it. That is the whole idea: **approve-before-it-runs**, not clean-up-after.
 
 ## 30-second quickstart
 
@@ -31,7 +31,7 @@ Then point any MCP host at it. No client-specific install required:
     "fluxgit": {
       "command": "/absolute/path/to/fluxgit-mcp-sidecar",
       "env": {
-        "FLUXGIT_GATEWAY_ADDR": "127.0.0.1:14660",
+        "FLUXGIT_MCP_HANDSHAKE_ADDR": "127.0.0.1:59647",
         "FLUXGIT_MCP_AUDIT_LOG": "/optional/path/to/audit.jsonl"
       }
     }
@@ -39,18 +39,18 @@ Then point any MCP host at it. No client-specific install required:
 }
 ```
 
-`FLUXGIT_GATEWAY_ADDR` connects the sidecar to the FluxGit desktop app and unlocks the write-approval flow plus real semantic diffs; without it the read-only tier still works standalone against local `git`. `FLUXGIT_MCP_AUDIT_LOG` enables an append-only, optionally Ed25519-signed audit log of every call (arguments are hashed, never stored verbatim).
+`FLUXGIT_MCP_HANDSHAKE_ADDR` connects the sidecar to the FluxGit desktop app and unlocks the proposal-approval flow plus real semantic diffs; without it the read-only tier still works standalone against local `git`. The older `FLUXGIT_GATEWAY_ADDR` name remains a backward-compatible fallback, but new configurations should use the canonical name above. `FLUXGIT_MCP_AUDIT_LOG` enables an append-only, optionally Ed25519-signed audit log of every call (arguments are hashed, never stored verbatim).
 
 ## What your agent gets
 
-**23 read-only tools, built for context budgets.** Instead of shelling out 6-10 raw `git` commands and flooding the context window, an agent opens a session with one `repo.brief` call: branch, ahead/behind, in-progress operation, working-tree summary, stashes, submodule drift, recent commits and detected conventions. In a measured comparison that single call returned the same situational awareness for **607 tokens** where the equivalent raw git output ran **1,886** — about a third of the context. `diff.semantic` adds precision: real per-file, per-token structural hunks instead of a text patch the agent has to re-parse. The full catalog is in [What's exposed](#whats-exposed) below.
+**23 read-only tools, built for context budgets.** Instead of shelling out several raw `git` commands, an agent can open a session with one `repo.brief` call: branch, ahead/behind, in-progress operation, working-tree summary, stashes, submodule drift, recent commits and detected conventions. In the published synthetic benchmark, that call returned **561 output tokens in one call**, compared with **1,790 output tokens across a broad ten-command CLI sweep**. A hand-tuned five-command CLI counterexample used only **492 tokens**, so this is a coverage and round-trip result rather than a universal token-saving claim. The [reproducible benchmark](https://fluxgit.com/research/git-context-token-benchmark/) includes the fixture, raw outputs, scripts and checksums. `diff.semantic` adds structural precision; it does not carry a token-saving claim. The full catalog is in [What's exposed](#whats-exposed) below.
 
-**11 write tools, every one gated by a human.** merge, rebase, reset, discard, patch, commit, push and branch, plus a multi-step `plan` and a `cancel` — all of them are proposals. Each requires a free-text `reason`, dispatches to the FluxGit app as the approval card shown above, and only executes after you approve. Destructive modes force stronger confirmation; completed merges, rebases and resets return a restore point, so the change stays reversible from FluxGit's Safety Timeline.
+**10 proposal tools, every execution gated by a human, plus `operation.cancel`.** Merge, rebase, reset, discard, patch, worktree, commit, push, branch and a multi-step plan create proposals. Each proposal requires a free-text `reason`, dispatches to the FluxGit app as the approval card shown above, and only executes after you approve. `operation.cancel` is separate: it withdraws the calling agent's own still-pending proposal and never touches the repository. Destructive modes force stronger confirmation, and completion reports the operation-specific recovery information actually captured.
 
 ## Free shell vs FluxGit desktop — stated honestly
 
 - **Free shell (this repo, Apache-2.0, no account):** the free-tier read-only tools — 13 of them, from `repo.status`, `repo.refs`, `repo.history`, `repo.reflog`, `diff.text`, `conflict.read`, `commit.details`, `worktree.list` and `submodule.status` up to `repo.brief`/`repo.scope` — run standalone against your local `git`. Nothing to buy, nothing to sign up for.
-- **With the FluxGit desktop app running:** the 11 write tools become approvable actions, `diff.semantic` serves real structural payloads from FluxGit's diff engine, and the FluxGit-only tools (safety timeline, restore points) light up. Without the app they degrade honestly: FluxGit-required tools return `gateway_not_configured` and write tools return `write_handshake_pending` (code 10003), never a fake success.
+- **With the FluxGit desktop app running:** the ten proposal tools become approvable actions, `operation.cancel` can withdraw the agent's own pending proposal, `diff.semantic` serves real structural payloads from FluxGit's diff engine, and the FluxGit-only tools (safety timeline, restore points) light up. Without the app they degrade honestly: FluxGit-required tools return `gateway_not_configured` and proposal tools return `write_handshake_pending` (code 10003), never a fake success.
 
 ## Made for the agents you already use
 
@@ -64,7 +64,7 @@ Then point any MCP host at it. No client-specific install required:
 
 AI coding agents are increasingly asked to navigate real repositories: explain branch state, summarize diffs, find lost commits, recommend safe next steps. To do this well, an agent needs Git context that is richer than `git status` and structured enough to reason over. To do this safely, an agent must never be able to silently mutate refs, force-push, discard work, or apply patches without a human approving the consequence.
 
-Other MCP Git servers face a choice: stay strictly read-only (limited utility) or expose write tools directly (dangerous — agents hallucinate, prompts can be poisoned, mistakes are destructive). This sidecar chooses neither. Reads are unrestricted; writes go through a **write-with-UI-handshake** protocol that the FluxGit desktop app implements: the agent proposes, FluxGit shows the preview, the user approves in the app, FluxGit executes through its safety pipeline with restore points and audit.
+Other MCP Git servers face a choice: stay strictly read-only (limited utility) or expose write tools directly (dangerous — agents hallucinate, prompts can be poisoned, mistakes are destructive). This sidecar chooses neither. Reads are unrestricted; writes go through a **write-with-UI-handshake** protocol that the FluxGit desktop app implements: the agent proposes, FluxGit shows the operation-specific impact, risk and available recovery context, the user approves in the app, and FluxGit executes through its guarded pipeline and records the outcome.
 
 ---
 
@@ -98,9 +98,9 @@ Other MCP Git servers face a choice: stay strictly read-only (limited utility) o
 | `flux.restorePointDetails` | One restore point with before/after refs |
 | `operation.status` | Re-check a proposal's status by previewId (poll after the initial 60s window; returns rejectionReason or the completion result) |
 
-### 11 write-with-UI-handshake tools
+### 10 proposal tools plus `operation.cancel`
 
-All 10 `operation.preview.*` proposals dispatch through the FluxGit gateway when configured (the original 5 as of 2026-05-28; `plan`, `worktree`, `commit`, `push` and `branch` added since). The sidecar POSTs the proposal to the gateway's handshake server, the FluxGit app renders an "🤖 Requested by AI agent" approval card per operation type, and the sidecar polls until the user approves, rejects, or the proposal expires. When the gateway is not reachable, the sidecar returns `write_handshake_pending` (code 10003) so the agent can recommend the user perform the action in FluxGit UI.
+All 10 `operation.preview.*` tools dispatch a proposal through the FluxGit gateway when configured. The sidecar POSTs the proposal to the gateway's handshake server, the FluxGit app renders a requested-by-agent approval card per operation type, and the sidecar polls until the user approves, rejects, or the proposal expires. When the gateway is not reachable, the sidecar returns `write_handshake_pending` (code 10003) so the agent can recommend the user perform the action in FluxGit UI. `operation.cancel` addresses an existing pending proposal and does not create an approval request.
 
 | Tool | Purpose | Gateway dispatch |
 |---|---|---|
@@ -116,7 +116,7 @@ All 10 `operation.preview.*` proposals dispatch through the FluxGit gateway when
 | `operation.preview.branch` | Propose creating (and optionally checking out) a branch from a start point | POST `/v1/mcp/operation/preview/branch` → approval card with name + start point + checkout choice |
 | `operation.cancel` | Cancel the agent's own still-pending proposal by previewId | POST cancel; the card disappears from the user's queue like an expired proposal |
 
-All write proposals require a free-text `reason` so the user sees the agent's justification in the approval modal. All reuse the same gateway state machine (`pending → approved → completed`, terminal states `rejected | failed | expired`) and the same Tauri bridge in the UI. When an approved merge/rebase/reset executes, the completion `result` includes the captured restore point (`beforeCommit`/`afterCommit`/`canUndo`) so the agent can tell the user the change is reversible from FluxGit's Safety Timeline.
+All write proposals require a free-text `reason` so the user sees the agent's justification in the approval modal. All reuse the same gateway state machine (`pending → approved → completed`, terminal states `rejected | failed | expired`) and the same Tauri bridge in the UI. Completion reports a restore point only when that operation captured one; callers must use the returned recovery fields rather than promise universal undo.
 
 ### Write protocol details
 
@@ -355,7 +355,7 @@ Error codes:
 
 ## Status
 
-This is a working MCP server. The read-only surface is implemented and tested. The write-with-UI-handshake protocol is **live as of 2026-05-28**: all 10 `operation.preview.*` tools dispatch through the gateway handshake server, render an "🤖 Requested by AI agent" approval card in the FluxGit app, and complete through the existing safety pipeline (restore points + audit). Clients see structured terminal results (`completed | rejected | failed | expired`) instead of a placeholder error. The contract is forward-stable.
+This is a working MCP server. The read-only surface is implemented and tested. The write-with-UI-handshake protocol is **live as of 2026-05-28**: all 10 `operation.preview.*` tools dispatch through the gateway handshake server, render a requested-by-agent approval card in the FluxGit app, and complete through the existing guarded pipeline. Clients see structured terminal results (`completed | rejected | failed | expired`) and operation-specific recovery fields instead of a placeholder error. The contract is forward-stable.
 
 ## Roadmap
 
