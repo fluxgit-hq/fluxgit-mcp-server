@@ -1,9 +1,11 @@
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use fluxgit_mcp_sidecar::{
-    parse_public_key_pem, verify_audit_event_signature, AuditVerificationError, McpSidecar,
-};
+use fluxgit_mcp_sidecar::{parse_public_key_pem, verify_audit_ledger, McpSidecar};
+
+const AUDIT_MAX_PUBKEY_BYTES: u64 = 64 * 1024;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -28,18 +30,26 @@ fn print_help() {
 \n\
 USAGE:\n  \
     fluxgit-mcp-sidecar                        Run the MCP server on stdin/stdout\n  \
-    fluxgit-mcp-sidecar verify-audit <jsonl> --pubkey <pem>\n\
-                                               Verify the signature of every entry in an audit JSONL file\n\
+    fluxgit-mcp-sidecar verify-audit <jsonl> --pubkey <pem> [--require-signed]\n\
+                                               Stream-verify the retained ledger chain, rotations and signatures\n\
 \n\
 ENVIRONMENT:\n  \
-    FLUXGIT_MCP_AUDIT_LOG       Path to the JSONL audit log (enables auditing)\n  \
-    FLUXGIT_MCP_AUDIT_SIGN_KEY  Path to PEM PKCS8 Ed25519 private key for per-install signing\n\
+    FLUXGIT_RUN_DIR              Base for the default <run_dir>/audit/mcp.jsonl ledger\n  \
+    FLUXGIT_MCP_AUDIT_LOG       Optional override for the shared audit ledger path\n  \
+    FLUXGIT_MCP_AUDIT_DISABLED  Disable audit appends when explicitly present\n  \
+    FLUXGIT_MCP_AUDIT_SIGN_KEY  PEM PKCS8 Ed25519 key; invalid explicit configuration fails closed\n\
 "
     );
 }
 
 fn run_stdio() -> ExitCode {
-    let server = McpSidecar::from_env();
+    let server = match McpSidecar::from_env() {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("fluxgit-mcp-sidecar: audit configuration failed closed: {err}");
+            return ExitCode::from(1);
+        }
+    };
     if let Err(err) = server.run_stdio() {
         eprintln!("fluxgit-mcp-sidecar: {err}");
         return ExitCode::from(1);
@@ -57,12 +67,14 @@ fn run_stdio() -> ExitCode {
 fn verify_audit_cli(args: Vec<String>) -> ExitCode {
     let mut jsonl_path: Option<PathBuf> = None;
     let mut pubkey_path: Option<PathBuf> = None;
+    let mut require_signed = false;
     let mut iter = args.into_iter();
     while let Some(a) = iter.next() {
         match a.as_str() {
             "--pubkey" => {
                 pubkey_path = iter.next().map(PathBuf::from);
             }
+            "--require-signed" => require_signed = true,
             other if !other.starts_with('-') && jsonl_path.is_none() => {
                 jsonl_path = Some(PathBuf::from(other));
             }
@@ -81,7 +93,7 @@ fn verify_audit_cli(args: Vec<String>) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let pem = match std::fs::read_to_string(&pubkey_path) {
+    let pem = match read_bounded_utf8_file(&pubkey_path, AUDIT_MAX_PUBKEY_BYTES) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
@@ -99,60 +111,44 @@ fn verify_audit_cli(args: Vec<String>) -> ExitCode {
         }
     };
 
-    let contents = match std::fs::read_to_string(&jsonl_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("verify-audit: cannot read {}: {e}", jsonl_path.display());
-            return ExitCode::from(2);
+    let report = match verify_audit_ledger(&jsonl_path, &public_key, require_signed) {
+        Ok(report) => report,
+        Err(error) => {
+            // The error is deliberately metadata-only (segment/line/reason),
+            // never the possibly sensitive event body.
+            eprintln!("verify-audit: verification failed: {error}");
+            return ExitCode::from(3);
         }
     };
 
-    let mut verified = 0usize;
-    let mut failed = 0usize;
-    let mut unsigned = 0usize;
-    let mut malformed = 0usize;
-    let mut failure_lines: Vec<usize> = Vec::new();
+    println!("entries:   {}", report.entries);
+    println!("chained:   {}", report.chained);
+    println!("legacy:    {}", report.legacy);
+    println!("signed:    {}", report.signed);
+    println!("unsigned:  {}", report.unsigned);
+    println!("segments:  {}", report.segments);
+    println!(
+        "sequence:  {}..{}",
+        report.first_sequence.unwrap_or_default(),
+        report.last_sequence.unwrap_or_default()
+    );
+    println!(
+        "retention_checkpoint_used: {}",
+        report.retention_checkpoint_used
+    );
+    ExitCode::SUCCESS
+}
 
-    for (idx, line) in contents.lines().enumerate() {
-        let line_no = idx + 1;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => {
-                malformed += 1;
-                failure_lines.push(line_no);
-                continue;
-            }
-        };
-        match verify_audit_event_signature(&event, &public_key) {
-            Ok(true) => verified += 1,
-            Ok(false) => {
-                failed += 1;
-                failure_lines.push(line_no);
-            }
-            Err(AuditVerificationError::MissingSignature) => {
-                unsigned += 1;
-            }
-            Err(_) => {
-                malformed += 1;
-                failure_lines.push(line_no);
-            }
-        }
+fn read_bounded_utf8_file(path: &PathBuf, max_bytes: u64) -> io::Result<String> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(8192) as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds the {max_bytes}-byte safety limit"),
+        ));
     }
-
-    println!("verified: {verified}");
-    println!("failed:   {failed}");
-    println!("unsigned: {unsigned}");
-    println!("malformed: {malformed}");
-    if !failure_lines.is_empty() {
-        println!("failure_lines: {failure_lines:?}");
-    }
-
-    if failed > 0 || malformed > 0 {
-        ExitCode::from(3)
-    } else {
-        ExitCode::SUCCESS
-    }
+    String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }

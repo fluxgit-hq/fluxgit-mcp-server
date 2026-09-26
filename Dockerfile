@@ -1,9 +1,9 @@
 # Build stage
-FROM rust:1.87-slim AS build
+FROM rust:1.88-slim AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Runtime: the sidecar shells out to `git`, so the image must include it.
 FROM debian:bookworm-slim

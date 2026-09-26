@@ -1,8 +1,12 @@
 [package]
 name = "fluxgit-mcp-sidecar"
+# This crate is published independently from the FluxGit desktop app, so its
+# semver describes MCP server wire compatibility. It is also the version
+# reported in the MCP handshake (SERVER_VERSION in src/lib.rs) and must stay
+# identical to server.json.
 version = "0.1.0"
 edition = "2021"
-description = "Safety-first read-only Model Context Protocol (MCP) server for Git. AI agents inspect; FluxGit keeps control."
+description = "Safety-first Git MCP server: rich read tools plus human-approved FluxGit operation proposals."
 license = "Apache-2.0"
 repository = "https://github.com/fluxgit-hq/fluxgit-mcp-server"
 homepage = "https://fluxgit.com/features/mcp-agent-git/"
@@ -11,10 +15,9 @@ readme = "README.md"
 keywords = ["mcp", "git", "agent", "safety", "ai"]
 categories = ["development-tools", "command-line-utilities"]
 authors = ["FluxGit"]
-rust-version = "1.75"
+rust-version = "1.88"
 
 [dependencies]
-sha2 = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.11", default-features = false, features = ["json", "blocking", "rustls-tls"] }
@@ -24,3 +27,22 @@ chrono = { version = "0.4", features = ["serde"] }
 # `pem` enables PEM PKCS8 parsing so we can reuse the license-server keypair format.
 ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
 base64 = "0.22"
+# SHA-256 audit argument fingerprints (collision-resistant, replaces FNV-1a).
+sha2 = "0.10"
+# Cross-process advisory locking for the single shared gateway/sidecar audit
+# ledger. fs2 0.4 supports the sidecar's Rust 1.88 MSRV.
+fs2 = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }

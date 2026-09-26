@@ -2,25 +2,89 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use base64::Engine as _;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub const SERVER_NAME: &str = "fluxgit-mcp-sidecar";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// The latest stateless MCP protocol revision implemented by the sidecar.
+pub const LATEST_PROTOCOL_VERSION: &str = "2026-07-28";
+/// The handshake-era revision retained for older MCP hosts.
+pub const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Backward-compatible alias used by integrations that imported this constant.
+pub const PROTOCOL_VERSION: &str = LEGACY_PROTOCOL_VERSION;
+pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] =
+    [LATEST_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION];
+
+const MCP_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MCP_MAX_LEGACY_HEADER_BYTES: usize = 8 * 1024;
+const MCP_MAX_REQUEST_ID_BYTES: usize = 1_024;
+/// A bridge payload is embedded twice in modern MCP tool results: once as
+/// structuredContent and once as JSON text. Keep inbound bridge JSON well
+/// below the wire ceiling; [`serialize_response`] remains the final fail-safe
+/// for escaping/pretty-print overhead and every non-bridge response.
+const MCP_MAX_BRIDGE_RESPONSE_BYTES: usize = MCP_MAX_FRAME_BYTES / 3;
+const MCP_LIST_CACHE_TTL_MS: u64 = 30_000;
+const MCP_ALLOWED_ROOTS_ENV: &str = "FLUXGIT_MCP_ALLOWED_ROOTS";
+const MCP_INSTRUCTIONS: &str = "Use repo.brief first for repository context. Read tools never mutate Git state. operation.preview.* only creates an in-app FluxGit proposal: keep the returned previewId, let FluxGit show its card and notifications, and use operation.status until the user-approved guarded pipeline reports a terminal result.";
+const MCP_MAX_PATCH_CHARS: usize = 4 * 1024 * 1024;
+const MCP_MAX_MESSAGE_CHARS: usize = 64 * 1024;
+const MCP_MAX_REASON_CHARS: usize = 4096;
+const MCP_MAX_REF_CHARS: usize = 4096;
+const MCP_MAX_PATH_CHARS: usize = 32 * 1024;
+const MCP_MAX_PATH_ITEMS: usize = 10_000;
+
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const GIT_STREAM_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Commands whose callers present their output as complete must fit below this
+/// ceiling. Returning an error is safer than silently presenting a prefix as a
+/// complete repository snapshot.
+const GIT_COMPLETE_STDOUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// `diff.text` and conflict blob reads advertise explicit truncation metadata,
+/// but still need a finite amount of work to calculate their exact totals.
+const GIT_BOUNDED_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
+const GIT_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+const GIT_STDERR_MAX_BYTES: usize = 1024 * 1024;
+
+/// Audit records contain metadata and fingerprints, never patch bodies or Git
+/// output. A generous explicit line ceiling protects both appenders and the
+/// streaming verifier from malformed or attacker-controlled JSONL files.
+pub const AUDIT_MAX_LINE_BYTES: usize = 256 * 1024;
+/// The active JSONL and each immutable rotated segment are independently
+/// bounded. A legacy-only active file may exceed this by at most one line
+/// while the first chained entry anchors that legacy prefix.
+pub const AUDIT_MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+/// Retain at most four immutable segments plus the active JSONL. Normal
+/// operation therefore uses at most roughly 20 MiB (plus tiny lock/checkpoint
+/// metadata) and never grows without bound.
+pub const AUDIT_MAX_ROTATED_SEGMENTS: usize = 4;
+const AUDIT_MAX_SIGNING_KEY_BYTES: u64 = 64 * 1024;
+const AUDIT_MAX_CHECKPOINT_BYTES: u64 = 16 * 1024;
+const AUDIT_MAX_DIRECTORY_ENTRIES: usize = 4_096;
+const AUDIT_MAX_CHECKPOINT_FILES: usize = 16;
+const AUDIT_CHAIN_VERSION: u64 = 1;
+const AUDIT_SCHEMA_VERSION: u64 = 1;
+const AUDIT_SIGNATURE_VERSION: u64 = 3;
+const AUDIT_GENESIS_HASH: &str = "genesis";
+const AUDIT_SUMMARY_MAX_CHARS: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct McpSidecar {
     gateway_state: GatewayState,
-    audit_log: Option<PathBuf>,
-    audit_signer: Option<AuditSigner>,
+    audit_ledger: Option<AuditLedger>,
     /// The connected agent's own name, taken from `clientInfo.name` in the MCP
     /// `initialize` request.
     ///
@@ -35,9 +99,9 @@ pub struct McpSidecar {
 
 /// Per-install Ed25519 audit signer. Loaded once at startup from
 /// `FLUXGIT_MCP_AUDIT_SIGN_KEY` (PEM PKCS8, matching the license-server convention).
-/// Signing is opt-in: if the env var is unset, no signing happens. If the env var
-/// points to a missing or invalid key, we warn to stderr and continue WITHOUT
-/// signing — auditing must never refuse to record an event.
+/// Signing is opt-in when the env var is unset. An explicitly configured key
+/// is fail-closed: unsafe, unreadable, oversized, or invalid material is an
+/// audit startup error and can never silently downgrade to unsigned entries.
 #[derive(Clone)]
 pub struct AuditSigner {
     signing_key: SigningKey,
@@ -58,13 +122,18 @@ impl fmt::Debug for AuditSigner {
 impl AuditSigner {
     /// Load a signer from a PEM-encoded PKCS8 Ed25519 private key file.
     pub fn from_pem_file(path: &Path) -> Result<Self, AuditSignerError> {
-        let pem = fs::read_to_string(path).map_err(AuditSignerError::Io)?;
+        let pem = read_secure_signing_key(path).map_err(AuditSignerError::Io)?;
         Self::from_pem_str(&pem)
     }
 
     /// Load a signer from an in-memory PEM PKCS8 string. Exposed for tests
     /// (so a keypair can be generated and consumed without touching disk).
     pub fn from_pem_str(pem: &str) -> Result<Self, AuditSignerError> {
+        if pem.len() as u64 > AUDIT_MAX_SIGNING_KEY_BYTES {
+            return Err(AuditSignerError::Parse(format!(
+                "key exceeds the {AUDIT_MAX_SIGNING_KEY_BYTES}-byte safety limit"
+            )));
+        }
         let signing_key =
             SigningKey::from_pkcs8_pem(pem).map_err(|e| AuditSignerError::Parse(e.to_string()))?;
         Ok(Self::from_signing_key(signing_key))
@@ -107,9 +176,8 @@ impl AuditSigner {
     }
 }
 
-/// Reasons an audit signer might fail to load. None of these are fatal at
-/// runtime — the sidecar logs a warning and falls back to unsigned audit
-/// rather than refusing to record events.
+/// Reasons an audit signer might fail to load. They are fatal to an explicitly
+/// configured audit surface; callers must not substitute an unsigned signer.
 #[derive(Debug)]
 pub enum AuditSignerError {
     Io(io::Error),
@@ -251,12 +319,19 @@ pub fn verify_audit_event_signature(
     sig_array.copy_from_slice(&sig_bytes);
     let signature = Signature::from_bytes(&sig_array);
 
-    // Build the canonical form WITHOUT the signature field (and without the
-    // signatureKeyId field, which is metadata describing which key signed it
-    // and is therefore also not part of the signed payload).
+    // Signature v2 binds the key id so it cannot be relabelled during key
+    // rotation. Legacy entries omitted that metadata from the signed bytes;
+    // keep their verification path for backward compatibility.
     let mut unsigned = obj.clone();
     unsigned.remove("signature");
-    unsigned.remove("signatureKeyId");
+    if unsigned
+        .get("signatureVersion")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        < 2
+    {
+        unsigned.remove("signatureKeyId");
+    }
     let canonical = canonical_json_bytes(&Value::Object(unsigned));
 
     Ok(public_key.verify(&canonical, &signature).is_ok())
@@ -266,6 +341,1354 @@ pub fn verify_audit_event_signature(
 /// emitted by Python `cryptography` and matching license-server convention).
 pub fn parse_public_key_pem(pem: &str) -> Result<VerifyingKey, AuditSignerError> {
     VerifyingKey::from_public_key_pem(pem).map_err(|e| AuditSignerError::Parse(e.to_string()))
+}
+
+/// A single, shared, bounded audit ledger implementation used by both the
+/// MCP stdio sidecar and the gateway's human-decision endpoints.
+///
+/// Every append takes a stable sibling lock, validates the directory and file
+/// again after locking/opening, repairs only an unmistakable partial active
+/// tail, validates the retained chain, rotates under the same lock, writes one
+/// complete JSONL record, and synchronizes it before releasing the lock.
+#[derive(Clone)]
+pub struct AuditLedger {
+    path: PathBuf,
+    signer: Option<AuditSigner>,
+    max_segment_bytes: u64,
+    max_rotated_segments: usize,
+}
+
+impl fmt::Debug for AuditLedger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditLedger")
+            .field("path", &self.path)
+            .field(
+                "signer",
+                &self.signer.as_ref().map(|signer| signer.key_id()),
+            )
+            .field("max_segment_bytes", &self.max_segment_bytes)
+            .field("max_rotated_segments", &self.max_rotated_segments)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub enum AuditLedgerError {
+    Io(io::Error),
+    Configuration(String),
+    Serialization(String),
+    Integrity {
+        segment: usize,
+        line: usize,
+        reason: String,
+    },
+}
+
+impl AuditLedgerError {
+    fn integrity(segment: usize, line: usize, reason: impl Into<String>) -> Self {
+        Self::Integrity {
+            segment,
+            line,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for AuditLedgerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "audit I/O error: {error}"),
+            Self::Configuration(message) => write!(f, "invalid audit configuration: {message}"),
+            Self::Serialization(message) => write!(f, "cannot serialize audit metadata: {message}"),
+            Self::Integrity {
+                segment,
+                line,
+                reason,
+            } => write!(
+                f,
+                "audit integrity failure in segment {segment}, line {line}: {reason}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuditLedgerError {}
+
+impl From<io::Error> for AuditLedgerError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl AuditLedger {
+    /// Resolve the common environment contract. Auditing is enabled by
+    /// default at `<run_dir>/audit/mcp.jsonl`; `FLUXGIT_MCP_AUDIT_LOG`
+    /// overrides it and `FLUXGIT_MCP_AUDIT_DISABLED` disables appends.
+    ///
+    /// The signing key is deliberately loaded first: explicitly configuring
+    /// an invalid key is an error even when another variable disables audit,
+    /// avoiding a latent silent downgrade on the next restart.
+    pub fn from_env() -> Result<Option<Self>, AuditLedgerError> {
+        let signer = load_audit_signer_from_env()?;
+        let Some(path) = mcp_audit_log_path_checked()? else {
+            return Ok(None);
+        };
+        Self::new(path, signer).map(Some)
+    }
+
+    pub fn new(path: PathBuf, signer: Option<AuditSigner>) -> Result<Self, AuditLedgerError> {
+        Self::with_limits(
+            path,
+            signer,
+            AUDIT_MAX_SEGMENT_BYTES,
+            AUDIT_MAX_ROTATED_SEGMENTS,
+        )
+    }
+
+    /// Construct a ledger with explicit retention limits. Public primarily so
+    /// the gateway can share the implementation and adversarial tests can
+    /// exercise rotation without writing multi-megabyte fixtures.
+    pub fn with_limits(
+        path: PathBuf,
+        signer: Option<AuditSigner>,
+        max_segment_bytes: u64,
+        max_rotated_segments: usize,
+    ) -> Result<Self, AuditLedgerError> {
+        if path.as_os_str().is_empty() || path.file_name().is_none() {
+            return Err(AuditLedgerError::Configuration(
+                "audit log path must name a file".into(),
+            ));
+        }
+        if max_segment_bytes < 512 {
+            return Err(AuditLedgerError::Configuration(
+                "audit segment limit must be at least 512 bytes".into(),
+            ));
+        }
+        if max_rotated_segments == 0 || max_rotated_segments > 64 {
+            return Err(AuditLedgerError::Configuration(
+                "audit rotated-segment limit must be between 1 and 64".into(),
+            ));
+        }
+        Ok(Self {
+            path,
+            signer,
+            max_segment_bytes,
+            max_rotated_segments,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn append(&self, event: Value) -> Result<(), AuditLedgerError> {
+        prepare_audit_parent(&self.path)?;
+        let lock_path = audit_lock_path(&self.path)?;
+        let lock_file = open_secure_audit_file(&lock_path, true, true)?;
+        lock_file.lock_exclusive()?;
+
+        // The lock file and destination are attacker-reachable filesystem
+        // names. Re-check them only after ownership of the stable lock is held.
+        validate_audit_parent(&self.path)?;
+        validate_opened_path(&lock_path, &lock_file)?;
+        recover_active_tail(&self.path)?;
+
+        let mut scan = scan_audit_ledger(
+            &self.path,
+            None,
+            false,
+            self.max_segment_bytes,
+            self.max_rotated_segments,
+        )?;
+        let rotated_count = scan
+            .files
+            .iter()
+            .filter(|segment| segment.path != self.path)
+            .count();
+        if rotated_count > self.max_rotated_segments {
+            prune_rotated_segments(
+                &self.path,
+                self.signer.as_ref(),
+                self.max_segment_bytes,
+                self.max_rotated_segments,
+            )?;
+            scan = scan_audit_ledger(
+                &self.path,
+                None,
+                false,
+                self.max_segment_bytes,
+                self.max_rotated_segments,
+            )?;
+        }
+        let mut segment_id = scan
+            .active
+            .as_ref()
+            .and_then(|active| active.segment_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let mut chained = build_chained_event(event, &scan, &segment_id, self.signer.as_ref())?;
+        let mut line = serialize_audit_line(&chained)?;
+
+        let mut active_len = fs::symlink_metadata(&self.path)
+            .map(|metadata| metadata.len())
+            .or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Ok(0)
+                } else {
+                    Err(error)
+                }
+            })?;
+        let active_has_chain = scan
+            .active
+            .as_ref()
+            .is_some_and(|active| active.last_sequence.is_some());
+        if active_len > 0
+            && active_has_chain
+            && active_len.saturating_add(line.len() as u64) > self.max_segment_bytes
+        {
+            rotate_active_segment(&self.path, &scan)?;
+            prune_rotated_segments(
+                &self.path,
+                self.signer.as_ref(),
+                self.max_segment_bytes,
+                self.max_rotated_segments,
+            )?;
+            scan = scan_audit_ledger(
+                &self.path,
+                None,
+                false,
+                self.max_segment_bytes,
+                self.max_rotated_segments,
+            )?;
+            segment_id = Uuid::new_v4().to_string();
+            chained = build_chained_event(chained, &scan, &segment_id, self.signer.as_ref())?;
+            line = serialize_audit_line(&chained)?;
+            active_len = 0;
+        }
+
+        // A pre-chain legacy file must first receive a chained boundary entry
+        // that commits to its complete prefix. It may cross the normal segment
+        // limit by at most this one bounded line; the next append rotates it.
+        let hard_limit = self
+            .max_segment_bytes
+            .saturating_add(AUDIT_MAX_LINE_BYTES as u64);
+        if active_len.saturating_add(line.len() as u64) > hard_limit {
+            return Err(AuditLedgerError::Configuration(format!(
+                "active audit segment would exceed its {hard_limit}-byte hard limit"
+            )));
+        }
+
+        let mut file = open_secure_audit_file(&self.path, true, true)?;
+        validate_audit_parent(&self.path)?;
+        validate_opened_path(&self.path, &file)?;
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&line)?;
+        file.sync_data()?;
+        Ok(())
+    }
+}
+
+fn serialize_audit_line(event: &Value) -> Result<Vec<u8>, AuditLedgerError> {
+    let mut line = serde_json::to_vec(event)
+        .map_err(|error| AuditLedgerError::Serialization(error.to_string()))?;
+    line.push(b'\n');
+    if line.len() > AUDIT_MAX_LINE_BYTES {
+        return Err(AuditLedgerError::Configuration(format!(
+            "audit event is {} bytes; maximum JSONL line is {AUDIT_MAX_LINE_BYTES} bytes",
+            line.len()
+        )));
+    }
+    Ok(line)
+}
+
+fn sibling_audit_path(path: &Path, suffix: &str) -> Result<PathBuf, AuditLedgerError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| AuditLedgerError::Configuration("audit log path must name a file".into()))?;
+    let mut sibling = file_name.to_os_string();
+    sibling.push(suffix);
+    Ok(path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(sibling))
+}
+
+fn audit_lock_path(path: &Path) -> Result<PathBuf, AuditLedgerError> {
+    sibling_audit_path(path, ".lock")
+}
+
+fn prepare_audit_parent(path: &Path) -> Result<(), AuditLedgerError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let was_missing = match fs::symlink_metadata(parent) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
+    fs::create_dir_all(parent)?;
+    secure_audit_directory(parent, was_missing)?;
+    validate_audit_parent(path)
+}
+
+fn validate_audit_parent(path: &Path) -> Result<(), AuditLedgerError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    secure_audit_directory(parent, false)?;
+    Ok(())
+}
+
+fn open_secure_audit_file(
+    path: &Path,
+    create: bool,
+    writable: bool,
+) -> Result<File, AuditLedgerError> {
+    reject_unsafe_audit_path(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(writable).create(create);
+    configure_secure_audit_open(&mut options);
+    let file = options.open(path)?;
+    secure_audit_file(path, &file)?;
+    validate_opened_path(path, &file)?;
+    Ok(file)
+}
+
+/// Repair only the final unterminated record of the active file. A valid JSON
+/// value merely receives its missing newline; an invalid suffix is truncated
+/// only when at least one complete earlier line exists. Corruption of a
+/// one-record file is ambiguous and therefore fails closed.
+fn recover_active_tail(path: &Path) -> Result<(), AuditLedgerError> {
+    let mut file = match open_secure_audit_file(path, false, true) {
+        Ok(file) => file,
+        Err(AuditLedgerError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    let mut cursor = len;
+    let mut previous_newline = None;
+    let mut chunk = [0u8; 8 * 1024];
+    while cursor > 0 {
+        let read_len = usize::try_from(cursor.min(chunk.len() as u64)).unwrap_or(chunk.len());
+        cursor -= read_len as u64;
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut chunk[..read_len])?;
+        if let Some(index) = chunk[..read_len].iter().rposition(|byte| *byte == b'\n') {
+            previous_newline = Some(cursor + index as u64);
+            break;
+        }
+    }
+    let tail_start = previous_newline.map_or(0, |position| position + 1);
+    let tail_len = len.saturating_sub(tail_start);
+    if tail_len == 0 || tail_len > AUDIT_MAX_LINE_BYTES as u64 {
+        return Err(AuditLedgerError::integrity(
+            usize::MAX,
+            0,
+            "unterminated active tail exceeds the line bound",
+        ));
+    }
+    let mut tail = vec![0u8; tail_len as usize];
+    file.seek(SeekFrom::Start(tail_start))?;
+    file.read_exact(&mut tail)?;
+    let valid_object = serde_json::from_slice::<Value>(&tail)
+        .ok()
+        .is_some_and(|value| value.is_object());
+    if valid_object {
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+    } else if tail_start > 0 {
+        file.set_len(tail_start)?;
+    } else {
+        return Err(AuditLedgerError::integrity(
+            usize::MAX,
+            1,
+            "single-record active file has an invalid partial tail",
+        ));
+    }
+    file.sync_data()?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct RotatedSegmentName {
+    path: PathBuf,
+    first_sequence: u64,
+    last_sequence: u64,
+    segment_id: String,
+}
+
+#[derive(Clone, Debug)]
+enum LedgerFileKind {
+    Rotated(RotatedSegmentName),
+    Active,
+}
+
+#[derive(Clone, Debug)]
+struct LedgerFile {
+    path: PathBuf,
+    kind: LedgerFileKind,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScannedSegment {
+    path: PathBuf,
+    first_sequence: Option<u64>,
+    last_sequence: Option<u64>,
+    last_hash: Option<String>,
+    segment_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LedgerScan {
+    files: Vec<ScannedSegment>,
+    active: Option<ScannedSegment>,
+    last_sequence: u64,
+    last_hash: Option<String>,
+    legacy_anchor: Option<[u8; 32]>,
+    entries: u64,
+    chained: u64,
+    legacy: u64,
+    signed: u64,
+    unsigned: u64,
+    first_sequence: Option<u64>,
+    checkpoint_used: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RetentionCheckpoint {
+    next_sequence: u64,
+    previous_hash: String,
+}
+
+/// Bounded summary returned by the streaming ledger verifier. It contains
+/// counters and sequence metadata only, never event bodies, repository names,
+/// tool arguments, paths, or signatures.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditLedgerVerification {
+    pub entries: u64,
+    pub chained: u64,
+    pub legacy: u64,
+    pub signed: u64,
+    pub unsigned: u64,
+    pub segments: usize,
+    pub first_sequence: Option<u64>,
+    pub last_sequence: Option<u64>,
+    pub retention_checkpoint_used: bool,
+}
+
+/// Stream and verify the active audit JSONL plus all retained rotation
+/// segments. Legacy per-entry records remain accepted and their signatures
+/// are checked, but they are reported separately and are never described as
+/// chained. New records must have a contiguous sequence and matching
+/// previous/entry hashes, so modification, intermediate deletion, duplicate
+/// insertion, and reordering fail verification.
+pub fn verify_audit_ledger(
+    path: &Path,
+    public_key: &VerifyingKey,
+    require_signed: bool,
+) -> Result<AuditLedgerVerification, AuditLedgerError> {
+    let scan = scan_audit_ledger(
+        path,
+        Some(public_key),
+        require_signed,
+        AUDIT_MAX_SEGMENT_BYTES,
+        AUDIT_MAX_ROTATED_SEGMENTS,
+    )?;
+    Ok(AuditLedgerVerification {
+        entries: scan.entries,
+        chained: scan.chained,
+        legacy: scan.legacy,
+        signed: scan.signed,
+        unsigned: scan.unsigned,
+        segments: scan.files.len(),
+        first_sequence: scan.first_sequence,
+        last_sequence: (scan.last_sequence > 0).then_some(scan.last_sequence),
+        retention_checkpoint_used: scan.checkpoint_used,
+    })
+}
+
+/// Domain-separated SHA-256 fingerprint suitable for `repo_scope`. This is
+/// intentionally one-way and never returns any part of the repository path.
+pub fn audit_repo_scope_fingerprint(repo_path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fluxgit-mcp-repo-scope-v1\0");
+    hasher.update(repo_path.as_bytes());
+    format!("sha256:{}", lowercase_hex(&hasher.finalize()))
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn sha256_label(bytes: &[u8]) -> String {
+    format!("sha256:{}", lowercase_hex(&Sha256::digest(bytes)))
+}
+
+fn is_sha256_label(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn legacy_anchor_next(previous: Option<[u8; 32]>, event: &Value) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fluxgit-mcp-legacy-prefix-v1\0");
+    hasher.update(previous.unwrap_or([0u8; 32]));
+    hasher.update(canonical_json_bytes(event));
+    hasher.finalize().into()
+}
+
+fn legacy_anchor_label(anchor: &[u8; 32]) -> String {
+    format!("legacy-sha256:{}", lowercase_hex(anchor))
+}
+
+fn bounded_audit_text(value: &str, max_chars: usize) -> String {
+    let mut output = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(max_chars.saturating_add(1))
+        .collect::<String>();
+    if output.chars().count() > max_chars {
+        output = output.chars().take(max_chars.saturating_sub(1)).collect();
+        output.push('.');
+    }
+    output
+}
+
+fn build_chained_event(
+    event: Value,
+    scan: &LedgerScan,
+    segment_id: &str,
+    signer: Option<&AuditSigner>,
+) -> Result<Value, AuditLedgerError> {
+    let mut object = event.as_object().cloned().ok_or_else(|| {
+        AuditLedgerError::Configuration("audit events must be JSON objects".into())
+    })?;
+    for reserved in [
+        "id",
+        "auditSchemaVersion",
+        "auditChainVersion",
+        "sequence",
+        "segmentId",
+        "previousHash",
+        "entryHash",
+        "signature",
+        "signatureKeyId",
+        "signatureVersion",
+    ] {
+        object.remove(reserved);
+    }
+    if !object.get("timestamp").is_some_and(Value::is_number) {
+        object.insert("timestamp".into(), json!(now_ms()));
+    }
+    if let Some(summary) = object.get("summary").and_then(Value::as_str) {
+        object.insert(
+            "summary".into(),
+            Value::String(bounded_audit_text(summary, AUDIT_SUMMARY_MAX_CHARS)),
+        );
+    }
+    object.insert("id".into(), Value::String(Uuid::new_v4().to_string()));
+    object.insert("auditSchemaVersion".into(), json!(AUDIT_SCHEMA_VERSION));
+    object.insert("auditChainVersion".into(), json!(AUDIT_CHAIN_VERSION));
+    object.insert(
+        "sequence".into(),
+        json!(scan.last_sequence.saturating_add(1)),
+    );
+    object.insert("segmentId".into(), Value::String(segment_id.to_string()));
+    let previous_hash = scan
+        .last_hash
+        .clone()
+        .or_else(|| scan.legacy_anchor.as_ref().map(legacy_anchor_label))
+        .unwrap_or_else(|| AUDIT_GENESIS_HASH.to_string());
+    object.insert("previousHash".into(), Value::String(previous_hash));
+    if let Some(signer) = signer {
+        object.insert(
+            "signatureKeyId".into(),
+            Value::String(signer.key_id().to_string()),
+        );
+        object.insert("signatureVersion".into(), json!(AUDIT_SIGNATURE_VERSION));
+    }
+    let mut value = Value::Object(object);
+    let entry_hash = calculate_entry_hash(&value)?;
+    value["entryHash"] = Value::String(entry_hash);
+    if let Some(signer) = signer {
+        value["signature"] = Value::String(signer.sign_event(&value));
+    }
+    Ok(value)
+}
+
+fn calculate_entry_hash(event: &Value) -> Result<String, AuditLedgerError> {
+    let mut object = event.as_object().cloned().ok_or_else(|| {
+        AuditLedgerError::Configuration("chained audit entry is not an object".into())
+    })?;
+    object.remove("entryHash");
+    object.remove("signature");
+    Ok(sha256_label(&canonical_json_bytes(&Value::Object(object))))
+}
+
+fn ledger_name_prefix(path: &Path) -> Result<String, AuditLedgerError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            AuditLedgerError::Configuration(
+                "audit log filename must be valid Unicode for bounded rotation".into(),
+            )
+        })
+}
+
+fn collect_ledger_files(path: &Path) -> Result<Vec<LedgerFile>, AuditLedgerError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = ledger_name_prefix(path)?;
+    let rotated_prefix = format!("{base}.segment-");
+    let mut rotated = Vec::new();
+    let mut directory_entries = 0usize;
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        directory_entries = directory_entries.saturating_add(1);
+        if directory_entries > AUDIT_MAX_DIRECTORY_ENTRIES {
+            return Err(AuditLedgerError::Configuration(format!(
+                "audit directory exceeds the {AUDIT_MAX_DIRECTORY_ENTRIES}-entry scan bound"
+            )));
+        }
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(&rotated_prefix) else {
+            continue;
+        };
+        let mut pieces = rest.splitn(3, '-');
+        let first_raw = pieces.next().unwrap_or_default();
+        let last_raw = pieces.next().unwrap_or_default();
+        let segment_id = pieces.next().unwrap_or_default();
+        if first_raw.len() != 20 || last_raw.len() != 20 || Uuid::parse_str(segment_id).is_err() {
+            return Err(AuditLedgerError::Configuration(
+                "malformed audit rotation filename".into(),
+            ));
+        }
+        let first_sequence = first_raw.parse::<u64>().map_err(|_| {
+            AuditLedgerError::Configuration("malformed audit rotation sequence".into())
+        })?;
+        let last_sequence = last_raw.parse::<u64>().map_err(|_| {
+            AuditLedgerError::Configuration("malformed audit rotation sequence".into())
+        })?;
+        if first_sequence == 0 || last_sequence < first_sequence {
+            return Err(AuditLedgerError::Configuration(
+                "invalid audit rotation sequence range".into(),
+            ));
+        }
+        rotated.push(RotatedSegmentName {
+            path: entry.path(),
+            first_sequence,
+            last_sequence,
+            segment_id: segment_id.to_string(),
+        });
+    }
+    rotated.sort_by_key(|segment| segment.first_sequence);
+    for pair in rotated.windows(2) {
+        if pair[0].last_sequence >= pair[1].first_sequence {
+            return Err(AuditLedgerError::Configuration(
+                "overlapping or duplicate audit rotation ranges".into(),
+            ));
+        }
+    }
+    let mut files = rotated
+        .into_iter()
+        .map(|segment| LedgerFile {
+            path: segment.path.clone(),
+            kind: LedgerFileKind::Rotated(segment),
+        })
+        .collect::<Vec<_>>();
+    match fs::symlink_metadata(path) {
+        Ok(_) => files.push(LedgerFile {
+            path: path.to_path_buf(),
+            kind: LedgerFileKind::Active,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(files)
+}
+
+fn collect_checkpoint_paths(path: &Path) -> Result<Vec<PathBuf>, AuditLedgerError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = format!("{}.checkpoint-", ledger_name_prefix(path)?);
+    let mut checkpoints = Vec::new();
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(checkpoints),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix));
+        if matches {
+            checkpoints.push(entry.path());
+            if checkpoints.len() > AUDIT_MAX_CHECKPOINT_FILES {
+                return Err(AuditLedgerError::Configuration(format!(
+                    "too many audit retention checkpoints (maximum {AUDIT_MAX_CHECKPOINT_FILES})"
+                )));
+            }
+        }
+    }
+    Ok(checkpoints)
+}
+
+fn read_retention_checkpoints(
+    path: &Path,
+    public_key: Option<&VerifyingKey>,
+    require_signed: bool,
+) -> Result<Vec<RetentionCheckpoint>, AuditLedgerError> {
+    let mut checkpoints = Vec::new();
+    for (index, checkpoint_path) in collect_checkpoint_paths(path)?.into_iter().enumerate() {
+        let file = open_secure_audit_file(&checkpoint_path, false, false)?;
+        let size = file.metadata()?.len();
+        if size == 0 || size > AUDIT_MAX_CHECKPOINT_BYTES {
+            return Err(AuditLedgerError::integrity(
+                index,
+                1,
+                "retention checkpoint exceeds its byte bound",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(size as usize);
+        file.take(AUDIT_MAX_CHECKPOINT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            AuditLedgerError::integrity(index, 1, "retention checkpoint is malformed JSON")
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            AuditLedgerError::integrity(index, 1, "retention checkpoint is not an object")
+        })?;
+        if object.get("auditCheckpointVersion").and_then(Value::as_u64) != Some(1) {
+            return Err(AuditLedgerError::integrity(
+                index,
+                1,
+                "unsupported retention checkpoint version",
+            ));
+        }
+        let next_sequence = object
+            .get("nextSequence")
+            .and_then(Value::as_u64)
+            .filter(|sequence| *sequence > 1)
+            .ok_or_else(|| {
+                AuditLedgerError::integrity(
+                    index,
+                    1,
+                    "retention checkpoint has an invalid next sequence",
+                )
+            })?;
+        let previous_hash = object
+            .get("previousHash")
+            .and_then(Value::as_str)
+            .filter(|hash| is_sha256_label(hash))
+            .ok_or_else(|| {
+                AuditLedgerError::integrity(
+                    index,
+                    1,
+                    "retention checkpoint has an invalid previous hash",
+                )
+            })?
+            .to_string();
+        verify_optional_signature(&value, public_key, require_signed, index, 1)?;
+        checkpoints.push(RetentionCheckpoint {
+            next_sequence,
+            previous_hash,
+        });
+    }
+    Ok(checkpoints)
+}
+
+enum BoundedAuditLine {
+    Eof,
+    Data { terminated: bool },
+    TooLong,
+}
+
+fn read_bounded_ledger_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> io::Result<BoundedAuditLine> {
+    line.clear();
+    let mut too_long = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() && !too_long {
+                Ok(BoundedAuditLine::Eof)
+            } else if too_long {
+                Ok(BoundedAuditLine::TooLong)
+            } else {
+                Ok(BoundedAuditLine::Data { terminated: false })
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        if !too_long {
+            if line.len().saturating_add(consumed) > AUDIT_MAX_LINE_BYTES {
+                line.clear();
+                too_long = true;
+            } else {
+                line.extend_from_slice(&available[..consumed]);
+            }
+        }
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(if too_long {
+                BoundedAuditLine::TooLong
+            } else {
+                BoundedAuditLine::Data { terminated: true }
+            });
+        }
+    }
+}
+
+fn verify_optional_signature(
+    event: &Value,
+    public_key: Option<&VerifyingKey>,
+    require_signed: bool,
+    segment: usize,
+    line: usize,
+) -> Result<bool, AuditLedgerError> {
+    let Some(signature) = event.get("signature") else {
+        if require_signed {
+            return Err(AuditLedgerError::integrity(
+                segment,
+                line,
+                "required signature is missing",
+            ));
+        }
+        return Ok(false);
+    };
+    let encoded = signature
+        .as_str()
+        .ok_or_else(|| AuditLedgerError::integrity(segment, line, "signature is not a string"))?;
+    let decoded = BASE64_URL_NO_PAD.decode(encoded).map_err(|_| {
+        AuditLedgerError::integrity(segment, line, "signature is not valid base64url")
+    })?;
+    if decoded.len() != Signature::BYTE_SIZE {
+        return Err(AuditLedgerError::integrity(
+            segment,
+            line,
+            "signature has the wrong length",
+        ));
+    }
+    if let Some(public_key) = public_key {
+        match verify_audit_event_signature(event, public_key) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AuditLedgerError::integrity(
+                    segment,
+                    line,
+                    "signature verification failed",
+                ))
+            }
+            Err(_) => {
+                return Err(AuditLedgerError::integrity(
+                    segment,
+                    line,
+                    "signature metadata is malformed",
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn scan_audit_ledger(
+    path: &Path,
+    public_key: Option<&VerifyingKey>,
+    require_signed: bool,
+    max_segment_bytes: u64,
+    max_rotated_segments: usize,
+) -> Result<LedgerScan, AuditLedgerError> {
+    validate_audit_parent(path)?;
+    let files = collect_ledger_files(path)?;
+    let rotated_count = files
+        .iter()
+        .filter(|file| matches!(file.kind, LedgerFileKind::Rotated(_)))
+        .count();
+    // One extra segment can exist after an otherwise atomic active-file rename
+    // if the process crashed before retention pruning. It remains bounded and
+    // the next successful append prunes it under the same lock.
+    if rotated_count > max_rotated_segments.saturating_add(1) {
+        return Err(AuditLedgerError::Configuration(format!(
+            "audit ledger has {rotated_count} rotated segments; maximum retained is {max_rotated_segments}"
+        )));
+    }
+    let checkpoints = read_retention_checkpoints(path, public_key, require_signed)?;
+    let hard_segment_limit = max_segment_bytes.saturating_add(AUDIT_MAX_LINE_BYTES as u64);
+    let mut scan = LedgerScan::default();
+    let mut expected_sequence: Option<u64> = None;
+    let mut expected_previous: Option<String> = None;
+    let mut chain_started = false;
+    let mut prior_segment_id: Option<String> = None;
+
+    for (segment_index, descriptor) in files.iter().enumerate() {
+        let metadata = fs::symlink_metadata(&descriptor.path)?;
+        if metadata.len() > hard_segment_limit {
+            return Err(AuditLedgerError::integrity(
+                segment_index,
+                0,
+                "segment exceeds its byte bound",
+            ));
+        }
+        let file = open_secure_audit_file(&descriptor.path, false, false)?;
+        validate_opened_path(&descriptor.path, &file)?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::with_capacity(4096);
+        let mut line_number = 0usize;
+        let mut segment = ScannedSegment {
+            path: descriptor.path.clone(),
+            ..ScannedSegment::default()
+        };
+
+        loop {
+            match read_bounded_ledger_line(&mut reader, &mut line)? {
+                BoundedAuditLine::Eof => break,
+                BoundedAuditLine::TooLong => {
+                    return Err(AuditLedgerError::integrity(
+                        segment_index,
+                        line_number.saturating_add(1),
+                        "JSONL record exceeds the line bound",
+                    ))
+                }
+                BoundedAuditLine::Data { terminated } => {
+                    line_number = line_number.saturating_add(1);
+                    if !terminated {
+                        return Err(AuditLedgerError::integrity(
+                            segment_index,
+                            line_number,
+                            "segment ends with an unterminated record",
+                        ));
+                    }
+                }
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                return Err(AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "blank JSONL records are not allowed",
+                ));
+            }
+            let event: Value = serde_json::from_slice(&line).map_err(|_| {
+                AuditLedgerError::integrity(segment_index, line_number, "record is malformed JSON")
+            })?;
+            let object = event.as_object().ok_or_else(|| {
+                AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "record is not a JSON object",
+                )
+            })?;
+            let is_chained = object.contains_key("auditChainVersion");
+            let signed = verify_optional_signature(
+                &event,
+                public_key,
+                require_signed,
+                segment_index,
+                line_number,
+            )?;
+            scan.entries = scan.entries.saturating_add(1);
+            if signed {
+                scan.signed = scan.signed.saturating_add(1);
+            } else {
+                scan.unsigned = scan.unsigned.saturating_add(1);
+            }
+
+            if !is_chained {
+                if chain_started || expected_sequence.is_some() {
+                    return Err(AuditLedgerError::integrity(
+                        segment_index,
+                        line_number,
+                        "legacy record appears after the chained ledger began",
+                    ));
+                }
+                if matches!(descriptor.kind, LedgerFileKind::Rotated(_)) {
+                    // Rotated legacy prefixes are only supported when the same
+                    // segment also contains the chained boundary that anchors
+                    // them; the post-read filename check enforces that.
+                }
+                scan.legacy_anchor = Some(legacy_anchor_next(scan.legacy_anchor, &event));
+                scan.legacy = scan.legacy.saturating_add(1);
+                continue;
+            }
+
+            if object.get("auditChainVersion").and_then(Value::as_u64) != Some(AUDIT_CHAIN_VERSION)
+                || object.get("auditSchemaVersion").and_then(Value::as_u64)
+                    != Some(AUDIT_SCHEMA_VERSION)
+            {
+                return Err(AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "unsupported audit chain/schema version",
+                ));
+            }
+            let sequence = object
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .filter(|sequence| *sequence > 0)
+                .ok_or_else(|| {
+                    AuditLedgerError::integrity(
+                        segment_index,
+                        line_number,
+                        "missing or invalid sequence",
+                    )
+                })?;
+            let previous_hash = object
+                .get("previousHash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AuditLedgerError::integrity(segment_index, line_number, "missing previous hash")
+                })?;
+            let entry_hash = object
+                .get("entryHash")
+                .and_then(Value::as_str)
+                .filter(|hash| is_sha256_label(hash))
+                .ok_or_else(|| {
+                    AuditLedgerError::integrity(
+                        segment_index,
+                        line_number,
+                        "missing or invalid entry hash",
+                    )
+                })?;
+            let segment_id = object
+                .get("segmentId")
+                .and_then(Value::as_str)
+                .filter(|id| {
+                    Uuid::parse_str(id)
+                        .ok()
+                        .is_some_and(|parsed| parsed.to_string() == *id)
+                })
+                .ok_or_else(|| {
+                    AuditLedgerError::integrity(
+                        segment_index,
+                        line_number,
+                        "missing or invalid segment UUID",
+                    )
+                })?;
+            let event_id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| {
+                    Uuid::parse_str(id).ok().is_some_and(|parsed| {
+                        parsed.to_string() == *id && parsed.get_version_num() == 4
+                    })
+                })
+                .ok_or_else(|| {
+                    AuditLedgerError::integrity(
+                        segment_index,
+                        line_number,
+                        "missing or invalid v4 event UUID",
+                    )
+                })?;
+            let _ = event_id;
+            if !object.get("timestamp").is_some_and(Value::is_number) {
+                return Err(AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "missing numeric timestamp",
+                ));
+            }
+
+            if !chain_started {
+                let (initial_sequence, initial_previous, used_checkpoint) =
+                    if let Some(anchor) = scan.legacy_anchor.as_ref() {
+                        (1, legacy_anchor_label(anchor), false)
+                    } else if sequence == 1 {
+                        (1, AUDIT_GENESIS_HASH.to_string(), false)
+                    } else {
+                        let matching = checkpoints
+                            .iter()
+                            .filter(|checkpoint| {
+                                checkpoint.next_sequence == sequence
+                                    && checkpoint.previous_hash == previous_hash
+                            })
+                            .count();
+                        if matching != 1 {
+                            return Err(AuditLedgerError::integrity(
+                                segment_index,
+                                line_number,
+                                "retained prefix lacks one matching retention checkpoint",
+                            ));
+                        }
+                        (sequence, previous_hash.to_string(), true)
+                    };
+                expected_sequence = Some(initial_sequence);
+                expected_previous = Some(initial_previous);
+                scan.checkpoint_used = used_checkpoint;
+                chain_started = true;
+            }
+            if expected_sequence != Some(sequence) {
+                return Err(AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "sequence is duplicated, missing, or out of order",
+                ));
+            }
+            if expected_previous.as_deref() != Some(previous_hash) {
+                return Err(AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "previous hash does not match the preceding entry",
+                ));
+            }
+            let calculated_hash = calculate_entry_hash(&event)?;
+            if calculated_hash != entry_hash {
+                return Err(AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "entry hash does not match canonical event bytes",
+                ));
+            }
+            if let Some(file_segment_id) = segment.segment_id.as_deref() {
+                if file_segment_id != segment_id {
+                    return Err(AuditLedgerError::integrity(
+                        segment_index,
+                        line_number,
+                        "one file contains multiple segment UUIDs",
+                    ));
+                }
+            } else {
+                if prior_segment_id.as_deref() == Some(segment_id) {
+                    return Err(AuditLedgerError::integrity(
+                        segment_index,
+                        line_number,
+                        "segment UUID was reused across rotation files",
+                    ));
+                }
+                segment.segment_id = Some(segment_id.to_string());
+            }
+            segment.first_sequence.get_or_insert(sequence);
+            segment.last_sequence = Some(sequence);
+            segment.last_hash = Some(entry_hash.to_string());
+            scan.first_sequence.get_or_insert(sequence);
+            scan.last_sequence = sequence;
+            scan.last_hash = Some(entry_hash.to_string());
+            scan.chained = scan.chained.saturating_add(1);
+            expected_sequence = sequence.checked_add(1);
+            if expected_sequence.is_none() {
+                return Err(AuditLedgerError::integrity(
+                    segment_index,
+                    line_number,
+                    "audit sequence exhausted u64",
+                ));
+            }
+            expected_previous = Some(entry_hash.to_string());
+        }
+
+        match &descriptor.kind {
+            LedgerFileKind::Rotated(claimed) => {
+                if segment.first_sequence != Some(claimed.first_sequence)
+                    || segment.last_sequence != Some(claimed.last_sequence)
+                    || segment.segment_id.as_deref() != Some(claimed.segment_id.as_str())
+                {
+                    return Err(AuditLedgerError::integrity(
+                        segment_index,
+                        0,
+                        "rotation filename does not match segment contents",
+                    ));
+                }
+            }
+            LedgerFileKind::Active => scan.active = Some(segment.clone()),
+        }
+        if let Some(segment_id) = segment.segment_id.clone() {
+            prior_segment_id = Some(segment_id);
+        }
+        scan.files.push(segment);
+    }
+
+    // A checkpoint is meaningful only when it exactly anchors the first
+    // retained chain entry. Unused future checkpoints may remain after a crash
+    // between atomic checkpoint creation and old-segment deletion, but no more
+    // than one may match any actual retained start (enforced above).
+    Ok(scan)
+}
+
+fn rotate_active_segment(path: &Path, scan: &LedgerScan) -> Result<(), AuditLedgerError> {
+    let active = scan.active.as_ref().ok_or_else(|| {
+        AuditLedgerError::Configuration("active audit segment disappeared before rotation".into())
+    })?;
+    let first = active.first_sequence.ok_or_else(|| {
+        AuditLedgerError::Configuration(
+            "legacy-only audit segment cannot rotate before a chained boundary".into(),
+        )
+    })?;
+    let last = active.last_sequence.ok_or_else(|| {
+        AuditLedgerError::Configuration("active audit segment has no final sequence".into())
+    })?;
+    let segment_id = active.segment_id.as_deref().ok_or_else(|| {
+        AuditLedgerError::Configuration("active audit segment has no segment UUID".into())
+    })?;
+    let file = open_secure_audit_file(path, false, true)?;
+    file.sync_all()?;
+    validate_opened_path(path, &file)?;
+    drop(file);
+
+    let suffix = format!(".segment-{first:020}-{last:020}-{segment_id}");
+    let rotated = sibling_audit_path(path, &suffix)?;
+    match fs::symlink_metadata(&rotated) {
+        Ok(_) => {
+            return Err(AuditLedgerError::Configuration(
+                "audit rotation destination already exists".into(),
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_audit_parent(path)?;
+    fs::rename(path, &rotated)?;
+    sync_audit_parent(path)?;
+    Ok(())
+}
+
+fn write_retention_checkpoint(
+    path: &Path,
+    next_sequence: u64,
+    previous_hash: &str,
+    signer: Option<&AuditSigner>,
+) -> Result<PathBuf, AuditLedgerError> {
+    let mut checkpoint = json!({
+        "auditCheckpointVersion": 1,
+        "nextSequence": next_sequence,
+        "previousHash": previous_hash,
+        "prunedThroughSequence": next_sequence.saturating_sub(1),
+        "createdAt": now_ms(),
+    });
+    if let Some(signer) = signer {
+        checkpoint["signatureKeyId"] = Value::String(signer.key_id().to_string());
+        checkpoint["signatureVersion"] = json!(AUDIT_SIGNATURE_VERSION);
+        checkpoint["signature"] = Value::String(signer.sign_event(&checkpoint));
+    }
+    let bytes = serde_json::to_vec(&checkpoint)
+        .map_err(|error| AuditLedgerError::Serialization(error.to_string()))?;
+    if bytes.len() as u64 > AUDIT_MAX_CHECKPOINT_BYTES {
+        return Err(AuditLedgerError::Configuration(
+            "retention checkpoint exceeds its byte bound".into(),
+        ));
+    }
+    let suffix = format!(".checkpoint-{next_sequence:020}-{}.json", Uuid::new_v4());
+    let checkpoint_path = sibling_audit_path(path, &suffix)?;
+    reject_unsafe_audit_path(&checkpoint_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    configure_secure_audit_open(&mut options);
+    let mut file = options.open(&checkpoint_path)?;
+    secure_audit_file(&checkpoint_path, &file)?;
+    validate_opened_path(&checkpoint_path, &file)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    sync_audit_parent(path)?;
+    Ok(checkpoint_path)
+}
+
+fn prune_rotated_segments(
+    path: &Path,
+    signer: Option<&AuditSigner>,
+    max_segment_bytes: u64,
+    max_rotated_segments: usize,
+) -> Result<(), AuditLedgerError> {
+    let scan = scan_audit_ledger(path, None, false, max_segment_bytes, max_rotated_segments)?;
+    let rotated = scan
+        .files
+        .iter()
+        .filter(|segment| segment.path != path)
+        .collect::<Vec<_>>();
+    if rotated.len() <= max_rotated_segments {
+        return Ok(());
+    }
+    let prune_count = rotated.len() - max_rotated_segments;
+    let last_pruned = rotated[prune_count - 1];
+    let first_retained = rotated[prune_count];
+    let pruned_sequence = last_pruned.last_sequence.ok_or_else(|| {
+        AuditLedgerError::Configuration("pruned segment lacks a final sequence".into())
+    })?;
+    let previous_hash = last_pruned.last_hash.as_deref().ok_or_else(|| {
+        AuditLedgerError::Configuration("pruned segment lacks a final hash".into())
+    })?;
+    let next_sequence = first_retained.first_sequence.ok_or_else(|| {
+        AuditLedgerError::Configuration("retained segment lacks a first sequence".into())
+    })?;
+    if pruned_sequence.checked_add(1) != Some(next_sequence) {
+        return Err(AuditLedgerError::Configuration(
+            "retention boundary is not sequence-contiguous".into(),
+        ));
+    }
+
+    // Checkpoint creation is immutable and synchronized before deletion. A
+    // crash can therefore leave an extra older segment, never an unexplained
+    // missing prefix.
+    let new_checkpoint = write_retention_checkpoint(path, next_sequence, previous_hash, signer)?;
+    for segment in rotated.into_iter().take(prune_count) {
+        reject_unsafe_audit_path(&segment.path)?;
+        fs::remove_file(&segment.path)?;
+    }
+    sync_audit_parent(path)?;
+    for old_checkpoint in collect_checkpoint_paths(path)? {
+        if old_checkpoint != new_checkpoint {
+            reject_unsafe_audit_path(&old_checkpoint)?;
+            fs::remove_file(old_checkpoint)?;
+        }
+    }
+    sync_audit_parent(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_audit_parent(path: &Path) -> Result<(), AuditLedgerError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_audit_parent(_path: &Path) -> Result<(), AuditLedgerError> {
+    // Windows rename durability is provided by the synchronized files; Rust
+    // 1.75 has no portable way to open a directory handle for FlushFileBuffers.
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -304,9 +1727,12 @@ pub struct JsonRpcError {
 #[derive(Debug, Serialize, Clone, PartialEq)]
 struct ToolSpec {
     name: &'static str,
+    title: String,
     description: &'static str,
     #[serde(rename = "inputSchema")]
     input_schema: Value,
+    #[serde(rename = "outputSchema")]
+    output_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotations: Option<ToolAnnotations>,
 }
@@ -321,6 +1747,10 @@ struct ToolAnnotations {
     /// entirely for every other tool so the advertised JSON stays compact.
     #[serde(rename = "destructiveHint", skip_serializing_if = "Option::is_none")]
     destructive_hint: Option<bool>,
+    #[serde(rename = "idempotentHint")]
+    idempotent_hint: bool,
+    #[serde(rename = "openWorldHint")]
+    open_world_hint: bool,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -333,6 +1763,8 @@ struct ToolCallContent {
 #[derive(Debug, Serialize, Clone, PartialEq)]
 struct ToolCallResult {
     content: Vec<ToolCallContent>,
+    #[serde(rename = "structuredContent")]
+    structured_content: Value,
     #[serde(rename = "isError")]
     is_error: bool,
 }
@@ -344,12 +1776,31 @@ struct InitializeResult {
     capabilities: Value,
     #[serde(rename = "serverInfo")]
     server_info: ServerInfo,
+    instructions: &'static str,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
 struct ServerInfo {
     name: &'static str,
     version: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolEra {
+    Legacy,
+    Modern,
+}
+
+#[derive(Debug, Clone)]
+struct ProtocolContext {
+    era: ProtocolEra,
+    agent_id: String,
+}
+
+impl ProtocolContext {
+    fn is_modern(&self) -> bool {
+        self.era == ProtocolEra::Modern
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,8 +1897,9 @@ impl ToolKind {
 /// Tools that propose a write through the FluxGit UI handshake (PLAYBOOK §10).
 /// They are not read-only and they never execute locally. With the FluxGit
 /// desktop app running (FLUXGIT_MCP_HANDSHAKE_ADDR set), each call dispatches
-/// to the app: FluxGit opens a preview, the user approves or rejects, and the
-/// sidecar reports the outcome. Without the app they return
+/// to the app: FluxGit opens a preview and the sidecar returns its stable id
+/// immediately (or a synchronous terminal result). The agent follows pending
+/// work with `operation.status`. Without the app these tools return
 /// `write_handshake_pending` (code 10003) with agent guidance.
 const WRITE_HANDSHAKE_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::OperationPreviewMerge,
@@ -527,19 +1979,18 @@ fn is_fluxgit_required(kind: ToolKind) -> bool {
 }
 
 impl McpSidecar {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, AuditLedgerError> {
         let gateway_state = if resolve_handshake_addr().is_some() {
             GatewayState::Configured
         } else {
             GatewayState::NotConfigured
         };
 
-        Self {
+        Ok(Self {
             gateway_state,
-            audit_log: mcp_audit_log_path(),
-            audit_signer: load_audit_signer_from_env(),
+            audit_ledger: AuditLedger::from_env()?,
             client_id: Default::default(),
-        }
+        })
     }
 
     pub fn new_for_tests(gateway_configured: bool) -> Self {
@@ -549,8 +2000,7 @@ impl McpSidecar {
             } else {
                 GatewayState::NotConfigured
             },
-            audit_log: None,
-            audit_signer: None,
+            audit_ledger: None,
             client_id: Default::default(),
         }
     }
@@ -562,8 +2012,9 @@ impl McpSidecar {
             } else {
                 GatewayState::NotConfigured
             },
-            audit_log: Some(audit_log),
-            audit_signer: None,
+            audit_ledger: Some(
+                AuditLedger::new(audit_log, None).expect("valid test audit ledger configuration"),
+            ),
             client_id: Default::default(),
         }
     }
@@ -581,8 +2032,10 @@ impl McpSidecar {
             } else {
                 GatewayState::NotConfigured
             },
-            audit_log: Some(audit_log),
-            audit_signer: Some(signer),
+            audit_ledger: Some(
+                AuditLedger::new(audit_log, Some(signer))
+                    .expect("valid signed test audit ledger configuration"),
+            ),
             client_id: Default::default(),
         }
     }
@@ -596,6 +2049,9 @@ impl McpSidecar {
         while let Some(frame) = read_frame(&mut input)? {
             let response = self.handle_frame(&frame);
             if let Some(response) = response {
+                // MCP stdio is newline-delimited JSON-RPC. We still accept the
+                // pre-standard Content-Length input used by older FluxGit
+                // builds, but every response is emitted on the standard wire.
                 write_frame(&mut output, &response)?;
             }
         }
@@ -653,6 +2109,11 @@ impl McpSidecar {
             });
         }
 
+        let request_id = value.get("id").cloned();
+        let has_request_id = value
+            .as_object()
+            .is_some_and(|object| object.contains_key("id"));
+
         let request: JsonRpcRequest = match serde_json::from_value(value) {
             Ok(request) => request,
             Err(err) => {
@@ -682,22 +2143,36 @@ impl McpSidecar {
             });
         }
 
+        if has_request_id && !request_id.as_ref().is_some_and(valid_request_id) {
+            return Some(JsonRpcResponse {
+                jsonrpc: "2.0",
+                id: Value::Null,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32600,
+                    message: "Invalid request".into(),
+                    data: Some(json!({
+                        "details": format!(
+                            "id must be an integer or a string no longer than {MCP_MAX_REQUEST_ID_BYTES} bytes"
+                        )
+                    })),
+                }),
+            });
+        }
+
+        // JSON-RPC notifications never receive a response. MCP request methods
+        // require an id, and intentionally are not executed when sent as a
+        // notification so a host cannot create a write proposal it cannot track.
+        if !has_request_id {
+            return None;
+        }
+
         let id = request.id.unwrap_or(Value::Null);
         let response = match request.method.as_str() {
             "initialize" => {
-                // MCP sends the agent's own name here. Capturing it is what
-                // makes per-agent policy and per-agent quotas addressable at
-                // all; before this every agent arrived as one hardcoded id.
-                if let Some(name) = request
-                    .params
-                    .get("clientInfo")
-                    .and_then(|c| c.get("name"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                {
+                if let Some(name) = client_id_from_info(request.params.get("clientInfo")) {
                     if let Ok(mut slot) = self.client_id.lock() {
-                        *slot = Some(name.to_string());
+                        *slot = Some(name);
                     }
                 }
                 JsonRpcResponse {
@@ -707,54 +2182,155 @@ impl McpSidecar {
                     error: None,
                 }
             }
-            "tools/list" => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(json!({
-                    "tools": all_advertised_tools(),
-                })),
-                error: None,
-            },
-            "tools/call" => {
-                let audit_context = McpAuditContext::from_params(&request.params);
-                match self.handle_tools_call(request.params) {
-                    Ok(result) => {
-                        self.record_tool_audit(&audit_context, &result);
-                        JsonRpcResponse {
-                            jsonrpc: "2.0",
-                            id,
-                            result: Some(json!(result)),
-                            error: None,
-                        }
-                    }
+            method => {
+                let context = match self.protocol_context(&request.params, method) {
+                    Ok(context) => context,
                     Err(error) => {
-                        self.record_tool_error_audit(&audit_context, &error);
-                        JsonRpcResponse {
+                        return Some(JsonRpcResponse {
                             jsonrpc: "2.0",
                             id,
                             result: None,
                             error: Some(error),
+                        });
+                    }
+                };
+
+                match method {
+                    "server/discover" => JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: Some(discover_result()),
+                        error: None,
+                    },
+                    "ping" => JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: Some(protocol_result(json!({}), &context, false)),
+                        error: None,
+                    },
+                    "tools/list" => {
+                        if let Err(error) = validate_tools_list_cursor(&request.params) {
+                            JsonRpcResponse {
+                                jsonrpc: "2.0",
+                                id,
+                                result: None,
+                                error: Some(error),
+                            }
+                        } else {
+                            let result = json!({ "tools": all_advertised_tools() });
+                            JsonRpcResponse {
+                                jsonrpc: "2.0",
+                                id,
+                                result: Some(protocol_result(result, &context, true)),
+                                error: None,
+                            }
                         }
                     }
+                    "tools/call" => {
+                        let audit_context =
+                            McpAuditContext::from_params(&request.params, &context.agent_id);
+                        match self.handle_tools_call(request.params, &context.agent_id) {
+                            Ok(result) => {
+                                self.record_tool_audit(&audit_context, &result);
+                                JsonRpcResponse {
+                                    jsonrpc: "2.0",
+                                    id,
+                                    result: Some(protocol_result(json!(result), &context, false)),
+                                    error: None,
+                                }
+                            }
+                            Err(error) => {
+                                self.record_tool_error_audit(&audit_context, &error);
+                                JsonRpcResponse {
+                                    jsonrpc: "2.0",
+                                    id,
+                                    result: None,
+                                    error: Some(error),
+                                }
+                            }
+                        }
+                    }
+                    _ => JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32601,
+                            message: "Method not found".into(),
+                            data: Some(json!({ "method": request.method })),
+                        }),
+                    },
                 }
             }
-            "notifications/initialized" => return None,
-            _ => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32601,
-                    message: "Method not found".into(),
-                    data: Some(json!({ "method": request.method })),
-                }),
-            },
         };
 
         Some(response)
     }
 
-    fn handle_tools_call(&self, params: Value) -> Result<ToolCallResult, JsonRpcError> {
+    fn protocol_context(
+        &self,
+        params: &Value,
+        method: &str,
+    ) -> Result<ProtocolContext, JsonRpcError> {
+        let meta = params.get("_meta").and_then(Value::as_object);
+        let version = meta.and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"));
+
+        let Some(version) = version else {
+            if method == "server/discover" {
+                return Err(invalid_params_error(
+                    "server/discover requires _meta.io.modelcontextprotocol/protocolVersion",
+                ));
+            }
+            return Ok(ProtocolContext {
+                era: ProtocolEra::Legacy,
+                agent_id: self.agent_id(),
+            });
+        };
+
+        let requested = version.as_str().ok_or_else(|| {
+            invalid_params_error("_meta.io.modelcontextprotocol/protocolVersion must be a string")
+        })?;
+        if requested != LATEST_PROTOCOL_VERSION {
+            return Err(unsupported_protocol_version_error(requested));
+        }
+
+        let capabilities =
+            meta.and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"));
+        if !capabilities.is_some_and(Value::is_object) {
+            return Err(invalid_params_error(
+                "modern requests require _meta.io.modelcontextprotocol/clientCapabilities as an object",
+            ));
+        }
+
+        let client_info = meta.and_then(|meta| meta.get("io.modelcontextprotocol/clientInfo"));
+        if let Some(client_info) = client_info {
+            let valid = client_info.as_object().is_some_and(|client_info| {
+                ["name", "version"].iter().all(|field| {
+                    client_info
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+            });
+            if !valid {
+                return Err(invalid_params_error(
+                    "_meta.io.modelcontextprotocol/clientInfo must contain non-empty name and version strings",
+                ));
+            }
+        }
+        Ok(ProtocolContext {
+            era: ProtocolEra::Modern,
+            // clientInfo is self-reported attribution, never authentication.
+            agent_id: client_id_from_info(client_info)
+                .unwrap_or_else(|| "external-mcp-sidecar".to_string()),
+        })
+    }
+
+    fn handle_tools_call(
+        &self,
+        params: Value,
+        agent_id: &str,
+    ) -> Result<ToolCallResult, JsonRpcError> {
         let object = params.as_object().ok_or_else(|| JsonRpcError {
             code: -32602,
             message: "Invalid params".into(),
@@ -781,7 +2357,15 @@ impl McpSidecar {
             })),
         })?;
 
-        let arguments = object.get("arguments").unwrap_or(&Value::Null);
+        let raw_arguments = object.get("arguments").unwrap_or(&Value::Null);
+        // Schema validation and allowed-root enforcement deliberately produce
+        // the single argument object used by every dispatcher below.  In
+        // particular, an allowed symlink/junction alias is replaced with its
+        // canonical target before the alias can be retargeted to escape the
+        // configured roots (or before a raw spelling can reappear in a gateway
+        // proposal, semantic request, fleet scan, or local Git invocation).
+        let validated_arguments = validate_and_canonicalize_tool_arguments(kind, raw_arguments)?;
+        let arguments = &validated_arguments;
 
         // operation.status / operation.cancel talk directly to the gateway
         // handshake bridge (they take only a previewId, no repoPath), so they
@@ -792,7 +2376,7 @@ impl McpSidecar {
             return operation_status_tool_call(arguments);
         }
         if kind == ToolKind::OperationCancel {
-            return operation_cancel_tool_call(&self.agent_id(), arguments);
+            return operation_cancel_tool_call(agent_id, arguments);
         }
 
         // Write-with-UI-handshake tools (PLAYBOOK §10, §14.2, §14.7):
@@ -801,41 +2385,41 @@ impl McpSidecar {
         // playbook §14.2:
         //   1. FLUXGIT_MCP_HANDSHAKE_ADDR (canonical for the handshake server)
         //   2. FLUXGIT_GATEWAY_ADDR (fallback for backward compatibility)
-        // When the env is unset, the dispatch POST fails, or polling times out we
+        // When the env is unset or the dispatch POST fails we
         // fall through to the standard `write_handshake_pending_error` (code 10003)
         // so the agent gets the existing, well-known error contract.
         if is_write_handshake(kind) {
             if let Some(addr) = resolve_handshake_addr() {
                 let dispatched = match kind {
                     ToolKind::OperationPreviewMerge => {
-                        dispatch_operation_preview_merge(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_merge(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewRebase => {
-                        dispatch_operation_preview_rebase(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_rebase(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewDiscard => {
-                        dispatch_operation_preview_discard(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_discard(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewReset => {
-                        dispatch_operation_preview_reset(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_reset(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewPatch => {
-                        dispatch_operation_preview_patch(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_patch(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewPlan => {
-                        dispatch_operation_preview_plan(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_plan(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewWorktree => {
-                        dispatch_operation_preview_worktree(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_worktree(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewCommit => {
-                        dispatch_operation_preview_commit(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_commit(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewPush => {
-                        dispatch_operation_preview_push(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_push(&addr, agent_id, arguments)
                     }
                     ToolKind::OperationPreviewBranch => {
-                        dispatch_operation_preview_branch(&addr, &self.agent_id(), arguments)
+                        dispatch_operation_preview_branch(&addr, agent_id, arguments)
                     }
                     _ => None,
                 };
@@ -844,28 +2428,19 @@ impl McpSidecar {
                 }
             }
             // Fall through to the standard write_handshake_pending error when the
-            // gateway is unset, unreachable, or polling times out.
+            // gateway is unset or unreachable.
         }
         if is_write_handshake(kind) {
             let error = write_handshake_pending_error(kind.as_str());
-            return Ok(ToolCallResult {
-                content: vec![ToolCallContent {
-                    kind: "text",
-                    text: serde_json::to_string_pretty(&json!({
+            return Ok(text_tool_result(
+                json!({
                         "error": error,
                         "tool": kind.as_str(),
                         "readOnly": false,
                         "tier": "fluxgit-write-handshake",
-                    }))
-                    .unwrap_or_else(|serialize_err| {
-                        format!(
-                            "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
-                            serialize_err
-                        )
-                    }),
-                }],
-                is_error: true,
-            });
+                }),
+                true,
+            ));
         }
 
         // Enforce the free-shell vs FluxGit-powered boundary (PLAYBOOK §2).
@@ -874,24 +2449,15 @@ impl McpSidecar {
         // produce misleading "FluxGit-powered" results and undermine the business model.
         if is_fluxgit_required(kind) && matches!(self.gateway_state, GatewayState::NotConfigured) {
             let error = gateway_not_configured_error(kind.as_str());
-            return Ok(ToolCallResult {
-                content: vec![ToolCallContent {
-                    kind: "text",
-                    text: serde_json::to_string_pretty(&json!({
+            return Ok(text_tool_result(
+                json!({
                         "error": error,
                         "tool": kind.as_str(),
                         "readOnly": true,
                         "tier": "fluxgit",
-                    }))
-                    .unwrap_or_else(|serialize_err| {
-                        format!(
-                            "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
-                            serialize_err
-                        )
-                    }),
-                }],
-                is_error: true,
-            });
+                }),
+                true,
+            ));
         }
 
         if kind == ToolKind::FleetRadar {
@@ -942,23 +2508,14 @@ impl McpSidecar {
             GatewayState::Configured => gateway_unavailable_error(kind.as_str()),
         };
 
-        Ok(ToolCallResult {
-            content: vec![ToolCallContent {
-                kind: "text",
-                text: serde_json::to_string_pretty(&json!({
+        Ok(text_tool_result(
+            json!({
                     "error": error,
                     "tool": kind.as_str(),
                     "readOnly": true,
-                }))
-                .unwrap_or_else(|serialize_err| {
-                    format!(
-                        "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
-                        serialize_err
-                    )
-                }),
-            }],
-            is_error: true,
-        })
+            }),
+            true,
+        ))
     }
 
     fn record_tool_audit(&self, context: &McpAuditContext, result: &ToolCallResult) {
@@ -978,7 +2535,6 @@ impl McpSidecar {
             format!("MCP {noun} tool {} completed.", context.tool)
         };
         self.append_audit_event(json!({
-            "id": format!("mcp-tool-{}-{}", now_ms(), context.tool.replace('.', "-")),
             "timestamp": now_ms(),
             "tool": context.tool,
             "repo_scope": context.repo_scope,
@@ -987,8 +2543,8 @@ impl McpSidecar {
             "approval": labels.approval,
             "result": result_label,
             "event_type": labels.event_type,
-            "session_id": "external-mcp-sidecar",
-            "duration_ms": 0,
+            "session_id": context.agent_id,
+            "duration_ms": context.duration_ms(),
             "summary": summary,
             "readOnly": labels.read_only,
             "sidecarReadOnly": true,
@@ -998,7 +2554,6 @@ impl McpSidecar {
     fn record_tool_error_audit(&self, context: &McpAuditContext, error: &JsonRpcError) {
         let labels = context.audit_labels();
         self.append_audit_event(json!({
-            "id": format!("mcp-block-{}-{}", now_ms(), context.tool.replace('.', "-")),
             "timestamp": now_ms(),
             "tool": context.tool,
             "repo_scope": context.repo_scope,
@@ -1007,8 +2562,8 @@ impl McpSidecar {
             "approval": "denied",
             "result": "blocked",
             "event_type": "write_block",
-            "session_id": "external-mcp-sidecar",
-            "duration_ms": 0,
+            "session_id": context.agent_id,
+            "duration_ms": context.duration_ms(),
             "summary": format!("MCP tool {} was blocked: {}", context.tool, error.message),
             "readOnly": labels.read_only,
             "sidecarReadOnly": true,
@@ -1016,47 +2571,396 @@ impl McpSidecar {
     }
 
     fn append_audit_event(&self, event: Value) {
-        let Some(path) = &self.audit_log else {
+        let Some(ledger) = &self.audit_ledger else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+        if let Err(error) = ledger.append(event) {
+            eprintln!(
+                "fluxgit-mcp-sidecar: cannot append audit log {}: {error}",
+                ledger.path().display()
+            );
         }
+    }
+}
 
-        // If a per-install signer is configured, sign the canonical form
-        // of the event and attach `signature` + `signatureKeyId`. Otherwise
-        // write the event as-is (legacy unsigned format, backward compatible).
-        let final_event = match &self.audit_signer {
-            Some(signer) => {
-                let signature = signer.sign_event(&event);
-                let mut obj = match event {
-                    Value::Object(map) => map,
-                    other => {
-                        // Audit events are always JSON objects in practice;
-                        // if something exotic slips in, write it unsigned.
-                        let _ = self.write_audit_line(path, &other);
-                        return;
-                    }
-                };
-                obj.insert("signature".to_string(), Value::String(signature));
-                obj.insert(
-                    "signatureKeyId".to_string(),
-                    Value::String(signer.key_id.clone()),
-                );
-                Value::Object(obj)
+fn reject_unsafe_audit_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata_is_reparse_point(&metadata) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "audit log must not be a symlink or reparse point",
+                ));
             }
-            None => event,
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "audit log path must be a regular file",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn secure_audit_directory(path: &Path, newly_created: bool) -> io::Result<()> {
+    validate_no_reparse_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "audit parent must be a directory",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if newly_created {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        let mode = fs::symlink_metadata(path)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("audit directory permissions {mode:03o} are not private (expected 700)"),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = newly_created;
+    Ok(())
+}
+
+fn validate_no_reparse_ancestors(path: &Path) -> io::Result<()> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if metadata_is_reparse_point(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "audit directory component {} is a symlink or reparse point",
+                    ancestor.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn configure_secure_audit_open(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself rather than following it if the path is
+        // swapped between the metadata check and CreateFileW.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn secure_audit_file(_path: &Path, file: &File) -> io::Result<()> {
+    validate_regular_unlinked_file(file, "audit log")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn validate_regular_unlinked_file(file: &File, label: &str) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("opened {label} is not a regular non-reparse file"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{label} must not be hard-linked"),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let (_, _, links) = windows_file_identity(file)?;
+        if links != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{label} must not be hard-linked"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_opened_path(path: &Path, file: &File) -> Result<(), AuditLedgerError> {
+    use std::os::unix::fs::MetadataExt;
+    reject_unsafe_audit_path(path)?;
+    let named = fs::symlink_metadata(path)?;
+    let opened = file.metadata()?;
+    if named.dev() != opened.dev() || named.ino() != opened.ino() {
+        return Err(AuditLedgerError::Configuration(
+            "audit path changed during secure open".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> io::Result<(u32, u64, u32)> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    let success =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    Ok((
+        information.dwVolumeSerialNumber,
+        index,
+        information.nNumberOfLinks,
+    ))
+}
+
+#[cfg(windows)]
+fn validate_opened_path(path: &Path, file: &File) -> Result<(), AuditLedgerError> {
+    reject_unsafe_audit_path(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_secure_audit_open(&mut options);
+    let named = options.open(path)?;
+    validate_regular_unlinked_file(&named, "audit path")?;
+    if windows_file_identity(file)? != windows_file_identity(&named)? {
+        return Err(AuditLedgerError::Configuration(
+            "audit path changed during secure open".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_opened_path(path: &Path, _file: &File) -> Result<(), AuditLedgerError> {
+    reject_unsafe_audit_path(path)?;
+    Ok(())
+}
+
+fn read_secure_signing_key(path: &Path) -> io::Result<String> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "signing key path is empty",
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    validate_no_reparse_ancestors(parent)?;
+    reject_unsafe_audit_path(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_secure_audit_open(&mut options);
+    let file = options.open(path)?;
+    validate_regular_unlinked_file(&file, "audit signing key")?;
+    validate_opened_path(path, &file)
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error.to_string()))?;
+    let metadata = file.metadata()?;
+    if metadata.len() == 0 || metadata.len() > AUDIT_MAX_SIGNING_KEY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("audit signing key must contain 1 to {AUDIT_MAX_SIGNING_KEY_BYTES} bytes"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("audit signing key permissions {mode:03o} are not private"),
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(AUDIT_MAX_SIGNING_KEY_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn valid_request_id(id: &Value) -> bool {
+    id.as_str()
+        .is_some_and(|value| value.len() <= MCP_MAX_REQUEST_ID_BYTES)
+        || id
+            .as_number()
+            .is_some_and(|number| number.is_i64() || number.is_u64())
+}
+
+/// tools/list is intentionally a single complete page. Silently accepting a
+/// continuation token would make a host believe it had resumed pagination
+/// while returning the first page again, which can duplicate tools or loop.
+fn validate_tools_list_cursor(params: &Value) -> Result<(), JsonRpcError> {
+    match params.get("cursor") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(cursor)) if cursor.is_empty() => Ok(()),
+        Some(Value::String(_)) => Err(invalid_params_error(
+            "tools/list is a single complete page and does not accept a non-empty cursor",
+        )),
+        Some(_) => Err(invalid_params_error(
+            "tools/list cursor must be a string when provided",
+        )),
+    }
+}
+
+/// Convert self-reported MCP client metadata into a bounded policy/audit label.
+/// This is attribution only: neither the sidecar nor gateway treats it as an
+/// authenticated principal.
+fn client_id_from_info(info: Option<&Value>) -> Option<String> {
+    let raw = info?.as_object()?.get("name")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut sanitized = String::with_capacity(raw.len().min(128));
+    let mut previous_dash = false;
+    for character in raw.chars() {
+        let mapped = if character.is_ascii_alphanumeric() || "._:-".contains(character) {
+            character
+        } else {
+            '-'
         };
+        if mapped == '-' && previous_dash {
+            continue;
+        }
+        if sanitized.len() + mapped.len_utf8() > 128 {
+            break;
+        }
+        sanitized.push(mapped);
+        previous_dash = mapped == '-';
+    }
+    let sanitized = sanitized.trim_matches('-').to_string();
+    (!sanitized.is_empty()).then_some(sanitized)
+}
 
-        let _ = self.write_audit_line(path, &final_event);
+fn unsupported_protocol_version_error(requested: &str) -> JsonRpcError {
+    JsonRpcError {
+        code: -32022,
+        message: "Unsupported protocol version".into(),
+        data: Some(json!({
+            "supported": SUPPORTED_PROTOCOL_VERSIONS,
+            "requested": requested,
+        })),
+    }
+}
+
+fn server_info_json() -> Value {
+    json!({
+        "name": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "description": "Safe Git intelligence and human-approved FluxGit operations for coding agents.",
+        "websiteUrl": "https://fluxgit.com/features/mcp-agent-git/",
+    })
+}
+
+fn server_capabilities_json() -> Value {
+    json!({
+        "tools": {
+            "listChanged": false,
+        }
+    })
+}
+
+fn discover_result() -> Value {
+    json!({
+        "resultType": "complete",
+        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "capabilities": server_capabilities_json(),
+        "instructions": MCP_INSTRUCTIONS,
+        "ttlMs": MCP_LIST_CACHE_TTL_MS,
+        "cacheScope": "public",
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": server_info_json(),
+        }
+    })
+}
+
+/// Add revision-specific wire members without leaking modern-only members into
+/// the 2024 handshake contract.
+fn protocol_result(mut result: Value, context: &ProtocolContext, cacheable: bool) -> Value {
+    let Some(object) = result.as_object_mut() else {
+        return result;
+    };
+
+    if !context.is_modern() {
+        object.remove("structuredContent");
+        if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+            for tool in tools {
+                if let Some(tool) = tool.as_object_mut() {
+                    tool.remove("title");
+                    tool.remove("outputSchema");
+                    tool.remove("annotations");
+                }
+            }
+        }
+        return result;
     }
 
-    fn write_audit_line(&self, path: &Path, event: &Value) -> io::Result<()> {
-        let line = serde_json::to_string(event)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file, "{line}")
+    object.insert("resultType".into(), Value::String("complete".into()));
+    if cacheable {
+        object.insert("ttlMs".into(), json!(MCP_LIST_CACHE_TTL_MS));
+        object.insert("cacheScope".into(), Value::String("public".into()));
     }
+    object.insert(
+        "_meta".into(),
+        json!({
+            "io.modelcontextprotocol/serverInfo": server_info_json(),
+        }),
+    );
+    result
 }
 
 struct McpAuditContext {
@@ -1064,6 +2968,8 @@ struct McpAuditContext {
     repo_scope: String,
     args_fingerprint: Option<String>,
     kind: Option<ToolKind>,
+    agent_id: String,
+    started_at: Instant,
 }
 
 /// Honest audit labels per tool class. Write-proposal tools must never be
@@ -1078,6 +2984,10 @@ struct AuditLabels {
 }
 
 impl McpAuditContext {
+    fn duration_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
     fn audit_labels(&self) -> AuditLabels {
         match self.kind {
             Some(ToolKind::OperationCancel) => AuditLabels {
@@ -1108,7 +3018,7 @@ impl McpAuditContext {
         }
     }
 
-    fn from_params(params: &Value) -> Self {
+    fn from_params(params: &Value, agent_id: &str) -> Self {
         let tool = params
             .get("name")
             .and_then(Value::as_str)
@@ -1148,6 +3058,8 @@ impl McpAuditContext {
             kind: ToolKind::from_name(&tool),
             tool,
             repo_scope,
+            agent_id: agent_id.to_string(),
+            started_at: Instant::now(),
         }
     }
 }
@@ -1183,20 +3095,20 @@ fn operation_risk(kind: ToolKind) -> &'static str {
 /// without leaking paths or ref names. Labeled `sha256:` so verifiers know
 /// the algorithm (the pre-hardening `fnv1a64:` label is retired — FNV-1a is
 /// not collision-resistant and must not anchor an audit trail).
-/// A stable idempotency key for one logical operation.
+/// Gateway-scoped idempotency for one explicit logical operation.
 ///
-/// The gateway has always had `find_active_by_idempotency` and an
-/// `idempotency_key` field on every request struct — tested, correct, and dead,
-/// because the sidecar never sent one. Without it a retrying agent minted a
-/// fresh previewId per attempt, producing ten separate approval cards for one
-/// intention and then a 429: the exact approval fatigue the per-agent cap exists
-/// to prevent.
-///
-/// Derived from the tool name and the arguments, so the same request retried
-/// yields the same key while a genuinely different request does not.
+/// Agents that need retry deduplication supply the optional `idempotencyKey`;
+/// the tool scope prevents the same client key from aliasing two operation
+/// types. Calls without a key are intentionally distinct, even when their
+/// arguments match: repository state can change between two otherwise
+/// identical commit/push intentions while terminal gateway records remain in
+/// the one-hour retention window.
 fn idempotency_key_for(tool: &str, arguments: &Value) -> Option<String> {
-    let fingerprint = arguments_fingerprint(arguments)?;
-    Some(format!("{tool}:{fingerprint}"))
+    let object = arguments.as_object()?;
+    match object.get("idempotencyKey").and_then(Value::as_str) {
+        Some(key) => Some(format!("{tool}:client:{key}")),
+        None => Some(format!("{tool}:call:{}", uuid::Uuid::new_v4())),
+    }
 }
 
 fn arguments_fingerprint(arguments: &Value) -> Option<String> {
@@ -1204,7 +3116,9 @@ fn arguments_fingerprint(arguments: &Value) -> Option<String> {
     if arguments.is_null() {
         return None;
     }
-    let serialized = serde_json::to_vec(arguments).ok()?;
+    // Object insertion order is not semantic JSON. Canonicalization keeps the
+    // privacy-preserving audit correlation stable across serializers.
+    let serialized = canonical_json_bytes(arguments);
     let digest = Sha256::digest(&serialized);
     let mut out = String::with_capacity(7 + 64);
     out.push_str("sha256:");
@@ -1254,16 +3168,15 @@ fn render_fleet_radar_tool_result(arguments: &Value) -> ToolCallResult {
 }
 
 fn text_tool_result(payload: Value, is_error: bool) -> ToolCallResult {
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|serialize_err| {
+        format!(
+            "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
+            serialize_err
+        )
+    });
     ToolCallResult {
-        content: vec![ToolCallContent {
-            kind: "text",
-            text: serde_json::to_string_pretty(&payload).unwrap_or_else(|serialize_err| {
-                format!(
-                    "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
-                    serialize_err
-                )
-            }),
-        }],
+        content: vec![ToolCallContent { kind: "text", text }],
+        structured_content: payload,
         is_error,
     }
 }
@@ -1338,19 +3251,15 @@ fn local_tool_payload(
 }
 
 fn repo_path_from_arguments(arguments: &Value) -> Option<PathBuf> {
-    let object = arguments.as_object()?;
-    for key in ["repoPath", "repositoryPath", "root"] {
-        if let Some(path) = object.get(key).and_then(Value::as_str) {
-            return Some(PathBuf::from(path));
-        }
-    }
-
-    let path = PathBuf::from(object.get("path")?.as_str()?);
-    if path.is_dir() {
-        Some(path)
-    } else {
-        None
-    }
+    // Every local/semantic single-repository schema requires `repoPath`.
+    // Treating a tool-specific `path` (for example a diff scope or worktree
+    // destination) as a repository fallback could bypass the canonicalized
+    // allowed-root field if a future schema changed, so no aliases are
+    // accepted here.
+    arguments
+        .get("repoPath")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
 }
 
 fn safety_timeline_payload(repo_path: &Path, arguments: &Value) -> Result<Value, JsonRpcError> {
@@ -1541,7 +3450,7 @@ fn fleet_radar_payload(arguments: &Value) -> Result<Value, JsonRpcError> {
     let entries = inputs
         .into_iter()
         .take(max_repos)
-        .map(|input| fleet_radar_entry(input))
+        .map(fleet_radar_entry)
         .collect::<Vec<_>>();
     let failed_count = entries
         .iter()
@@ -1864,6 +3773,9 @@ fn git_path_exists(repo_path: &Path, marker: &str) -> bool {
     resolved.exists()
 }
 
+// These independent signals deliberately mirror the typed Fleet Radar output;
+// grouping them would obscure the classifier's pinned decision table.
+#[allow(clippy::too_many_arguments)]
 fn fleet_attention_classification(
     dirty: bool,
     changed_files: u64,
@@ -2302,17 +4214,21 @@ fn repo_brief_payload(repo_path: &Path, arguments: &Value) -> Result<Value, Json
 
     // Aggregated recursive submodule drift. Only non-clean entries are listed,
     // capped at 10 with an explicit truncation flag.
-    let submodules = run_git_optional(repo_path, &["submodule", "status", "--recursive"])
-        .map(|output| {
+    let submodules = submodule_status_entries(repo_path)
+        .ok()
+        .map(|entries| {
             let mut total = 0u64;
             let mut clean_count = 0u64;
             let mut uninitialized = 0u64;
             let mut drifted = 0u64;
             let mut conflicts = 0u64;
             let mut attention = Vec::new();
-            for line in output.lines().filter(|line| !line.trim().is_empty()) {
+            for entry in entries {
                 total += 1;
-                let state = line.chars().next().unwrap_or(' ');
+                let state = entry["state"]
+                    .as_str()
+                    .and_then(|state| state.chars().next())
+                    .unwrap_or(' ');
                 match state {
                     '-' => uninitialized += 1,
                     '+' => drifted += 1,
@@ -2320,7 +4236,7 @@ fn repo_brief_payload(repo_path: &Path, arguments: &Value) -> Result<Value, Json
                     _ => clean_count += 1,
                 }
                 if state != ' ' && attention.len() < 10 {
-                    attention.push(parse_submodule_line(line));
+                    attention.push(entry);
                 }
             }
             let needs_attention = (uninitialized + drifted + conflicts) as usize;
@@ -2501,7 +4417,11 @@ fn repo_refs_payload(repo_path: &Path) -> Result<Value, JsonRpcError> {
         "head": run_git(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim(),
         "branches": lines_json(run_git(repo_path, &["branch", "-a", "--format=%(refname:short)"])?),
         "tags": lines_json(run_git(repo_path, &["tag", "--list"])?),
-        "remotes": lines_json(run_git(repo_path, &["remote", "-v"])?),
+        // Return remote *names*, never configured URLs. `git remote -v`
+        // echoes HTTPS userinfo, sensitive query parameters, and fragments;
+        // those credentials would otherwise be duplicated into both MCP text
+        // and structuredContent. Agents can resolve refs without endpoints.
+        "remotes": lines_json(run_git(repo_path, &["remote"])?),
         "stashes": lines_json(run_git(repo_path, &["stash", "list"])?),
     }))
 }
@@ -2554,7 +4474,7 @@ fn repo_branch_stack_payload(repo_path: &Path, arguments: &Value) -> Result<Valu
     let base_commit = base_ref
         .as_deref()
         .and_then(|base| run_git_optional(repo_path, &["rev-parse", base]));
-    let base_distance = base_ref.as_deref().and_then(|base| {
+    let base_distance = base_ref.as_deref().map(|base| {
         let ahead_from_base = run_git_optional(
             repo_path,
             &["rev-list", "--count", &format!("{base}..HEAD")],
@@ -2567,10 +4487,10 @@ fn repo_branch_stack_payload(repo_path: &Path, arguments: &Value) -> Result<Valu
         )
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
-        Some(json!({
+        json!({
             "aheadFromBase": ahead_from_base,
             "behindBase": behind_base,
-        }))
+        })
     });
     let related = discover_related_branch_stack_refs(
         repo_path,
@@ -2938,19 +4858,20 @@ fn conflict_side_value(repo_path: &Path, sha: Option<&str>, max_bytes: usize) ->
     let Some(sha) = sha else {
         return Value::Null;
     };
-    let Ok(bytes) = run_git_bytes(repo_path, &["cat-file", "blob", sha]) else {
+    let capture_bytes = max_bytes.max(8_000);
+    let Ok(output) = run_git_bounded(repo_path, &["cat-file", "blob", sha], capture_bytes) else {
         return json!({ "sha": sha, "error": "blob unreadable" });
     };
-    let size = bytes.len();
-    if bytes[..size.min(8000)].contains(&0) {
+    let size = output.total_bytes;
+    if output.prefix[..output.prefix.len().min(8_000)].contains(&0) {
         return json!({ "sha": sha, "binary": true, "size": size });
     }
-    let truncated = size > max_bytes;
+    let truncated = size > max_bytes as u64;
     json!({
         "sha": sha,
         "size": size,
         "truncated": truncated,
-        "content": String::from_utf8_lossy(&bytes[..size.min(max_bytes)]),
+        "content": String::from_utf8_lossy(&output.prefix[..output.prefix.len().min(max_bytes)]),
     })
 }
 
@@ -2958,9 +4879,25 @@ fn conflict_side_value(repo_path: &Path, sha: Option<&str>, max_bytes: usize) ->
 /// the agent can map hunks to line ranges. Returns an empty array when the file
 /// is missing, binary, or carries no markers (e.g. rm/rm conflicts).
 fn conflict_marker_regions_for_file(file_path: &Path) -> Vec<Value> {
-    let Ok(bytes) = fs::read(file_path) else {
+    const MAX_MARKER_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+    let Ok(metadata) = fs::symlink_metadata(file_path) else {
         return Vec::new();
     };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Vec::new();
+    }
+    let Ok(file) = File::open(file_path) else {
+        return Vec::new();
+    };
+    let mut bytes =
+        Vec::with_capacity(metadata.len().min(MAX_MARKER_SCAN_BYTES).min(65_536) as usize);
+    if file
+        .take(MAX_MARKER_SCAN_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Vec::new();
+    }
     if bytes[..bytes.len().min(8000)].contains(&0) {
         return Vec::new();
     }
@@ -3201,10 +5138,141 @@ fn worktree_list_payload(repo_path: &Path) -> Result<Value, JsonRpcError> {
 }
 
 fn submodule_status_payload(repo_path: &Path) -> Result<Value, JsonRpcError> {
-    let output = run_git(repo_path, &["submodule", "status", "--recursive"])?;
     Ok(json!({
-        "submodules": output.lines().map(parse_submodule_line).collect::<Vec<_>>(),
+        "submodules": submodule_status_entries(repo_path)?,
     }))
+}
+
+const SUBMODULE_STATUS_MAX_ENTRIES: usize = 1_000;
+const SUBMODULE_STATUS_MAX_DEPTH: usize = 16;
+
+#[derive(Clone)]
+struct IndexedGitlink {
+    commit: String,
+    conflicted: bool,
+}
+
+/// Read submodule pins through Git's built-in index plumbing instead of the
+/// `git submodule` shell script. This avoids executing inherited shell/helper
+/// machinery and lets the sidecar enforce recursion and entry ceilings.
+fn submodule_status_entries(repo_path: &Path) -> Result<Vec<Value>, JsonRpcError> {
+    let canonical_root = repo_path
+        .canonicalize()
+        .map_err(|error| local_git_error(&["ls-files", "--stage"], error.to_string()))?;
+    let mut entries = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    collect_submodule_status_entries(
+        &canonical_root,
+        &canonical_root,
+        "",
+        0,
+        &mut visited,
+        &mut entries,
+    )?;
+    Ok(entries)
+}
+
+fn collect_submodule_status_entries(
+    root: &Path,
+    repo_path: &Path,
+    prefix: &str,
+    depth: usize,
+    visited: &mut std::collections::HashSet<PathBuf>,
+    entries: &mut Vec<Value>,
+) -> Result<(), JsonRpcError> {
+    if depth > SUBMODULE_STATUS_MAX_DEPTH {
+        return Err(local_git_error(
+            &["ls-files", "--stage"],
+            format!(
+                "submodule nesting exceeds the {SUBMODULE_STATUS_MAX_DEPTH}-level safety limit"
+            ),
+        ));
+    }
+    let canonical_repo = repo_path
+        .canonicalize()
+        .map_err(|error| local_git_error(&["ls-files", "--stage"], error.to_string()))?;
+    if !canonical_repo.starts_with(root) || !visited.insert(canonical_repo.clone()) {
+        return Ok(());
+    }
+
+    let output = run_git(&canonical_repo, &["ls-files", "--stage", "-z"])?;
+    let mut gitlinks = std::collections::BTreeMap::<String, IndexedGitlink>::new();
+    for record in output.split('\0').filter(|record| !record.is_empty()) {
+        let Some((metadata, path)) = record.split_once('\t') else {
+            continue;
+        };
+        let mut fields = metadata.split_whitespace();
+        let mode = fields.next().unwrap_or_default();
+        let commit = fields.next().unwrap_or_default();
+        let stage = fields.next().unwrap_or_default();
+        if mode != "160000" || commit.is_empty() || path.is_empty() {
+            continue;
+        }
+        let candidate = gitlinks
+            .entry(path.to_string())
+            .or_insert_with(|| IndexedGitlink {
+                commit: commit.to_string(),
+                conflicted: stage != "0",
+            });
+        candidate.conflicted |= stage != "0";
+        if stage == "2" || candidate.commit.is_empty() {
+            candidate.commit = commit.to_string();
+        }
+    }
+
+    for (path, gitlink) in gitlinks {
+        if entries.len() >= SUBMODULE_STATUS_MAX_ENTRIES {
+            return Err(local_git_error(
+                &["ls-files", "--stage"],
+                format!(
+                    "submodule count exceeds the {SUBMODULE_STATUS_MAX_ENTRIES}-entry safety limit"
+                ),
+            ));
+        }
+        let display_path = if prefix.is_empty() {
+            path.clone()
+        } else {
+            format!("{prefix}/{path}")
+        };
+        let candidate_path = canonical_repo.join(&path);
+        let canonical_candidate = candidate_path
+            .canonicalize()
+            .ok()
+            .filter(|candidate| candidate.starts_with(root));
+        let current_commit = canonical_candidate
+            .as_deref()
+            .and_then(|candidate| run_git_optional(candidate, &["rev-parse", "HEAD"]));
+        let state = if gitlink.conflicted {
+            "U"
+        } else if current_commit.is_none() {
+            "-"
+        } else if current_commit.as_deref() != Some(gitlink.commit.as_str()) {
+            "+"
+        } else {
+            " "
+        };
+        entries.push(json!({
+            "state": state,
+            "commit": gitlink.commit,
+            "path": display_path,
+            "description": "",
+        }));
+
+        if current_commit.is_some() {
+            let Some(candidate) = canonical_candidate else {
+                continue;
+            };
+            collect_submodule_status_entries(
+                root,
+                &candidate,
+                &display_path,
+                depth + 1,
+                visited,
+                entries,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Default byte cap for `diff.text` output (64 KiB). A repo-wide diff can be
@@ -3229,7 +5297,9 @@ fn diff_text_payload(repo_path: &Path, arguments: &Value) -> Result<Value, JsonR
         .and_then(Value::as_u64)
         .map(|value| value.max(1) as usize);
 
-    let mut args = vec!["diff"];
+    // Never execute repository-configured external diff/textconv commands from
+    // a read-only MCP inspection.
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv"];
     if let Some(base) = checked_rev_opt(base, "base")? {
         args.push(base);
     }
@@ -3241,10 +5311,10 @@ fn diff_text_payload(repo_path: &Path, arguments: &Value) -> Result<Value, JsonR
         args.push(path);
     }
 
-    let full = run_git(repo_path, &args)?;
-    let total_bytes = full.len();
-    let total_lines = full.lines().count();
-    let (diff, truncated) = truncate_diff_text(&full, max_bytes, max_lines);
+    let streamed = run_git_bounded(repo_path, &args, max_bytes.saturating_add(4))?;
+    let prefix = String::from_utf8_lossy(&streamed.prefix);
+    let (diff, prefix_truncated) = truncate_diff_text(&prefix, max_bytes, max_lines);
+    let truncated = prefix_truncated || streamed.total_bytes > streamed.prefix.len() as u64;
 
     Ok(json!({
         "format": "text",
@@ -3253,8 +5323,8 @@ fn diff_text_payload(repo_path: &Path, arguments: &Value) -> Result<Value, JsonR
         "path": path_filter,
         "diff": diff,
         "truncated": truncated,
-        "totalBytes": total_bytes,
-        "totalLines": total_lines,
+        "totalBytes": streamed.total_bytes,
+        "totalLines": streamed.total_lines,
         "maxBytes": max_bytes,
     }))
 }
@@ -3307,17 +5377,35 @@ fn truncate_diff_text(full: &str, max_bytes: usize, max_lines: Option<usize>) ->
 }
 
 fn semantic_fallback_payload(repo_path: &Path, arguments: &Value) -> Value {
+    let base = arguments.get("base").and_then(Value::as_str);
+    let head = arguments.get("head").and_then(Value::as_str);
+    let path = diff_path_filter(arguments, repo_path).map(Value::String);
     json!({
         "supported": false,
         "fallback": "diff.text",
         "reason": "Semantic diff is not available in local sidecar fallback mode.",
-        "textDiffArguments": {
-            "repoPath": repo_path,
-            "base": arguments.get("base").and_then(Value::as_str),
-            "head": arguments.get("head").and_then(Value::as_str),
-            "path": diff_path_filter(arguments, repo_path),
-        },
+        "textDiffArguments": diff_text_arguments(repo_path, base, head, path),
     })
+}
+
+fn diff_text_arguments(
+    repo_path: &Path,
+    base: Option<&str>,
+    head: Option<&str>,
+    path: Option<Value>,
+) -> Value {
+    let mut arguments = Map::new();
+    arguments.insert("repoPath".into(), json!(repo_path));
+    if let Some(base) = base {
+        arguments.insert("base".into(), json!(base));
+    }
+    if let Some(head) = head {
+        arguments.insert("head".into(), json!(head));
+    }
+    if let Some(path) = path.filter(|path| !path.is_null()) {
+        arguments.insert("path".into(), path);
+    }
+    Value::Object(arguments)
 }
 
 fn semantic_fallbacks_payload(repo_path: &Path, arguments: &Value) -> Value {
@@ -3343,7 +5431,7 @@ const SEMANTIC_DIFF_MAX_FILES: usize = 25;
 /// - base + head        → base..head (tree to tree)
 /// - base only          → base vs working tree
 /// - head only          → head vs working tree (git treats the single
-///                        positional rev as the OLD side)
+///   positional rev as the OLD side)
 /// - neither            → index vs working tree
 fn semantic_engine_refs(base: Option<&str>, head: Option<&str>) -> (String, String) {
     match (base, head) {
@@ -3419,7 +5507,7 @@ fn fetch_semantic_diff_from_gateway(
     if !response.status().is_success() {
         return None;
     }
-    response.json::<Value>().ok()
+    response_json_limited(response).ok()
 }
 
 /// Build the enriched `data` payload for diff.semantic /
@@ -3472,12 +5560,7 @@ fn semantic_gateway_tool_payload(
                             let file_path = object.get("path").cloned().unwrap_or(Value::Null);
                             object.insert(
                                 "textDiffArguments".into(),
-                                json!({
-                                    "repoPath": repo_path,
-                                    "base": base,
-                                    "head": head,
-                                    "path": file_path,
-                                }),
+                                diff_text_arguments(repo_path, base, head, Some(file_path)),
                             );
                         }
                     }
@@ -3684,38 +5767,49 @@ fn fluxgit_run_dir() -> Option<PathBuf> {
     }
 }
 
-fn mcp_audit_log_path() -> Option<PathBuf> {
+pub fn audit_log_path_for_run_dir(run_dir: &Path) -> PathBuf {
+    run_dir.join("audit").join("mcp.jsonl")
+}
+
+fn mcp_audit_log_path_checked() -> Result<Option<PathBuf>, AuditLedgerError> {
     if env::var_os("FLUXGIT_MCP_AUDIT_DISABLED").is_some() {
-        return None;
+        return Ok(None);
     }
-    if let Ok(custom) = env::var("FLUXGIT_MCP_AUDIT_LOG") {
-        return Some(PathBuf::from(custom));
+    if let Some(custom) = env::var_os("FLUXGIT_MCP_AUDIT_LOG") {
+        if custom.is_empty() {
+            return Err(AuditLedgerError::Configuration(
+                "FLUXGIT_MCP_AUDIT_LOG is explicitly set but empty".into(),
+            ));
+        }
+        return Ok(Some(PathBuf::from(custom)));
     }
-    Some(fluxgit_run_dir()?.join("audit").join("mcp.jsonl"))
+    let run_dir = fluxgit_run_dir().ok_or_else(|| {
+        AuditLedgerError::Configuration(
+            "cannot resolve the FluxGit run directory for the default audit log".into(),
+        )
+    })?;
+    Ok(Some(audit_log_path_for_run_dir(&run_dir)))
 }
 
 /// Load the per-install audit signer from `FLUXGIT_MCP_AUDIT_SIGN_KEY`, if set.
 ///
-/// Signing is opt-in: when the env var is unset, returns `None` and the audit
-/// log is written in the legacy unsigned format. If the env var points to a
-/// path that cannot be read or does not contain a valid PEM PKCS8 Ed25519
-/// private key, we log a single warning to stderr and return `None` rather
-/// than aborting — the audit log MUST keep recording events even if signing
-/// is misconfigured.
-fn load_audit_signer_from_env() -> Option<AuditSigner> {
-    let path = env::var_os("FLUXGIT_MCP_AUDIT_SIGN_KEY")?;
-    let path = PathBuf::from(path);
-    match AuditSigner::from_pem_file(&path) {
-        Ok(signer) => Some(signer),
-        Err(err) => {
-            eprintln!(
-                "fluxgit-mcp-sidecar: audit signing disabled for this session ({}): {}",
-                path.display(),
-                err
-            );
-            None
-        }
+/// Signing is opt-in: when the env var is unset, new chained entries remain
+/// unsigned for compatibility. Once the variable is explicitly configured,
+/// an empty, missing, unsafe, oversized, or invalid key is a startup error;
+/// it must never silently downgrade the shared ledger to unsigned entries.
+fn load_audit_signer_from_env() -> Result<Option<AuditSigner>, AuditLedgerError> {
+    let Some(path) = env::var_os("FLUXGIT_MCP_AUDIT_SIGN_KEY") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Err(AuditLedgerError::Configuration(
+            "FLUXGIT_MCP_AUDIT_SIGN_KEY is explicitly set but empty".into(),
+        ));
     }
+    let path = PathBuf::from(path);
+    AuditSigner::from_pem_file(&path)
+        .map(Some)
+        .map_err(|error| AuditLedgerError::Configuration(error.to_string()))
 }
 
 fn now_ms() -> u64 {
@@ -3834,54 +5928,841 @@ fn diff_path_filter(arguments: &Value, repo_path: &Path) -> Option<String> {
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, JsonRpcError> {
-    let output = Command::new("git")
-        // The one place "read everything and change nothing" was literally
-        // false: `git status` and `git diff` opportunistically refresh the stat
-        // cache, which rewrites .git/index and takes index.lock. Measured — the
-        // index sha256 changed after repo.status. Harmless to content, but it
-        // is a write inside .git and the lock can collide with a human
-        // operation in progress while an agent polls.
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(repo_path)
-        .args(args)
-        .output()
-        .map_err(|err| local_git_error(args, err.to_string()))?;
+    let output = execute_git(
+        repo_path,
+        args,
+        GIT_COMPLETE_STDOUT_MAX_BYTES,
+        GIT_COMPLETE_STDOUT_MAX_BYTES,
+        GIT_COMMAND_TIMEOUT,
+    )?;
+    // The one place "read everything and change nothing" was literally
+    // false: `git status` and `git diff` opportunistically refresh the stat
+    // cache, which rewrites .git/index and takes index.lock. Measured — the
+    // index sha256 changed after repo.status. Harmless to content, but it
+    // is a write inside .git and the lock can collide with a human
+    // operation in progress while an agent polls.
 
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&output.stdout.prefix).into_owned())
     } else {
         Err(local_git_error(
             args,
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            String::from_utf8_lossy(&output.stderr.prefix)
+                .trim()
+                .to_string(),
         ))
     }
 }
 
-/// Raw-byte variant of `run_git` for blob content (`cat-file blob`), where
-/// lossy UTF-8 conversion before binary detection would corrupt the signal.
-fn run_git_bytes(repo_path: &Path, args: &[&str]) -> Result<Vec<u8>, JsonRpcError> {
-    let output = Command::new("git")
-        // The one place "read everything and change nothing" was literally
-        // false: `git status` and `git diff` opportunistically refresh the stat
-        // cache, which rewrites .git/index and takes index.lock. Measured — the
-        // index sha256 changed after repo.status. Harmless to content, but it
-        // is a write inside .git and the lock can collide with a human
-        // operation in progress while an agent polls.
+struct BoundedGitOutput {
+    prefix: Vec<u8>,
+    total_bytes: u64,
+    total_lines: u64,
+}
+
+/// Stream stdout instead of using `Command::output`, retaining only a bounded
+/// prefix while still reporting exact byte/line totals. This prevents a large
+/// blob or repository-wide diff from allocating its full output in the MCP
+/// process before the response cap is applied.
+fn run_git_bounded(
+    repo_path: &Path,
+    args: &[&str],
+    capture_bytes: usize,
+) -> Result<BoundedGitOutput, JsonRpcError> {
+    if capture_bytes > GIT_BOUNDED_SCAN_MAX_BYTES {
+        return Err(local_git_error(
+            args,
+            format!(
+                "requested Git capture is {capture_bytes} bytes; safety maximum is {GIT_BOUNDED_SCAN_MAX_BYTES} bytes"
+            ),
+        ));
+    }
+    let output = execute_git(
+        repo_path,
+        args,
+        capture_bytes,
+        GIT_BOUNDED_SCAN_MAX_BYTES,
+        GIT_COMMAND_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        return Err(local_git_error(
+            args,
+            String::from_utf8_lossy(&output.stderr.prefix)
+                .trim()
+                .to_string(),
+        ));
+    }
+    Ok(BoundedGitOutput {
+        prefix: output.stdout.prefix,
+        total_bytes: output.stdout.total_bytes,
+        total_lines: output.stdout.total_lines,
+    })
+}
+
+struct GitStreamOutput {
+    prefix: Vec<u8>,
+    total_bytes: u64,
+    total_lines: u64,
+}
+
+struct GitProcessOutput {
+    status: std::process::ExitStatus,
+    stdout: GitStreamOutput,
+    stderr: GitStreamOutput,
+}
+
+static RESOLVED_GIT_EXECUTABLE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+fn resolved_git_executable(repo_path: &Path) -> Result<&'static Path, String> {
+    match RESOLVED_GIT_EXECUTABLE.get_or_init(|| resolve_git_executable(repo_path)) {
+        Ok(path) => Ok(path.as_path()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn resolve_git_executable(repo_path: &Path) -> Result<PathBuf, String> {
+    let current_dir = env::current_dir().map_err(|error| error.to_string())?;
+    if let Some(explicit) = env::var_os("FLUXGIT_MCP_GIT_PATH") {
+        if explicit.is_empty() {
+            return Err("FLUXGIT_MCP_GIT_PATH is explicitly set but empty".into());
+        }
+        return validate_git_executable_candidate(
+            PathBuf::from(explicit),
+            repo_path,
+            &current_dir,
+            true,
+        )
+        .ok_or_else(|| {
+            "FLUXGIT_MCP_GIT_PATH must be an absolute, existing, regular, non-reparse executable outside the repository/current directory"
+                .to_string()
+        });
+    }
+
+    let mut candidates = Vec::<(PathBuf, bool)>::new();
+    #[cfg(windows)]
+    {
+        for root in [
+            env::var_os("ProgramFiles"),
+            env::var_os("ProgramFiles(x86)"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let root = PathBuf::from(root);
+            candidates.push((root.join("Git/cmd/git.exe"), true));
+            candidates.push((root.join("Git/bin/git.exe"), true));
+        }
+    }
+    #[cfg(unix)]
+    {
+        for path in [
+            "/usr/bin/git",
+            "/usr/local/bin/git",
+            "/opt/homebrew/bin/git",
+            "/opt/local/bin/git",
+        ] {
+            candidates.push((PathBuf::from(path), true));
+        }
+    }
+
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path).filter(|entry| entry.is_absolute()) {
+            #[cfg(windows)]
+            let candidate = directory.join("git.exe");
+            #[cfg(not(windows))]
+            let candidate = directory.join("git");
+            candidates.push((candidate, false));
+        }
+    }
+    for (candidate, trusted_location) in candidates {
+        if let Some(validated) =
+            validate_git_executable_candidate(candidate, repo_path, &current_dir, trusted_location)
+        {
+            return Ok(validated);
+        }
+    }
+    Err(
+        "no safe absolute Git executable was found in trusted locations or absolute PATH entries"
+            .into(),
+    )
+}
+
+fn validate_git_executable_candidate(
+    candidate: PathBuf,
+    repo_path: &Path,
+    current_dir: &Path,
+    explicitly_trusted_location: bool,
+) -> Option<PathBuf> {
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        if !explicitly_trusted_location {
+            let parent = candidate.parent()?;
+            let parent_mode = fs::symlink_metadata(parent).ok()?.permissions().mode();
+            if parent_mode & 0o022 != 0 {
+                return None;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = explicitly_trusted_location;
+    let candidate = fs::canonicalize(&candidate).ok()?;
+    let canonical_repo = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let canonical_current =
+        fs::canonicalize(current_dir).unwrap_or_else(|_| current_dir.to_path_buf());
+    if candidate.starts_with(&canonical_repo) || candidate.starts_with(&canonical_current) {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Construct every production Git process through one fail-closed boundary.
+/// Inherited `GIT_*` state must not be able to redirect the repository,
+/// worktree, index, object database, config, helpers, prompts, pager or diff
+/// implementation away from the explicit `-C <repoPath>` target.
+fn hardened_git_command(repo_path: &Path, args: &[&str]) -> Result<Command, String> {
+    let mut command = Command::new(resolved_git_executable(repo_path)?);
+    remove_untrusted_git_environment(&mut command, env::vars_os());
+
+    let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    command
+        .arg("--no-pager")
         .arg("--no-optional-locks")
+        .arg("--no-replace-objects")
+        .arg("--literal-pathspecs")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("core.untrackedCache=false")
+        .arg("-c")
+        .arg("diff.external=")
+        .arg("-c")
+        .arg("core.pager=")
+        .arg("-c")
+        .arg("color.ui=false")
         .arg("-C")
         .arg(repo_path)
         .args(args)
-        .output()
-        .map_err(|err| local_git_error(args, err.to_string()))?;
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_config)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_PAGER", "")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    Ok(command)
+}
 
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(local_git_error(
+fn remove_untrusted_git_environment(
+    command: &mut Command,
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) {
+    for (key, _) in inherited {
+        let normalized = key.to_string_lossy().to_ascii_uppercase();
+        if normalized.starts_with("GIT_")
+            || normalized.starts_with("GCM_")
+            || normalized.starts_with("DYLD_")
+            || matches!(
+                normalized.as_str(),
+                "SSH_ASKPASS"
+                    | "SSH_ASKPASS_REQUIRE"
+                    | "PAGER"
+                    | "LESS"
+                    | "LV"
+                    | "LD_PRELOAD"
+                    | "LD_LIBRARY_PATH"
+            )
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
+struct GitProcessTree {
+    #[cfg(unix)]
+    process_group: i32,
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(windows)]
+    root_process_id: u32,
+}
+
+impl GitProcessTree {
+    fn attach(child: &std::process::Child) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            return Ok(Self {
+                process_group: child.id() as i32,
+            });
+        }
+        #[cfg(windows)]
+        {
+            use std::mem::{size_of, zeroed};
+            use std::os::windows::io::AsRawHandle;
+            use std::ptr;
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            };
+            let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+            if job.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as *const _,
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if configured == 0 {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    CloseHandle(job);
+                }
+                return Err(error);
+            }
+            let process = child.as_raw_handle() as HANDLE;
+            if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    CloseHandle(job);
+                }
+                return Err(error);
+            }
+            if let Err(error) = resume_suspended_windows_process(child.id()) {
+                unsafe {
+                    windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
+                    CloseHandle(job);
+                }
+                return Err(error);
+            }
+            Ok(Self {
+                job,
+                root_process_id: child.id(),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    fn terminate_descendants(&self) {
+        #[cfg(unix)]
+        unsafe {
+            // The command was spawned as leader of a fresh process group, so
+            // this kills Git plus helpers/descendants that inherited its pipes.
+            let _ = libc::killpg(self.process_group, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        unsafe {
+            let _ = windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
+            terminate_windows_descendants(self.root_process_id);
+        }
+    }
+
+    fn terminate(&self, child: &mut std::process::Child) {
+        self.terminate_descendants();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(windows)]
+unsafe fn terminate_windows_descendants(root_process_id: u32) {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut entry = PROCESSENTRY32 {
+        dwSize: size_of::<PROCESSENTRY32>() as u32,
+        ..PROCESSENTRY32::default()
+    };
+    let mut processes = Vec::new();
+    let mut found = Process32First(snapshot, &mut entry) != 0;
+    while found && processes.len() < 65_536 {
+        processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        found = Process32Next(snapshot, &mut entry) != 0;
+    }
+    CloseHandle(snapshot);
+
+    let mut descendants = vec![root_process_id];
+    loop {
+        let before = descendants.len();
+        for (process_id, parent_id) in &processes {
+            if descendants.contains(parent_id) && !descendants.contains(process_id) {
+                descendants.push(*process_id);
+            }
+        }
+        if descendants.len() == before {
+            break;
+        }
+    }
+    // Deepest descendants were discovered last. Kill in reverse order so a
+    // helper cannot create another child after its parent has been removed.
+    for process_id in descendants.into_iter().skip(1).rev() {
+        let process = OpenProcess(PROCESS_TERMINATE, 0, process_id);
+        if !process.is_null() {
+            let _ = TerminateProcess(process, 1);
+            CloseHandle(process);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn resume_suspended_windows_process(process_id: u32) -> io::Result<()> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..THREADENTRY32::default()
+    };
+    let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while found {
+        if entry.th32OwnerProcessID == process_id {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                let error = io::Error::last_os_error();
+                unsafe { CloseHandle(snapshot) };
+                return Err(error);
+            }
+            let previous_count = unsafe { ResumeThread(thread) };
+            let resume_error = (previous_count == u32::MAX).then(io::Error::last_os_error);
+            unsafe {
+                CloseHandle(thread);
+                CloseHandle(snapshot);
+            }
+            return match resume_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
+        }
+        found = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "cannot find the primary thread of suspended Git process",
+    ))
+}
+
+#[cfg(windows)]
+impl Drop for GitProcessTree {
+    fn drop(&mut self) {
+        self.terminate_descendants();
+        unsafe {
+            // KILL_ON_JOB_CLOSE guarantees no helper survives a successful or
+            // failing invocation, including descendants that closed stdout.
+            windows_sys::Win32::Foundation::CloseHandle(self.job);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GitProcessTree {
+    fn drop(&mut self) {
+        // The group is unique to this invocation. Kill it even after Git
+        // exited cleanly: a helper may have closed both captured pipes and
+        // otherwise survive unnoticed in the background.
+        self.terminate_descendants();
+    }
+}
+
+#[cfg(unix)]
+fn configure_git_pipe_nonblocking<T: std::os::unix::io::AsRawFd>(pipe: &T) -> io::Result<()> {
+    let descriptor = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn configure_git_pipe_nonblocking<T: std::os::windows::io::AsRawHandle>(
+    _pipe: &T,
+) -> io::Result<()> {
+    // Anonymous-pipe read handles do not necessarily have the write-attribute
+    // right required by SetNamedPipeHandleState. The Windows reader below
+    // uses PeekNamedPipe and calls Read only when bytes are available.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_git_pipe_nonblocking<T>(_pipe: &T) -> io::Result<()> {
+    Ok(())
+}
+
+fn execute_git(
+    repo_path: &Path,
+    args: &[&str],
+    stdout_capture_bytes: usize,
+    stdout_max_bytes: usize,
+    timeout: Duration,
+) -> Result<GitProcessOutput, JsonRpcError> {
+    let command =
+        hardened_git_command(repo_path, args).map_err(|error| local_git_error(args, error))?;
+    execute_git_command(
+        command,
+        args,
+        stdout_capture_bytes,
+        stdout_max_bytes,
+        timeout,
+    )
+}
+
+fn execute_git_command(
+    mut command: Command,
+    args: &[&str],
+    stdout_capture_bytes: usize,
+    stdout_max_bytes: usize,
+    timeout: Duration,
+) -> Result<GitProcessOutput, JsonRpcError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+        // Close the spawn/AssignProcessToJobObject race: Git cannot create a
+        // helper until the process is inside its kill-on-close job.
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| local_git_error(args, error.to_string()))?;
+
+    let process_tree = match GitProcessTree::attach(&child) {
+        Ok(tree) => tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(local_git_error(
+                args,
+                format!("cannot establish isolated Git process tree: {error}"),
+            ));
+        }
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            process_tree.terminate(&mut child);
+            return Err(local_git_error(
+                args,
+                "failed to capture git stdout".to_string(),
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            process_tree.terminate(&mut child);
+            return Err(local_git_error(
+                args,
+                "failed to capture git stderr".to_string(),
+            ));
+        }
+    };
+    if let Err(error) = configure_git_pipe_nonblocking(&stdout)
+        .and_then(|_| configure_git_pipe_nonblocking(&stderr))
+    {
+        process_tree.terminate(&mut child);
+        return Err(local_git_error(
             args,
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ))
+            format!("cannot make Git output pipes cancellation-safe: {error}"),
+        ));
+    }
+    let stop_reason = Arc::new(AtomicU8::new(0));
+    let stdout_stop = Arc::clone(&stop_reason);
+    let stderr_stop = Arc::clone(&stop_reason);
+    let stdout_reader = std::thread::spawn(move || {
+        read_git_stream(
+            stdout,
+            stdout_capture_bytes,
+            stdout_max_bytes,
+            1,
+            stdout_stop,
+        )
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        read_git_stream(
+            stderr,
+            GIT_STDERR_CAPTURE_BYTES,
+            GIT_STDERR_MAX_BYTES,
+            2,
+            stderr_stop,
+        )
+    });
+
+    let started = Instant::now();
+    let mut status = None;
+    loop {
+        let reason = stop_reason.load(Ordering::Acquire);
+        if reason != 0 {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            stop_reason.store(3, Ordering::Release);
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(exit_status)) => {
+                status = Some(exit_status);
+                break;
+            }
+            Ok(None) => std::thread::sleep(GIT_COMMAND_POLL_INTERVAL),
+            Err(_error) => {
+                stop_reason.store(4, Ordering::Release);
+                break;
+            }
+        }
+    }
+
+    if status.is_none() {
+        process_tree.terminate(&mut child);
+    }
+
+    if status.is_some() {
+        // A hostile helper can outlive the direct child while retaining an
+        // inherited pipe. Readers are nonblocking, so the main thread can stop
+        // them, terminate the complete tree, and always join them.
+        let stream_deadline = Instant::now() + GIT_STREAM_CLOSE_TIMEOUT;
+        while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+            if stop_reason.load(Ordering::Acquire) != 0 {
+                process_tree.terminate(&mut child);
+                break;
+            }
+            if Instant::now() >= stream_deadline {
+                stop_reason.store(5, Ordering::Release);
+                process_tree.terminate(&mut child);
+                break;
+            }
+            std::thread::sleep(GIT_COMMAND_POLL_INTERVAL);
+        }
+    }
+
+    // Nonblocking readers observe stop_reason within one poll and therefore
+    // cannot be left detached on any timeout/output-cap/error path.
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| local_git_error(args, "git stdout reader panicked".to_string()))?
+        .map_err(|error| local_git_error(args, format!("cannot read git stdout: {error}")))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| local_git_error(args, "git stderr reader panicked".to_string()))?
+        .map_err(|error| local_git_error(args, format!("cannot read git stderr: {error}")))?;
+
+    let final_reason = stop_reason.load(Ordering::Acquire);
+    if final_reason != 0 {
+        return Err(git_stop_error(
+            args,
+            final_reason,
+            stdout_max_bytes,
+            timeout,
+        ));
+    }
+
+    let status = status.ok_or_else(|| {
+        local_git_error(
+            args,
+            "git process terminated without an exit status".to_string(),
+        )
+    })?;
+    // Success belongs to the direct Git process only. Helpers are never part
+    // of the MCP result and must not survive merely because they closed both
+    // output pipes before the direct process exited.
+    process_tree.terminate_descendants();
+    Ok(GitProcessOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn git_stop_error(
+    args: &[&str],
+    reason: u8,
+    stdout_max_bytes: usize,
+    timeout: Duration,
+) -> JsonRpcError {
+    let details = match reason {
+        1 => format!(
+            "git stdout exceeded the {stdout_max_bytes}-byte safety limit; no partial result was returned as complete"
+        ),
+        2 => format!("git stderr exceeded the {GIT_STDERR_MAX_BYTES}-byte safety limit"),
+        3 => format!("git command exceeded the {}-second timeout", timeout.as_secs()),
+        4 => "failed while waiting for git process".to_string(),
+        5 => "git exited but a descendant retained an output pipe past the safety deadline"
+            .to_string(),
+        _ => "git process stopped at the hardened execution boundary".to_string(),
+    };
+    local_git_error(args, details)
+}
+
+trait CancellableGitReader: Read {
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<usize>;
+}
+
+#[cfg(not(windows))]
+impl<T: Read> CancellableGitReader for T {
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.read(buffer)
+    }
+}
+
+#[cfg(windows)]
+fn windows_read_git_pipe<T: Read + std::os::windows::io::AsRawHandle>(
+    reader: &mut T,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let mut available = 0u32;
+    let result = unsafe {
+        PeekNamedPipe(
+            reader.as_raw_handle() as HANDLE,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            &mut available,
+            ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(109 | 232 | 233)) {
+            return Ok(0);
+        }
+        return Err(error);
+    }
+    if available == 0 {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+    let limit = buffer.len().min(available as usize);
+    reader.read(&mut buffer[..limit])
+}
+
+#[cfg(windows)]
+impl CancellableGitReader for std::process::ChildStdout {
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        windows_read_git_pipe(self, buffer)
+    }
+}
+
+#[cfg(windows)]
+impl CancellableGitReader for std::process::ChildStderr {
+    fn read_available(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        windows_read_git_pipe(self, buffer)
+    }
+}
+
+fn read_git_stream(
+    mut reader: impl CancellableGitReader,
+    capture_bytes: usize,
+    max_bytes: usize,
+    limit_reason: u8,
+    stop_reason: Arc<AtomicU8>,
+) -> io::Result<GitStreamOutput> {
+    let mut prefix = Vec::with_capacity(capture_bytes.min(65_536));
+    let mut total_bytes = 0_u64;
+    let mut newline_count = 0_u64;
+    let mut last_byte = None;
+    let mut buffer = [0_u8; 16_384];
+    loop {
+        if stop_reason.load(Ordering::Acquire) != 0 {
+            let total_lines = newline_count
+                .saturating_add(u64::from(total_bytes > 0 && last_byte != Some(b'\n')));
+            return Ok(GitStreamOutput {
+                prefix,
+                total_bytes,
+                total_lines,
+            });
+        }
+        let read = match reader.read_available(&mut buffer) {
+            Ok(read) => read,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted
+                    || matches!(error.raw_os_error(), Some(232 | 233)) =>
+            {
+                std::thread::sleep(GIT_COMMAND_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if read == 0 {
+            let total_lines = newline_count
+                .saturating_add(u64::from(total_bytes > 0 && last_byte != Some(b'\n')));
+            return Ok(GitStreamOutput {
+                prefix,
+                total_bytes,
+                total_lines,
+            });
+        }
+        total_bytes = total_bytes.saturating_add(read as u64);
+        newline_count = newline_count
+            .saturating_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count() as u64);
+        last_byte = Some(buffer[read - 1]);
+        let remaining = capture_bytes.saturating_sub(prefix.len());
+        prefix.extend_from_slice(&buffer[..read.min(remaining)]);
+        if total_bytes > max_bytes as u64 {
+            let _ =
+                stop_reason.compare_exchange(0, limit_reason, Ordering::AcqRel, Ordering::Acquire);
+            let total_lines = newline_count
+                .saturating_add(u64::from(total_bytes > 0 && last_byte != Some(b'\n')));
+            return Ok(GitStreamOutput {
+                prefix,
+                total_bytes,
+                total_lines,
+            });
+        }
     }
 }
 
@@ -3893,13 +6774,15 @@ fn run_git_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn run_git_status(repo_path: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(args)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    execute_git(
+        repo_path,
+        args,
+        GIT_COMPLETE_STDOUT_MAX_BYTES,
+        GIT_COMPLETE_STDOUT_MAX_BYTES,
+        GIT_COMMAND_TIMEOUT,
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 fn clean_mcp_ref_label(ref_name: &str) -> String {
@@ -4156,30 +7039,16 @@ fn parse_name_status(line: &str) -> Value {
     })
 }
 
-fn parse_submodule_line(line: &str) -> Value {
-    let state = line.chars().next().unwrap_or(' ');
-    let mut parts = line.get(1..).unwrap_or("").split_whitespace();
-    json!({
-        "state": state.to_string(),
-        "commit": parts.next().unwrap_or_default(),
-        "path": parts.next().unwrap_or_default(),
-        "description": parts.collect::<Vec<_>>().join(" "),
-    })
-}
-
 impl InitializeResult {
     fn new() -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            capabilities: json!({
-                "tools": {
-                    "listChanged": false
-                }
-            }),
+            capabilities: server_capabilities_json(),
             server_info: ServerInfo {
                 name: SERVER_NAME,
                 version: SERVER_VERSION,
             },
+            instructions: MCP_INSTRUCTIONS,
         }
     }
 }
@@ -4232,11 +7101,15 @@ fn read_only_tools() -> Vec<ToolSpec> {
         .copied()
         .map(|kind| ToolSpec {
             name: kind.as_str(),
+            title: tool_title(kind),
             description: tool_description(kind),
             input_schema: tool_input_schema(kind),
+            output_schema: tool_output_schema(kind, true),
             annotations: Some(ToolAnnotations {
                 read_only_hint: true,
                 destructive_hint: None,
+                idempotent_hint: true,
+                open_world_hint: false,
             }),
         })
         .collect()
@@ -4248,20 +7121,1670 @@ fn write_handshake_tools() -> Vec<ToolSpec> {
         .copied()
         .map(|kind| ToolSpec {
             name: kind.as_str(),
+            title: tool_title(kind),
             description: tool_description(kind),
             input_schema: tool_input_schema(kind),
+            output_schema: tool_output_schema(kind, false),
             annotations: Some(ToolAnnotations {
                 read_only_hint: false,
-                // Reset and discard destroy work when approved; flag them so
-                // MCP hosts can require extra confirmation UI of their own.
-                destructive_hint: matches!(
+                // Be explicit instead of relying on MCP's destructive=true
+                // default. These proposals can rewrite existing refs/files or
+                // contain a destructive plan step; additive-only operations
+                // and proposal cancellation advertise false.
+                destructive_hint: Some(matches!(
                     kind,
-                    ToolKind::OperationPreviewReset | ToolKind::OperationPreviewDiscard
-                )
-                .then_some(true),
+                    ToolKind::OperationPreviewMerge
+                        | ToolKind::OperationPreviewRebase
+                        | ToolKind::OperationPreviewDiscard
+                        | ToolKind::OperationPreviewReset
+                        | ToolKind::OperationPreviewPatch
+                        | ToolKind::OperationPreviewPlan
+                        | ToolKind::OperationPreviewPush
+                )),
+                // Cancellation is idempotent. Preview admission has bounded
+                // deduplication, but after lifecycle retention/pruning the same
+                // call may create a fresh card and ultimately another Git
+                // effect, so MCP's stronger idempotence hint must stay false.
+                idempotent_hint: kind == ToolKind::OperationCancel,
+                // Only push crosses the local FluxGit/repository boundary.
+                open_world_hint: kind == ToolKind::OperationPreviewPush,
             }),
         })
         .collect()
+}
+
+fn tool_output_schema(kind: ToolKind, read_only: bool) -> Value {
+    let mut schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "tool": { "const": kind.as_str() },
+            "readOnly": { "const": read_only },
+            "source": tool_output_source_schema(kind),
+            "tier": tool_output_tier_schema(kind),
+            "repoPath": { "type": "string" },
+            "data": tool_data_schema(kind),
+            "error": tool_error_schema(),
+            "previewId": preview_id_output_schema(),
+            "status": lifecycle_status_schema(true),
+            "accepted": { "const": true },
+            "nextAction": preview_next_action_schema()
+        },
+        "required": ["tool", "readOnly"],
+        // The envelope and today's stable fields are strict enough for an MCP
+        // client to consume directly. Objects remain open for additive fields
+        // from a newer FluxGit gateway/desktop, which is important because the
+        // sidecar and app can be upgraded independently.
+        "additionalProperties": true
+    });
+    schema["anyOf"] = tool_output_variants(kind);
+    schema
+}
+
+fn tool_output_source_schema(kind: ToolKind) -> Value {
+    match kind {
+        ToolKind::DiffSemantic | ToolKind::DiffSemanticFallbacks => {
+            json!({ "enum": ["local-git", "fluxgit-gateway"] })
+        }
+        ToolKind::OperationStatus
+        | ToolKind::OperationCancel
+        | ToolKind::OperationPreviewMerge
+        | ToolKind::OperationPreviewRebase
+        | ToolKind::OperationPreviewDiscard
+        | ToolKind::OperationPreviewReset
+        | ToolKind::OperationPreviewPatch
+        | ToolKind::OperationPreviewPlan
+        | ToolKind::OperationPreviewWorktree
+        | ToolKind::OperationPreviewCommit
+        | ToolKind::OperationPreviewPush
+        | ToolKind::OperationPreviewBranch => json!({ "const": "fluxgit-app" }),
+        _ => json!({ "const": "local-git" }),
+    }
+}
+
+fn tool_output_tier_schema(kind: ToolKind) -> Value {
+    match kind {
+        ToolKind::OperationStatus
+        | ToolKind::OperationCancel
+        | ToolKind::OperationPreviewMerge
+        | ToolKind::OperationPreviewRebase
+        | ToolKind::OperationPreviewDiscard
+        | ToolKind::OperationPreviewReset
+        | ToolKind::OperationPreviewPatch
+        | ToolKind::OperationPreviewPlan
+        | ToolKind::OperationPreviewWorktree
+        | ToolKind::OperationPreviewCommit
+        | ToolKind::OperationPreviewPush
+        | ToolKind::OperationPreviewBranch => {
+            json!({ "const": "fluxgit-write-handshake" })
+        }
+        ToolKind::SafetyTimeline
+        | ToolKind::SafetyEventDetails
+        | ToolKind::FluxLatestRestorePoint
+        | ToolKind::FluxRestorePoints
+        | ToolKind::FluxRestorePointDetails => json!({ "const": "fluxgit" }),
+        ToolKind::FleetRadar
+        | ToolKind::RepoConflictPreflight
+        | ToolKind::DiffSemantic
+        | ToolKind::DiffSemanticFallbacks => json!({ "const": "hybrid" }),
+        _ => json!({ "const": "free" }),
+    }
+}
+
+fn tool_output_variants(kind: ToolKind) -> Value {
+    match kind {
+        ToolKind::OperationPreviewMerge
+        | ToolKind::OperationPreviewRebase
+        | ToolKind::OperationPreviewDiscard
+        | ToolKind::OperationPreviewReset
+        | ToolKind::OperationPreviewPatch
+        | ToolKind::OperationPreviewPlan
+        | ToolKind::OperationPreviewWorktree
+        | ToolKind::OperationPreviewCommit
+        | ToolKind::OperationPreviewPush
+        | ToolKind::OperationPreviewBranch => json!([
+            {
+                "type": "object",
+                "properties": { "status": { "const": "completed" } },
+                "required": ["source", "tier", "previewId", "status", "data"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "status": live_lifecycle_status_schema(),
+                    "accepted": { "const": true }
+                },
+                "required": ["source", "tier", "previewId", "status", "accepted", "nextAction"]
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "status": { "enum": ["rejected", "failed", "expired", "cancelled"] }
+                },
+                "required": ["source", "tier", "previewId", "status", "error"]
+            },
+            {
+                "type": "object",
+                "properties": { "status": { "const": "refused" } },
+                "required": ["source", "tier", "previewId", "status", "error"]
+            },
+            {
+                "type": "object",
+                "required": ["tier", "error"]
+            }
+        ]),
+        ToolKind::OperationStatus => json!([
+            {
+                "type": "object",
+                "required": ["source", "tier", "previewId", "data"]
+            },
+            {
+                "type": "object",
+                "required": ["tier", "error"]
+            }
+        ]),
+        ToolKind::OperationCancel => json!([
+            {
+                "type": "object",
+                "properties": { "status": { "const": "cancelled" } },
+                "required": ["source", "tier", "previewId", "status", "data"]
+            },
+            {
+                "type": "object",
+                "required": ["tier", "error"]
+            }
+        ]),
+        ToolKind::FleetRadar => json!([
+            { "type": "object", "required": ["source", "data"] },
+            { "type": "object", "required": ["error"] }
+        ]),
+        _ => json!([
+            { "type": "object", "required": ["source", "repoPath", "data"] },
+            { "type": "object", "required": ["error"] }
+        ]),
+    }
+}
+
+fn tool_data_schema(kind: ToolKind) -> Value {
+    match kind {
+        ToolKind::RepoBrief => repo_brief_output_schema(),
+        ToolKind::RepoScope => repo_scope_output_schema(),
+        ToolKind::SafetyTimeline => safety_timeline_output_schema(),
+        ToolKind::SafetyEventDetails => safety_event_details_output_schema(),
+        ToolKind::FleetRadar => fleet_radar_output_schema(),
+        ToolKind::RepoStatus => repo_status_output_schema(),
+        ToolKind::RepoRefs => repo_refs_output_schema(),
+        ToolKind::RepoBranchStack => repo_branch_stack_output_schema(),
+        ToolKind::RepoConflictPreflight => repo_conflict_preflight_output_schema(),
+        ToolKind::ConflictRead => conflict_read_output_schema(),
+        ToolKind::RepoReflog => repo_reflog_output_schema(),
+        ToolKind::RepoHistory => repo_history_output_schema(),
+        ToolKind::CommitDetails => commit_details_output_schema(),
+        ToolKind::WorktreeChanges => worktree_changes_output_schema(),
+        ToolKind::WorktreeList => worktree_list_output_schema(),
+        ToolKind::SubmoduleStatus => submodule_status_output_schema(),
+        ToolKind::DiffText => diff_text_output_schema(),
+        ToolKind::DiffSemantic => diff_semantic_output_schema(),
+        ToolKind::DiffSemanticFallbacks => diff_semantic_fallbacks_output_schema(),
+        ToolKind::FluxLatestRestorePoint => flux_latest_restore_point_output_schema(),
+        ToolKind::FluxRestorePoints => flux_restore_points_output_schema(),
+        ToolKind::FluxRestorePointDetails => flux_restore_point_details_output_schema(),
+        ToolKind::OperationStatus => gateway_raw_value_schema(
+            operation_status_data_schema(None, None),
+            "Official FluxGit status object; non-object JSON remains accepted for compatibility with older/custom loopback bridges.",
+        ),
+        ToolKind::OperationCancel => gateway_raw_value_schema(
+            operation_cancel_data_schema(),
+            "Official cancelled proposal object; non-object JSON remains accepted because the sidecar relays any successful loopback bridge body verbatim.",
+        ),
+        ToolKind::OperationPreviewMerge
+        | ToolKind::OperationPreviewRebase
+        | ToolKind::OperationPreviewDiscard
+        | ToolKind::OperationPreviewReset
+        | ToolKind::OperationPreviewPatch
+        | ToolKind::OperationPreviewPlan
+        | ToolKind::OperationPreviewWorktree
+        | ToolKind::OperationPreviewCommit
+        | ToolKind::OperationPreviewPush
+        | ToolKind::OperationPreviewBranch => {
+            operation_status_data_schema(Some(kind), Some("completed"))
+        }
+    }
+}
+
+fn output_object(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": true,
+    })
+}
+
+fn output_array(items: Value) -> Value {
+    json!({ "type": "array", "items": items })
+}
+
+fn bounded_output_array(items: Value, maximum: usize) -> Value {
+    json!({ "type": "array", "items": items, "maxItems": maximum })
+}
+
+fn nullable_output_schema(schema: Value) -> Value {
+    json!({ "anyOf": [schema, { "type": "null" }] })
+}
+
+fn nullable_string_output_schema() -> Value {
+    nullable_output_schema(json!({ "type": "string" }))
+}
+
+fn non_negative_integer_output_schema() -> Value {
+    json!({ "type": "integer", "minimum": 0 })
+}
+
+fn preview_id_output_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9_-]+$",
+    })
+}
+
+fn lifecycle_status_schema(include_refused: bool) -> Value {
+    let known = if include_refused {
+        json!([
+            "pending",
+            "approved",
+            "executing",
+            "completed",
+            "rejected",
+            "failed",
+            "expired",
+            "cancelled",
+            "refused"
+        ])
+    } else {
+        json!([
+            "pending",
+            "approved",
+            "executing",
+            "completed",
+            "rejected",
+            "failed",
+            "expired",
+            "cancelled"
+        ])
+    };
+    json!({
+        "anyOf": [
+            { "enum": known },
+            {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_-]*$"
+            }
+        ]
+    })
+}
+
+fn live_lifecycle_status_schema() -> Value {
+    json!({
+        "anyOf": [
+            { "enum": ["pending", "approved", "executing"] },
+            {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9_-]*$"
+            }
+        ]
+    })
+}
+
+fn tool_error_schema() -> Value {
+    output_object(
+        json!({
+            "code": { "type": "integer" },
+            "message": { "type": "string" },
+            "data": nullable_output_schema(output_object(json!({}), &[])),
+        }),
+        &["code", "message"],
+    )
+}
+
+fn preview_next_action_schema() -> Value {
+    output_object(
+        json!({
+            "tool": { "const": "operation.status" },
+            "message": { "type": "string", "minLength": 1 },
+            "data": output_object(
+                json!({
+                    "previewId": preview_id_output_schema(),
+                    "lastStatus": lifecycle_status_schema(false),
+                    "reason": { "type": "string", "minLength": 1 },
+                    "agentRecommendation": { "type": "string", "minLength": 1 },
+                }),
+                &["previewId", "lastStatus", "reason", "agentRecommendation"],
+            ),
+        }),
+        &["tool", "message", "data"],
+    )
+}
+
+fn status_entry_output_schema() -> Value {
+    output_object(
+        json!({
+            "status": { "type": "string" },
+            "path": { "type": "string" },
+        }),
+        &["status", "path"],
+    )
+}
+
+fn submodule_entry_output_schema() -> Value {
+    output_object(
+        json!({
+            "state": { "enum": [" ", "-", "+", "U"] },
+            "commit": { "type": "string" },
+            "path": { "type": "string" },
+            "description": { "type": "string" },
+        }),
+        &["state", "commit", "path", "description"],
+    )
+}
+
+fn short_commit_output_schema() -> Value {
+    output_object(
+        json!({
+            "sha": { "type": "string" },
+            "subject": { "type": "string" },
+        }),
+        &["sha", "subject"],
+    )
+}
+
+fn restore_point_output_schema() -> Value {
+    output_object(
+        json!({
+            "repoId": { "type": "string", "minLength": 1 },
+            "before": nullable_string_output_schema(),
+            "after": nullable_string_output_schema(),
+            "operation": nullable_string_output_schema(),
+            "canUndo": { "type": "boolean" },
+            "canRedo": { "type": "boolean" },
+            "approvalRequired": { "const": true },
+            "approvalMessage": { "type": "string", "minLength": 1 },
+            "metadata": output_object(
+                json!({
+                    "checkpointPath": { "type": "string" },
+                    "createdAt": nullable_output_schema(json!({ "type": "integer" })),
+                    "branchRef": nullable_string_output_schema(),
+                    "undone": { "type": "boolean" },
+                    "beforeRef": nullable_string_output_schema(),
+                    "afterRef": nullable_string_output_schema(),
+                    "upstreamRef": nullable_string_output_schema(),
+                    "resetMode": nullable_string_output_schema(),
+                    // Stored checkpoints predate a fixed plan shape and the
+                    // sidecar intentionally preserves any JSON value here.
+                    "plan": {
+                        "description": "Opaque checkpoint plan metadata preserved verbatim for compatibility."
+                    },
+                    "currentBranchRef": nullable_string_output_schema(),
+                    "currentHead": nullable_string_output_schema(),
+                }),
+                &[
+                    "checkpointPath", "createdAt", "branchRef", "undone", "beforeRef",
+                    "afterRef", "upstreamRef", "resetMode", "plan", "currentBranchRef",
+                    "currentHead",
+                ],
+            ),
+        }),
+        &[
+            "repoId",
+            "before",
+            "after",
+            "operation",
+            "canUndo",
+            "canRedo",
+            "approvalRequired",
+            "approvalMessage",
+            "metadata",
+        ],
+    )
+}
+
+fn safety_event_output_schema() -> Value {
+    let mut schema = output_object(
+        json!({
+            "id": { "type": "string", "minLength": 1 },
+            "repoLabel": { "type": "string" },
+            "source": { "enum": ["restore_point", "reflog"] },
+            "kind": { "enum": ["restore_created", "ref_move"] },
+            "severity": { "enum": ["info", "warning"] },
+            "title": { "type": "string" },
+            "summary": { "type": "string" },
+            "occurredAtUnix": { "type": "integer" },
+            "headBefore": nullable_string_output_schema(),
+            "headAfter": nullable_string_output_schema(),
+            "restorePoint": restore_point_output_schema(),
+            "reflogSelector": { "type": "string" },
+            "canCompare": { "type": "boolean" },
+            "actions": bounded_output_array(
+                json!({
+                    "enum": [
+                        "openRestorePoint", "openReflogEntry", "compareBeforeAfter",
+                        "createRescueBranch", "copyRedactedSummary"
+                    ]
+                }),
+                4,
+            ),
+            "approvalRequired": { "const": true },
+            "networkFetchPerformed": { "const": false },
+        }),
+        &[
+            "id",
+            "repoLabel",
+            "source",
+            "kind",
+            "severity",
+            "title",
+            "summary",
+            "occurredAtUnix",
+            "headBefore",
+            "headAfter",
+            "actions",
+            "approvalRequired",
+            "networkFetchPerformed",
+        ],
+    );
+    schema["anyOf"] = json!([
+        {
+            "properties": {
+                "source": { "const": "restore_point" },
+                "kind": { "const": "restore_created" }
+            },
+            "required": ["restorePoint"]
+        },
+        {
+            "properties": {
+                "source": { "const": "reflog" },
+                "kind": { "const": "ref_move" }
+            },
+            "required": ["reflogSelector", "canCompare"]
+        }
+    ]);
+    schema
+}
+
+fn repo_brief_output_schema() -> Value {
+    output_object(
+        json!({
+            "head": output_object(
+                json!({
+                    "branch": nullable_string_output_schema(),
+                    "detached": { "type": "boolean" },
+                    "sha": nullable_string_output_schema(),
+                    "upstream": nullable_string_output_schema(),
+                    "ahead": non_negative_integer_output_schema(),
+                    "behind": non_negative_integer_output_schema(),
+                }),
+                &["branch", "detached", "sha", "upstream", "ahead", "behind"],
+            ),
+            "operationInProgress": nullable_output_schema(json!({
+                "enum": ["merge", "rebase", "cherry-pick", "revert", "bisect"]
+            })),
+            "workingTree": output_object(
+                json!({
+                    "clean": { "type": "boolean" },
+                    "staged": non_negative_integer_output_schema(),
+                    "unstaged": non_negative_integer_output_schema(),
+                    "untracked": non_negative_integer_output_schema(),
+                    "conflicted": non_negative_integer_output_schema(),
+                }),
+                &["clean", "staged", "unstaged", "untracked", "conflicted"],
+            ),
+            "stashes": non_negative_integer_output_schema(),
+            "submodules": output_object(
+                json!({
+                    "total": non_negative_integer_output_schema(),
+                    "clean": non_negative_integer_output_schema(),
+                    "drifted": non_negative_integer_output_schema(),
+                    "uninitialized": non_negative_integer_output_schema(),
+                    "conflicts": non_negative_integer_output_schema(),
+                    "attention": bounded_output_array(submodule_entry_output_schema(), 10),
+                    "attentionTruncated": { "type": "boolean" },
+                }),
+                &[
+                    "total", "clean", "drifted", "uninitialized", "conflicts", "attention",
+                    "attentionTruncated",
+                ],
+            ),
+            "recentCommits": bounded_output_array(short_commit_output_schema(), 20),
+            "conventions": output_object(
+                json!({
+                    "conventionalCommitRatio": nullable_output_schema(json!({
+                        "type": "number", "minimum": 0, "maximum": 1
+                    })),
+                    "defaultBranch": nullable_string_output_schema(),
+                }),
+                &["conventionalCommitRatio", "defaultBranch"],
+            ),
+            "hints": bounded_output_array(json!({ "type": "string" }), 3),
+        }),
+        &[
+            "head",
+            "operationInProgress",
+            "workingTree",
+            "stashes",
+            "submodules",
+            "recentCommits",
+            "conventions",
+            "hints",
+        ],
+    )
+}
+
+fn repo_scope_output_schema() -> Value {
+    output_object(
+        json!({
+            "scope": { "type": "string", "minLength": 1 },
+            "workingTree": output_object(
+                json!({
+                    "changed": non_negative_integer_output_schema(),
+                    "entries": bounded_output_array(status_entry_output_schema(), 20),
+                    "truncated": { "type": "boolean" },
+                }),
+                &["changed", "entries", "truncated"],
+            ),
+            "recentCommits": bounded_output_array(short_commit_output_schema(), 20),
+            "churn": output_object(
+                json!({
+                    "days": { "type": "integer", "minimum": 1, "maximum": 365 },
+                    "commits": non_negative_integer_output_schema(),
+                    "authors": non_negative_integer_output_schema(),
+                }),
+                &["days", "commits", "authors"],
+            ),
+            "owners": nullable_output_schema(output_object(
+                json!({
+                    "source": { "type": "string" },
+                    "matchedPattern": nullable_string_output_schema(),
+                    "owners": output_array(json!({ "type": "string" })),
+                    "matching": { "const": "simplified-prefix (last match wins)" },
+                }),
+                &["source", "matchedPattern", "owners", "matching"],
+            )),
+            "hints": bounded_output_array(json!({ "type": "string" }), 3),
+        }),
+        &[
+            "scope",
+            "workingTree",
+            "recentCommits",
+            "churn",
+            "owners",
+            "hints",
+        ],
+    )
+}
+
+fn safety_timeline_output_schema() -> Value {
+    output_object(
+        json!({
+            "events": bounded_output_array(safety_event_output_schema(), 200),
+            "eventCount": { "type": "integer", "minimum": 0, "maximum": 200 },
+            "readOnly": { "const": true },
+            "approvalRequired": { "const": true },
+            "approvalMessage": { "type": "string", "minLength": 1 },
+            "networkFetchPerformed": { "const": false },
+        }),
+        &[
+            "events",
+            "eventCount",
+            "readOnly",
+            "approvalRequired",
+            "approvalMessage",
+            "networkFetchPerformed",
+        ],
+    )
+}
+
+fn safety_event_details_output_schema() -> Value {
+    output_object(
+        json!({
+            "event": nullable_output_schema(safety_event_output_schema()),
+            "eventFound": { "type": "boolean" },
+            "readOnly": { "const": true },
+            "approvalRequired": { "const": true },
+            "approvalMessage": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "event",
+            "eventFound",
+            "readOnly",
+            "approvalRequired",
+            "approvalMessage",
+        ],
+    )
+}
+
+fn fleet_entry_output_schema() -> Value {
+    output_object(
+        json!({
+            "repoId": nullable_string_output_schema(),
+            "label": { "type": "string" },
+            "repoPath": { "type": "string" },
+            "status": {
+                "enum": [
+                    "unknown", "conflict", "potential_conflict", "divergent",
+                    "local_changes", "behind", "ahead", "no_upstream", "clean"
+                ]
+            },
+            "priority": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "summary": { "type": "string" },
+            "dirty": { "type": "boolean" },
+            "changedFiles": non_negative_integer_output_schema(),
+            "ahead": non_negative_integer_output_schema(),
+            "behind": non_negative_integer_output_schema(),
+            "hasUpstream": { "type": "boolean" },
+            "upstream": nullable_string_output_schema(),
+            "branch": nullable_string_output_schema(),
+            "head": nullable_string_output_schema(),
+            "shortHead": nullable_string_output_schema(),
+            "conflictActive": { "type": "boolean" },
+            "conflictOperation": nullable_output_schema(json!({
+                "enum": ["merge", "rebase", "cherry-pick", "revert"]
+            })),
+            "potentialConflictActive": { "type": "boolean" },
+            "potentialConflictCount": non_negative_integer_output_schema(),
+            "potentialConflictTarget": nullable_string_output_schema(),
+            "potentialConflictPaths": output_array(json!({ "type": "string" })),
+            "lastCommitTimestamp": nullable_output_schema(json!({ "type": "integer" })),
+            "elapsedMs": non_negative_integer_output_schema(),
+            "error": { "type": "string" },
+            "suggestedActions": output_array(json!({ "type": "string" })),
+        }),
+        &[
+            "repoId",
+            "label",
+            "repoPath",
+            "status",
+            "priority",
+            "summary",
+            "dirty",
+            "changedFiles",
+            "ahead",
+            "behind",
+            "hasUpstream",
+            "upstream",
+            "branch",
+            "head",
+            "shortHead",
+            "conflictActive",
+            "conflictOperation",
+            "potentialConflictActive",
+            "potentialConflictCount",
+            "potentialConflictTarget",
+            "potentialConflictPaths",
+            "lastCommitTimestamp",
+            "elapsedMs",
+            "error",
+            "suggestedActions",
+        ],
+    )
+}
+
+fn fleet_attention_output_schema() -> Value {
+    output_object(
+        json!({
+            "repoId": nullable_string_output_schema(),
+            "label": { "type": "string" },
+            "repoPath": { "type": "string" },
+            "status": {
+                "enum": [
+                    "unknown", "conflict", "potential_conflict", "divergent",
+                    "local_changes", "behind", "ahead", "no_upstream"
+                ]
+            },
+            "priority": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "summary": { "type": "string" },
+            "suggestedActions": output_array(json!({ "type": "string" })),
+        }),
+        &[
+            "repoId",
+            "label",
+            "repoPath",
+            "status",
+            "priority",
+            "summary",
+            "suggestedActions",
+        ],
+    )
+}
+
+fn fleet_radar_output_schema() -> Value {
+    output_object(
+        json!({
+            "entries": bounded_output_array(fleet_entry_output_schema(), 500),
+            "attentionStack": bounded_output_array(fleet_attention_output_schema(), 500),
+            "requestedCount": non_negative_integer_output_schema(),
+            "scannedCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+            "failedCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+            "dirtyCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+            "conflictCount": { "type": "integer", "minimum": 0, "maximum": 500 },
+            "truncatedCount": non_negative_integer_output_schema(),
+            "elapsedMs": non_negative_integer_output_schema(),
+            "network": output_object(
+                json!({
+                    "fetchPerformed": { "const": false },
+                    "remoteStateSource": { "const": "cached local refs only" },
+                }),
+                &["fetchPerformed", "remoteStateSource"],
+            ),
+            "guidance": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "entries",
+            "attentionStack",
+            "requestedCount",
+            "scannedCount",
+            "failedCount",
+            "dirtyCount",
+            "conflictCount",
+            "truncatedCount",
+            "elapsedMs",
+            "network",
+            "guidance",
+        ],
+    )
+}
+
+fn repo_status_output_schema() -> Value {
+    output_object(
+        json!({
+            "branch": nullable_string_output_schema(),
+            "ahead": non_negative_integer_output_schema(),
+            "behind": non_negative_integer_output_schema(),
+            "clean": { "type": "boolean" },
+            "changedFiles": non_negative_integer_output_schema(),
+            "entries": output_array(status_entry_output_schema()),
+        }),
+        &[
+            "branch",
+            "ahead",
+            "behind",
+            "clean",
+            "changedFiles",
+            "entries",
+        ],
+    )
+}
+
+fn repo_refs_output_schema() -> Value {
+    let strings = || output_array(json!({ "type": "string" }));
+    output_object(
+        json!({
+            "head": { "type": "string" },
+            "branches": strings(),
+            "tags": strings(),
+            "remotes": strings(),
+            "stashes": strings(),
+        }),
+        &["head", "branches", "tags", "remotes", "stashes"],
+    )
+}
+
+fn repo_branch_stack_output_schema() -> Value {
+    let distance = || {
+        output_object(
+            json!({
+                "aheadFromBase": non_negative_integer_output_schema(),
+                "behindBase": non_negative_integer_output_schema(),
+            }),
+            &["aheadFromBase", "behindBase"],
+        )
+    };
+    output_object(
+        json!({
+            "current": output_object(
+                json!({
+                    "ref": nullable_string_output_schema(),
+                    "label": { "type": "string" },
+                    "commit": { "type": "string", "minLength": 1 },
+                    "ahead": non_negative_integer_output_schema(),
+                    "behind": non_negative_integer_output_schema(),
+                }),
+                &["ref", "label", "commit", "ahead", "behind"],
+            ),
+            "upstream": nullable_output_schema(output_object(
+                json!({
+                    "ref": { "type": "string", "minLength": 1 },
+                    "label": { "type": "string" },
+                    "commit": nullable_string_output_schema(),
+                }),
+                &["ref", "label", "commit"],
+            )),
+            "base": nullable_output_schema(output_object(
+                json!({
+                    "ref": { "type": "string", "minLength": 1 },
+                    "label": { "type": "string" },
+                    "commit": nullable_string_output_schema(),
+                    "distance": nullable_output_schema(distance()),
+                }),
+                &["ref", "label", "commit", "distance"],
+            )),
+            "related": bounded_output_array(
+                output_object(
+                    json!({
+                        "ref": { "type": "string", "minLength": 1 },
+                        "label": { "type": "string" },
+                        "commit": { "type": "string" },
+                        "relation": {
+                            "enum": ["tracks-current", "descends-from-current", "shares-base"]
+                        },
+                        "aheadOfCurrent": non_negative_integer_output_schema(),
+                        "behindCurrent": non_negative_integer_output_schema(),
+                        "upstream": nullable_string_output_schema(),
+                    }),
+                    &[
+                        "ref", "label", "commit", "relation", "aheadOfCurrent",
+                        "behindCurrent", "upstream",
+                    ],
+                ),
+                50,
+            ),
+            "risk": { "enum": ["low", "medium", "high"] },
+            "summary": { "type": "string" },
+            "guidance": { "type": "string" },
+            "suggestedActions": output_array(json!({
+                "enum": [
+                    "compareWithBase", "showAllBranchContext", "openSafetyTimeline",
+                    "prepareGuardedRebasePlan"
+                ]
+            })),
+            "model": { "const": "real-git-refs-no-virtual-branches" },
+            "networkFetchPerformed": { "const": false },
+            "readOnly": { "const": true },
+        }),
+        &[
+            "current",
+            "upstream",
+            "base",
+            "related",
+            "risk",
+            "summary",
+            "guidance",
+            "suggestedActions",
+            "model",
+            "networkFetchPerformed",
+            "readOnly",
+        ],
+    )
+}
+
+fn repo_conflict_preflight_output_schema() -> Value {
+    output_object(
+        json!({
+            "currentRef": { "type": "string", "minLength": 1 },
+            "targetRef": { "type": "string", "minLength": 1 },
+            "currentOid": { "type": "string", "minLength": 1 },
+            "targetOid": { "type": "string", "minLength": 1 },
+            "mergeBaseOid": nullable_string_output_schema(),
+            "status": {
+                "enum": [
+                    "unrelated-histories", "already-up-to-date", "fast-forward",
+                    "clean-merge", "conflicts"
+                ]
+            },
+            "conflictingPaths": output_array(json!({ "type": "string" })),
+            "conflictCount": non_negative_integer_output_schema(),
+            "readOnly": { "const": true },
+            "networkFetchPerformed": { "const": false },
+            "workingTreeMutated": { "const": false },
+            "approvalRequiredForMerge": { "const": true },
+            "guidance": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "currentRef",
+            "targetRef",
+            "currentOid",
+            "targetOid",
+            "mergeBaseOid",
+            "status",
+            "conflictingPaths",
+            "conflictCount",
+            "readOnly",
+            "networkFetchPerformed",
+            "workingTreeMutated",
+            "approvalRequiredForMerge",
+            "guidance",
+        ],
+    )
+}
+
+fn conflict_commit_output_schema() -> Value {
+    nullable_output_schema(output_object(
+        json!({
+            "sha": { "type": "string" },
+            "subject": { "type": "string" },
+        }),
+        &["sha", "subject"],
+    ))
+}
+
+fn conflict_side_output_schema() -> Value {
+    let mut side = output_object(
+        json!({
+            "sha": { "type": "string", "minLength": 1 },
+            "size": non_negative_integer_output_schema(),
+            "binary": { "const": true },
+            "truncated": { "type": "boolean" },
+            "content": { "type": "string", "maxLength": DIFF_TEXT_MAX_MAX_BYTES },
+            "error": { "type": "string", "minLength": 1 },
+        }),
+        &["sha"],
+    );
+    side["anyOf"] = json!([
+        { "required": ["error"] },
+        { "required": ["binary", "size"] },
+        { "required": ["size", "truncated", "content"] }
+    ]);
+    nullable_output_schema(side)
+}
+
+fn conflict_file_output_schema() -> Value {
+    output_object(
+        json!({
+            "path": { "type": "string" },
+            "kind": {
+                "enum": [
+                    "both-modified", "deleted-by-them", "deleted-by-us", "both-added",
+                    "added-by-us", "added-by-them", "both-deleted", "unknown"
+                ]
+            },
+            "sides": output_object(
+                json!({
+                    "base": conflict_side_output_schema(),
+                    "ours": conflict_side_output_schema(),
+                    "theirs": conflict_side_output_schema(),
+                }),
+                &["base", "ours", "theirs"],
+            ),
+            "regions": output_array(output_object(
+                json!({
+                    "startLine": { "type": "integer", "minimum": 1 },
+                    "sepLine": { "type": "integer", "minimum": 1 },
+                    "endLine": { "type": "integer", "minimum": 1 },
+                }),
+                &["startLine", "sepLine", "endLine"],
+            )),
+        }),
+        &["path", "kind", "sides", "regions"],
+    )
+}
+
+fn conflict_read_output_schema() -> Value {
+    json!({
+        "anyOf": [
+            output_object(
+                json!({
+                    "inConflict": { "const": false },
+                    "hint": { "type": "string", "minLength": 1 },
+                }),
+                &["inConflict", "hint"],
+            ),
+            output_object(
+                json!({
+                    "inConflict": { "const": true },
+                    "operation": {
+                        "enum": ["merge", "rebase", "cherry-pick", "revert", "unknown"]
+                    },
+                    "ours": conflict_commit_output_schema(),
+                    "theirs": conflict_commit_output_schema(),
+                    "conflictedFileCount": non_negative_integer_output_schema(),
+                    "files": bounded_output_array(conflict_file_output_schema(), 200),
+                    "fileListTruncated": { "type": "boolean" },
+                    "maxBytesPerSide": {
+                        "type": "integer", "minimum": 1, "maximum": DIFF_TEXT_MAX_MAX_BYTES
+                    },
+                    "guidance": { "type": "string", "minLength": 1 },
+                }),
+                &[
+                    "inConflict", "operation", "ours", "theirs", "conflictedFileCount",
+                    "files", "fileListTruncated", "maxBytesPerSide", "guidance",
+                ],
+            )
+        ]
+    })
+}
+
+fn repo_reflog_output_schema() -> Value {
+    let entry = output_object(
+        json!({
+            "index": { "type": "integer", "minimum": 0, "maximum": 99 },
+            "refName": { "type": "string", "minLength": 1 },
+            "selector": { "type": "string" },
+            "oldCommit": { "type": "string" },
+            "newCommit": { "type": "string" },
+            "shortNewCommit": { "type": "string" },
+            "message": { "type": "string" },
+            "authorName": { "type": "string" },
+            "authorEmail": { "type": "string" },
+            "timestamp": { "type": "integer" },
+            "canCompare": { "type": "boolean" },
+        }),
+        &[
+            "index",
+            "refName",
+            "selector",
+            "oldCommit",
+            "newCommit",
+            "shortNewCommit",
+            "message",
+            "authorName",
+            "authorEmail",
+            "timestamp",
+            "canCompare",
+        ],
+    );
+    output_object(
+        json!({
+            "refName": { "type": "string", "minLength": 1 },
+            "entries": bounded_output_array(entry, 100),
+            "entryCount": { "type": "integer", "minimum": 0, "maximum": 100 },
+            "readOnly": { "const": true },
+            "recoveryGuidance": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "refName",
+            "entries",
+            "entryCount",
+            "readOnly",
+            "recoveryGuidance",
+        ],
+    )
+}
+
+fn history_commit_output_schema() -> Value {
+    output_object(
+        json!({
+            "hash": { "type": "string" },
+            "shortHash": { "type": "string" },
+            "authorName": { "type": "string" },
+            "authorEmail": { "type": "string" },
+            "authorTime": { "type": "integer" },
+            "subject": { "type": "string" },
+        }),
+        &[
+            "hash",
+            "shortHash",
+            "authorName",
+            "authorEmail",
+            "authorTime",
+            "subject",
+        ],
+    )
+}
+
+fn repo_history_output_schema() -> Value {
+    output_object(
+        json!({
+            "commits": bounded_output_array(history_commit_output_schema(), 200),
+            "nextCursor": nullable_string_output_schema(),
+        }),
+        &["commits", "nextCursor"],
+    )
+}
+
+fn commit_details_output_schema() -> Value {
+    output_object(
+        json!({
+            "commit": output_object(
+                json!({
+                    "hash": { "type": "string" },
+                    "shortHash": { "type": "string" },
+                    "authorName": { "type": "string" },
+                    "authorEmail": { "type": "string" },
+                    "authorTime": { "type": "integer" },
+                    "parents": output_array(json!({ "type": "string" })),
+                    "message": { "type": "string" },
+                }),
+                &[
+                    "hash", "shortHash", "authorName", "authorEmail", "authorTime", "parents",
+                    "message",
+                ],
+            ),
+            "files": output_array(status_entry_output_schema()),
+        }),
+        &["commit", "files"],
+    )
+}
+
+fn worktree_changes_output_schema() -> Value {
+    output_object(
+        json!({
+            "staged": output_array(status_entry_output_schema()),
+            "unstaged": output_array(status_entry_output_schema()),
+            "untracked": output_array(status_entry_output_schema()),
+        }),
+        &["staged", "unstaged", "untracked"],
+    )
+}
+
+fn worktree_list_output_schema() -> Value {
+    let worktree = output_object(
+        json!({
+            "path": { "type": "string" },
+            "isMain": { "type": "boolean" },
+            "headSha": { "type": "string" },
+            "branch": { "type": "string" },
+            "detached": { "type": "boolean" },
+            "bare": { "type": "boolean" },
+            "locked": { "type": "boolean" },
+            "lockedReason": { "type": "string" },
+            "prunable": { "type": "boolean" },
+        }),
+        &["path", "isMain", "detached", "locked", "prunable"],
+    );
+    output_object(
+        json!({
+            "total": non_negative_integer_output_schema(),
+            "worktrees": output_array(worktree),
+        }),
+        &["total", "worktrees"],
+    )
+}
+
+fn submodule_status_output_schema() -> Value {
+    output_object(
+        json!({
+            "submodules": bounded_output_array(
+                submodule_entry_output_schema(),
+                SUBMODULE_STATUS_MAX_ENTRIES,
+            ),
+        }),
+        &["submodules"],
+    )
+}
+
+fn diff_text_output_schema() -> Value {
+    output_object(
+        json!({
+            "format": { "const": "text" },
+            "base": nullable_string_output_schema(),
+            "head": nullable_string_output_schema(),
+            "path": nullable_string_output_schema(),
+            "diff": { "type": "string", "maxLength": DIFF_TEXT_MAX_MAX_BYTES },
+            "truncated": { "type": "boolean" },
+            "totalBytes": non_negative_integer_output_schema(),
+            "totalLines": non_negative_integer_output_schema(),
+            "maxBytes": {
+                "type": "integer", "minimum": 1, "maximum": DIFF_TEXT_MAX_MAX_BYTES
+            },
+        }),
+        &[
+            "format",
+            "base",
+            "head",
+            "path",
+            "diff",
+            "truncated",
+            "totalBytes",
+            "totalLines",
+            "maxBytes",
+        ],
+    )
+}
+
+fn text_diff_arguments_output_schema() -> Value {
+    output_object(
+        json!({
+            "repoPath": { "type": "string" },
+            "base": { "type": "string" },
+            "head": { "type": "string" },
+            "path": { "type": "string" },
+        }),
+        &["repoPath"],
+    )
+}
+
+fn semantic_line_output_schema() -> Value {
+    output_object(
+        json!({
+            "type": { "enum": ["unchanged", "added", "deleted", "modified"] },
+            "oldLine": { "type": "integer", "minimum": 1 },
+            "newLine": { "type": "integer", "minimum": 1 },
+            "content": { "type": "string" },
+            "oldContent": { "type": "string" },
+            "changedTokens": output_array(json!({ "type": "string" })),
+            "oldChangedTokens": output_array(json!({ "type": "string" })),
+        }),
+        &["type", "content"],
+    )
+}
+
+fn semantic_file_output_schema() -> Value {
+    let hunk = output_object(
+        json!({
+            "header": { "type": "string" },
+            // The gateway emits at most 1,500 semantic lines per file. A
+            // per-hunk ceiling of the same value is valid and still useful to
+            // streaming clients; `linesTruncated` reports the file-wide cap.
+            "lines": bounded_output_array(semantic_line_output_schema(), 1_500),
+        }),
+        &["header", "lines"],
+    );
+    json!({
+        "anyOf": [
+            output_object(
+                json!({
+                    "path": { "type": "string" },
+                    "fallbackToText": { "const": false },
+                    "hunks": output_array(hunk),
+                    "linesTruncated": { "type": "boolean" },
+                }),
+                &["path", "fallbackToText", "hunks", "linesTruncated"],
+            ),
+            output_object(
+                json!({
+                    "path": { "type": "string" },
+                    "fallbackToText": { "const": true },
+                    "hunks": { "type": "array", "maxItems": 0 },
+                    "reason": { "type": "string", "minLength": 1 },
+                    "textDiffArguments": text_diff_arguments_output_schema(),
+                }),
+                &["path", "fallbackToText", "hunks", "reason", "textDiffArguments"],
+            )
+        ]
+    })
+}
+
+fn diff_semantic_output_schema() -> Value {
+    json!({
+        "anyOf": [
+            output_object(
+                json!({
+                    "supported": { "const": false },
+                    "fallback": { "const": "diff.text" },
+                    "reason": { "type": "string", "minLength": 1 },
+                    "textDiffArguments": text_diff_arguments_output_schema(),
+                }),
+                &["supported", "fallback", "reason", "textDiffArguments"],
+            ),
+            output_object(
+                json!({
+                    "supported": { "const": true },
+                    "engine": { "const": "fluxgit-diff-engine" },
+                    "base": nullable_string_output_schema(),
+                    "head": nullable_string_output_schema(),
+                    "path": nullable_string_output_schema(),
+                    "files": bounded_output_array(
+                        semantic_file_output_schema(),
+                        SEMANTIC_DIFF_MAX_FILES,
+                    ),
+                    "changedFiles": {
+                        "type": "integer", "minimum": 0, "maximum": SEMANTIC_DIFF_MAX_FILES
+                    },
+                    "filesTruncated": { "type": "boolean" },
+                }),
+                &[
+                    "supported", "engine", "base", "head", "path", "files",
+                    "changedFiles", "filesTruncated",
+                ],
+            )
+        ]
+    })
+}
+
+fn semantic_fallback_record_output_schema() -> Value {
+    output_object(
+        json!({
+            "from": { "const": "diff.semantic" },
+            "to": { "const": "diff.text" },
+            "supported": { "const": false },
+            "reason": { "type": "string", "minLength": 1 },
+            "repoPath": { "type": "string" },
+            "path": nullable_string_output_schema(),
+        }),
+        &["from", "to", "supported", "reason", "repoPath", "path"],
+    )
+}
+
+fn diff_semantic_fallbacks_output_schema() -> Value {
+    json!({
+        "anyOf": [
+            output_object(
+                json!({
+                    "fallbacks": {
+                        "type": "array",
+                        "items": semantic_fallback_record_output_schema(),
+                        "minItems": 1,
+                        "maxItems": 1,
+                    },
+                }),
+                &["fallbacks"],
+            ),
+            output_object(
+                json!({
+                    "fallbacks": bounded_output_array(
+                        semantic_fallback_record_output_schema(),
+                        SEMANTIC_DIFF_MAX_FILES,
+                    ),
+                    "engine": { "const": "fluxgit-diff-engine" },
+                    "analyzedFiles": {
+                        "type": "integer", "minimum": 0, "maximum": SEMANTIC_DIFF_MAX_FILES
+                    },
+                    "filesTruncated": { "type": "boolean" },
+                }),
+                &["fallbacks", "engine", "analyzedFiles", "filesTruncated"],
+            )
+        ]
+    })
+}
+
+fn flux_latest_restore_point_output_schema() -> Value {
+    output_object(
+        json!({
+            "latestRestorePoint": nullable_output_schema(restore_point_output_schema()),
+            // The current checkpoint store has one newest record; keep the
+            // advertised list bound aligned with the public 200-item API cap
+            // so additive history support does not break older clients.
+            "restorePoints": bounded_output_array(restore_point_output_schema(), 200),
+            "restoreCount": { "type": "integer", "minimum": 0, "maximum": 200 },
+            "approvalRequired": { "const": true },
+            "approvalMessage": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "latestRestorePoint",
+            "restorePoints",
+            "restoreCount",
+            "approvalRequired",
+            "approvalMessage",
+        ],
+    )
+}
+
+fn flux_restore_points_output_schema() -> Value {
+    output_object(
+        json!({
+            "restorePoints": bounded_output_array(restore_point_output_schema(), 200),
+            "restoreCount": { "type": "integer", "minimum": 0, "maximum": 200 },
+            "approvalRequired": { "const": true },
+            "approvalMessage": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "restorePoints",
+            "restoreCount",
+            "approvalRequired",
+            "approvalMessage",
+        ],
+    )
+}
+
+fn flux_restore_point_details_output_schema() -> Value {
+    output_object(
+        json!({
+            "restorePoint": nullable_output_schema(restore_point_output_schema()),
+            "restoreCount": { "type": "integer", "minimum": 0, "maximum": 200 },
+            "approvalRequired": { "const": true },
+            "approvalMessage": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "restorePoint",
+            "restoreCount",
+            "approvalRequired",
+            "approvalMessage",
+        ],
+    )
+}
+
+fn operation_type_for_kind(kind: ToolKind) -> Option<&'static str> {
+    match kind {
+        ToolKind::OperationPreviewMerge => Some("merge"),
+        ToolKind::OperationPreviewRebase => Some("rebase"),
+        ToolKind::OperationPreviewDiscard => Some("discard"),
+        ToolKind::OperationPreviewReset => Some("reset"),
+        ToolKind::OperationPreviewPatch => Some("patch"),
+        ToolKind::OperationPreviewPlan => Some("plan"),
+        ToolKind::OperationPreviewWorktree => Some("worktree"),
+        ToolKind::OperationPreviewCommit => Some("commit"),
+        ToolKind::OperationPreviewPush => Some("push"),
+        ToolKind::OperationPreviewBranch => Some("branch"),
+        _ => None,
+    }
+}
+
+fn operation_restore_point_output_schema() -> Value {
+    output_object(
+        json!({
+            "operation": { "type": "string" },
+            "branchRef": { "type": "string" },
+            "beforeCommit": { "type": "string" },
+            "afterCommit": { "type": "string" },
+            "canUndo": { "type": "boolean" },
+        }),
+        &[
+            "operation",
+            "branchRef",
+            "beforeCommit",
+            "afterCommit",
+            "canUndo",
+        ],
+    )
+}
+
+fn plan_step_result_output_schema() -> Value {
+    output_object(
+        json!({
+            "operationType": { "enum": ["merge", "rebase", "discard", "reset", "patch"] },
+            "status": { "enum": ["completed", "failed", "skipped"] },
+            "message": { "type": "string" },
+            "restorePoint": operation_restore_point_output_schema(),
+        }),
+        &["operationType", "status"],
+    )
+}
+
+fn operation_completion_result_schema(kind: Option<ToolKind>) -> Value {
+    let mut properties = json!({
+        "status": { "enum": ["completed", "failed"] },
+        "message": { "type": "string" },
+        "restorePoint": operation_restore_point_output_schema(),
+    });
+    let object = properties
+        .as_object_mut()
+        .expect("schema properties object");
+    let mut insert = |name: &str, schema: Value| {
+        object.insert(name.to_string(), schema);
+    };
+    match kind {
+        Some(ToolKind::OperationPreviewMerge) => {
+            insert("mergeCommit", json!({ "type": "string" }));
+            insert("summary", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewRebase) => {
+            insert("newHeadSha", json!({ "type": "string" }));
+            insert("replayedCommits", non_negative_integer_output_schema());
+            insert("restorePointId", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewDiscard) => {
+            insert(
+                "pathsDiscarded",
+                bounded_output_array(json!({ "type": "string" }), MCP_MAX_PATH_ITEMS),
+            );
+            insert("restorePointId", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewReset) => {
+            insert("newHeadSha", json!({ "type": "string" }));
+            insert("mode", json!({ "enum": ["soft", "mixed", "hard"] }));
+            insert("restorePointId", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewPatch) => {
+            insert(
+                "appliedFiles",
+                bounded_output_array(json!({ "type": "string" }), MCP_MAX_PATH_ITEMS),
+            );
+            insert("stagedToIndex", json!({ "type": "boolean" }));
+            insert("restorePointId", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewPlan) => {
+            insert(
+                "steps",
+                bounded_output_array(plan_step_result_output_schema(), 10),
+            );
+        }
+        Some(ToolKind::OperationPreviewWorktree) => {
+            insert("worktreePath", json!({ "type": "string" }));
+            insert("branch", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewCommit) => {
+            insert("commitSha", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewPush) => {
+            insert("pushedRef", json!({ "type": "string" }));
+            insert("remote", json!({ "type": "string" }));
+        }
+        Some(ToolKind::OperationPreviewBranch) => {
+            insert("branch", json!({ "type": "string" }));
+            insert("checkedOut", json!({ "type": "boolean" }));
+        }
+        None | Some(_) => {
+            // operation.status is discriminated by data.operationType rather
+            // than one fixed tool kind, so advertise every stable result key.
+            for (name, schema) in [
+                ("mergeCommit", json!({ "type": "string" })),
+                ("summary", json!({ "type": "string" })),
+                ("newHeadSha", json!({ "type": "string" })),
+                ("replayedCommits", non_negative_integer_output_schema()),
+                ("restorePointId", json!({ "type": "string" })),
+                (
+                    "pathsDiscarded",
+                    bounded_output_array(json!({ "type": "string" }), MCP_MAX_PATH_ITEMS),
+                ),
+                ("mode", json!({ "enum": ["soft", "mixed", "hard"] })),
+                (
+                    "appliedFiles",
+                    bounded_output_array(json!({ "type": "string" }), MCP_MAX_PATH_ITEMS),
+                ),
+                ("stagedToIndex", json!({ "type": "boolean" })),
+                (
+                    "steps",
+                    bounded_output_array(plan_step_result_output_schema(), 10),
+                ),
+                ("worktreePath", json!({ "type": "string" })),
+                ("branch", json!({ "type": "string" })),
+                ("commitSha", json!({ "type": "string" })),
+                ("pushedRef", json!({ "type": "string" })),
+                ("remote", json!({ "type": "string" })),
+                ("checkedOut", json!({ "type": "boolean" })),
+            ] {
+                insert(name, schema);
+            }
+        }
+    }
+    output_object(properties, &[])
+}
+
+fn gateway_raw_value_schema(preferred_object: Value, description: &str) -> Value {
+    json!({
+        "description": description,
+        "anyOf": [
+            preferred_object,
+            { "type": "array" },
+            { "type": "string" },
+            { "type": "number" },
+            { "type": "boolean" },
+            { "type": "null" }
+        ]
+    })
+}
+
+fn gateway_completion_value_schema(kind: Option<ToolKind>) -> Value {
+    gateway_raw_value_schema(
+        operation_completion_result_schema(kind),
+        "Operation-specific completion objects are typed below; primitive/array/null results remain accepted because the durable gateway contract preserves an opaque JSON Value across version skew.",
+    )
+}
+
+fn operation_status_data_schema(kind: Option<ToolKind>, status: Option<&str>) -> Value {
+    let operation_type = kind
+        .and_then(operation_type_for_kind)
+        .map(|operation_type| json!({ "const": operation_type }))
+        .unwrap_or_else(|| {
+            json!({
+                "enum": [
+                    "merge", "rebase", "discard", "reset", "patch", "plan", "worktree",
+                    "commit", "push", "branch"
+                ]
+            })
+        });
+    let status_schema = status
+        .map(|status| json!({ "const": status }))
+        .unwrap_or_else(|| lifecycle_status_schema(false));
+    output_object(
+        json!({
+            "previewId": preview_id_output_schema(),
+            // Old rollout gateways omitted this discriminator. It is fully
+            // typed when present but deliberately not required.
+            "operationType": operation_type,
+            "status": status_schema,
+            "result": gateway_completion_value_schema(kind),
+            "rejectionReason": { "type": "string" },
+            "expiresAt": { "type": "string", "format": "date-time" },
+        }),
+        &["previewId", "status"],
+    )
+}
+
+fn operation_cancel_data_schema() -> Value {
+    output_object(
+        json!({
+            "previewId": preview_id_output_schema(),
+            "agentId": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "repoPath": { "type": "string", "maxLength": MCP_MAX_PATH_CHARS },
+            "reason": { "type": "string", "maxLength": MCP_MAX_REASON_CHARS },
+            "requestedAt": { "type": "string", "format": "date-time" },
+            "expiresAt": { "type": "string", "format": "date-time" },
+            "status": { "const": "cancelled" },
+            "operationType": {
+                "enum": [
+                    "merge", "rebase", "discard", "reset", "patch", "plan", "worktree",
+                    "commit", "push", "branch"
+                ]
+            },
+            // User overrides are explicitly free-form in the durable gateway
+            // contract and must survive sidecar/app version skew.
+            "overrides": { "description": "Opaque human-approved overrides." },
+            "rejectionReason": { "type": "string" },
+            "result": gateway_completion_value_schema(None),
+            "idempotencyKey": { "type": "string", "maxLength": 256 },
+            "sourceRef": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "targetRef": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "strategy": { "enum": ["merge", "squash", "rebase"] },
+            "currentRef": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "ontoRef": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "interactive": { "type": "boolean" },
+            "paths": bounded_output_array(
+                json!({ "type": "string", "maxLength": MCP_MAX_PATH_CHARS }),
+                MCP_MAX_PATH_ITEMS,
+            ),
+            "mode": { "enum": ["soft", "mixed", "hard"] },
+            "patchContent": { "type": "string", "maxLength": MCP_MAX_PATCH_CHARS },
+            "applyToIndex": { "type": "boolean" },
+            "steps": { "type": "array", "maxItems": 10 },
+            "branch": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "path": { "type": "string", "maxLength": MCP_MAX_PATH_CHARS },
+            "message": { "type": "string", "maxLength": MCP_MAX_MESSAGE_CHARS },
+            "stageAll": { "type": "boolean" },
+            "remote": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "setUpstream": { "type": "boolean" },
+            "forceWithLease": { "type": "boolean" },
+            "name": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "startPoint": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
+            "checkout": { "type": "boolean" },
+        }),
+        &["previewId", "status"],
+    )
 }
 
 /// All advertised tools across tiers, used by `tools/list`. Read-only tools come first
@@ -4357,40 +8880,40 @@ fn tool_description(kind: ToolKind) -> &'static str {
             "Read one FluxGit restore point in detail: before/after commits, branch ref, undo/redo eligibility and checkpoint metadata. Use it when the user asks exactly what a restore would do; the restore itself requires approval inside FluxGit. Requires the FluxGit app."
         }
         ToolKind::OperationStatus => {
-            "Check the current status of a previously proposed operation by previewId: pending, approved, completed (with the execution result), failed, rejected (with the human's reason), expired or cancelled. Use it whenever a preview call returned error 10003 after its polling window — the proposal stays open in FluxGit for up to 5 minutes, so the user may still approve after your call stopped waiting. Read-only; requires the FluxGit desktop app connection (FLUXGIT_MCP_HANDSHAKE_ADDR)."
+            "Check the authoritative status of a previously proposed operation by previewId: pending, approved/executing, completed (with the execution result), failed, rejected, expired or cancelled. Preview calls return promptly while human review continues, so poll this tool before claiming the Git operation completed. Read-only; requires the FluxGit desktop app connection."
         }
         ToolKind::OperationCancel => {
             "Withdraw one of YOUR OWN still-pending operation proposals by previewId before the user decides. Use it when your plan changed and the approval card is now stale, so the user cannot approve an operation you no longer want. It only cancels proposals created by this agent, only while pending, and never touches the repository. Requires the FluxGit desktop app connection (FLUXGIT_MCP_HANDSHAKE_ADDR)."
         }
         ToolKind::OperationPreviewMerge => {
-            "Propose a merge for human review inside FluxGit. The sidecar never merges; FluxGit opens a preview, the user approves or rejects, and FluxGit executes through its safety pipeline. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); the call returns the preview outcome (approved, rejected or timed out). Without the app it returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog. On completion the result includes the captured restore point (beforeCommit/afterCommit/canUndo) when one was created — tell the user the change is reversible from FluxGit Safety Timeline."
+            "Propose a merge for human review inside FluxGit. The sidecar never merges. The call returns a previewId promptly; poll operation.status until completed, failed, rejected, expired or cancelled before reporting an outcome. FluxGit executes only after explicit approval through its safety pipeline. Always include a clear `reason`."
         }
         ToolKind::OperationPreviewRebase => {
-            "Propose a rebase for human review inside FluxGit. The sidecar never rebases; FluxGit opens a preview with risk analysis, the user approves or rejects, and FluxGit executes through its safety pipeline with a restore point. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); the call returns the preview outcome (approved, rejected or timed out). Without the app it returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog. On completion the result includes the captured restore point (beforeCommit/afterCommit/canUndo) when one was created — tell the user the change is reversible from FluxGit Safety Timeline."
+            "Propose a rebase for human review inside FluxGit. The sidecar never rebases. The call returns a previewId promptly; poll operation.status for the terminal result. FluxGit shows risk, requires explicit approval, executes through its safety pipeline and captures recovery state. Always include a clear `reason`."
         }
         ToolKind::OperationPreviewDiscard => {
-            "Propose discarding working tree changes for one or more paths. FluxGit shows exactly what would be lost and requires explicit user approval before any file is touched. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); the call returns the preview outcome (approved, rejected or timed out). Without the app it returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog."
+            "Propose discarding working-tree changes for selected paths. The call returns a previewId promptly; poll operation.status for the terminal result. FluxGit shows exactly what would be lost, captures recovery state and requires explicit approval before touching files. Always include a clear `reason`."
         }
         ToolKind::OperationPreviewReset => {
-            "Propose a reset (soft/mixed/hard) for human review. FluxGit shows commits at risk and creates a restore point before any destructive action. Hard resets always require strong confirmation. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); the call returns the preview outcome (approved, rejected or timed out). Without the app it returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog. On completion the result includes the captured restore point (beforeCommit/afterCommit/canUndo) when one was created — tell the user the change is reversible from FluxGit Safety Timeline."
+            "Propose a soft, mixed or hard reset for human review. The call returns a previewId promptly; poll operation.status for the terminal result. FluxGit shows commits at risk, captures a restore point and requires explicit approval; hard reset receives strong confirmation. Always include a clear `reason`."
         }
         ToolKind::OperationPreviewPatch => {
-            "Propose applying a patch generated by the agent. FluxGit shows the resulting diff in the preview UI, runs conflict detection and requires user approval before touching the working tree. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); the call returns the preview outcome (approved, rejected or timed out). Without the app it returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog."
+            "Propose applying an agent-generated patch. The call returns a previewId promptly; poll operation.status for the terminal result. FluxGit shows the resulting diff, runs conflict checks and requires explicit approval before touching the working tree. Always include a clear `reason`."
         }
         ToolKind::OperationPreviewPlan => {
-            "Propose a SEQUENCE of operations (1-10 steps of merge/rebase/discard/reset/patch) as one reviewable plan with a single approval. FluxGit shows every step in the approval card; the user approves intent once and FluxGit executes the steps in order through its safety pipeline, stopping at the first failure. The completion result reports per-step status and captured restore points. Use this instead of chaining single proposals when the work is one logical change (e.g. rebase then merge). Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions. Always include a clear `reason`: the user reads it in the approval dialog."
+            "Propose a sequence of 1-10 merge/rebase/discard/reset/patch steps as one reviewable plan. The call returns a previewId promptly; poll operation.status for per-step terminal results. FluxGit shows every step, requires one explicit approval, executes in order through its safety pipeline and stops at the first failure. Always include a clear `reason`."
         }
         ToolKind::OperationPreviewWorktree => {
-            "Propose creating an isolated git worktree for a parallel task BEFORE you start changing files, so your work happens in its own checkout instead of disturbing the user's current one. Use this at the start of a task that needs its own branch (e.g. 'fix the flaky test' or 'try an alternative refactor') so you can edit, build and commit without touching the main working tree. Provide `branch` (a new or existing branch name to check out in the worktree) and a clear `reason`; `path` is optional — omit it and FluxGit picks a sane default location next to the repo. Creating a worktree is non-destructive: it never rewrites history and never deletes files, it just adds a second checkout. The sidecar never creates the worktree itself; FluxGit opens an approval card, the user approves or rejects, and FluxGit creates it through its normal pipeline. On completion the result includes the created worktree's path so you can switch your work there. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
+            "Propose creating an isolated Git worktree before editing for a parallel task. Provide `branch`, optional `path`, and a clear `reason`. The call returns a previewId promptly; poll operation.status for the created path. FluxGit requires explicit approval and adds a checkout without rewriting history or deleting files."
         }
         ToolKind::OperationPreviewCommit => {
-            "Propose a commit for human review inside FluxGit — the most frequent write in a coding session. Provide `message` (subject line first; an optional body follows after a blank line) and a clear `reason` the user reads in the approval card. Optionally provide `paths` (files FluxGit stages before committing) or set `stageAll: true` (stage every unstaged change); omit both to commit exactly what is already staged. Amending is NOT supported through this tool — it rewrites history; ask the user to amend inside FluxGit instead. Committing is non-destructive: it only adds a commit and never rewrites or deletes existing work. The sidecar never commits itself; FluxGit stages and commits through its normal pipeline (hooks, signing and commit policy included) after the user approves. On completion the result includes the new commit SHA. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
+            "Propose a commit for human review. Provide `message`, a clear `reason`, and optionally `paths` or `stageAll`; omit both staging options to commit exactly what is staged. Amend is intentionally unsupported. The call returns a previewId promptly; poll operation.status for the commit SHA. FluxGit requires approval and uses its hooks, signing and commit policy."
         }
         ToolKind::OperationPreviewPush => {
-            "Propose pushing a branch to a remote for human review inside FluxGit. Defaults: `remote` 'origin', `branch` the currently checked-out branch. Set `setUpstream: true` when publishing a branch that has no upstream yet. `forceWithLease: true` requests a --force-with-lease push — FluxGit renders the approval card as HIGH risk with an explicit force warning, exactly like its own push dialog; use it only when you intentionally need to rewrite the remote branch. The sidecar never pushes itself; FluxGit executes the push through its guarded pipeline (credential handling and recovery flows included) after the user approves. On completion the result includes the pushed ref and remote. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
+            "Propose pushing a branch for human review. `remote` defaults to origin, `branch` to the current branch; `setUpstream` publishes tracking and `forceWithLease` explicitly requests a high-risk lease-protected rewrite. The call returns a previewId promptly; poll operation.status for the terminal result. FluxGit requires approval and uses its guarded credential/push pipeline."
         }
         ToolKind::OperationPreviewBranch => {
-            "Propose creating a local branch for human review inside FluxGit. Provide `name` (the new branch) and a clear `reason`; `startPoint` defaults to HEAD and `checkout: true` (the default) also checks the new branch out after creating it. Creating a branch is non-destructive: it adds a ref and never rewrites history or deletes files. The sidecar never creates the branch itself; FluxGit creates (and optionally checks out) the branch through its normal pipeline after the user approves. On completion the result includes the branch name and whether it was checked out. Requires the FluxGit desktop app to be running and connected (FLUXGIT_MCP_HANDSHAKE_ADDR); without it the call returns error 10003 with instructions."
+            "Propose creating a local branch for human review. Provide `name` and `reason`; `startPoint` defaults to HEAD and `checkout` defaults true. The call returns a previewId promptly; poll operation.status for the terminal result. FluxGit requires approval and validates the ref before adding or checking out the branch."
         }
     }
 }
@@ -4403,7 +8926,7 @@ fn tool_input_schema(kind: ToolKind) -> Value {
     // gateway handshake bridge — they take a previewId, never a repoPath.
     if matches!(kind, ToolKind::OperationStatus | ToolKind::OperationCancel) {
         let description = if kind == ToolKind::OperationStatus {
-            "The previewId returned by an operation.preview.* call (also included in error 10003 timeout payloads)."
+            "The previewId returned by an accepted operation.preview.* call."
         } else {
             "The previewId of a still-pending proposal created by this agent. Only the proposing agent can cancel it."
         };
@@ -4411,6 +8934,9 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             "previewId".into(),
             json!({
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_-]+$",
                 "description": description,
             }),
         );
@@ -4418,7 +8944,7 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             "type": "object",
             "properties": properties,
             "required": ["previewId"],
-            "additionalProperties": true,
+            "additionalProperties": false,
         });
     }
 
@@ -4427,7 +8953,9 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             "repoPaths".into(),
             json!({
                 "type": "array",
-                "items": { "type": "string" },
+                "items": { "type": "string", "minLength": 1, "maxLength": 32768 },
+                "minItems": 1,
+                "maxItems": 500,
                 "description": "Absolute local repository paths to scan. No fetch is performed."
             }),
         );
@@ -4438,12 +8966,15 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "repoPath": { "type": "string" },
-                        "repoId": { "type": "string" },
-                        "label": { "type": "string" }
+                        "repoPath": { "type": "string", "minLength": 1, "maxLength": 32768 },
+                        "repoId": { "type": "string", "minLength": 1, "maxLength": 256 },
+                        "label": { "type": "string", "minLength": 1, "maxLength": 512 }
                     },
-                    "required": ["repoPath"]
+                    "required": ["repoPath"],
+                    "additionalProperties": false
                 },
+                "minItems": 1,
+                "maxItems": 500,
                 "description": "Repository objects with optional FluxGit ids and display labels."
             }),
         );
@@ -4461,8 +8992,11 @@ fn tool_input_schema(kind: ToolKind) -> Value {
         return json!({
             "type": "object",
             "properties": properties,
-            "required": ["repoPaths"],
-            "additionalProperties": true,
+            "anyOf": [
+                { "required": ["repoPaths"] },
+                { "required": ["repositories"] }
+            ],
+            "additionalProperties": false,
         });
     }
 
@@ -4480,6 +9014,18 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             "description": "Optional FluxGit workspace id. Do not use it as a substitute for repoPath in local sidecar calls."
         }),
     );
+    if operation_type_for_kind(kind).is_some() {
+        properties.insert(
+            "idempotencyKey".into(),
+            json!({
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_-]+$",
+                "description": "Optional caller-generated key for retrying this same logical proposal without opening a duplicate approval card. Reuse only for retries of one intent; omit it for a new intent even when the other arguments match."
+            }),
+        );
+    }
     required.push("repoPath");
 
     match kind {
@@ -4562,7 +9108,8 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 "baseCandidates".into(),
                 json!({
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_REF_CHARS },
+                    "maxItems": 256,
                     "description": "Optional base branch names to try before default main/master/develop/dev/trunk."
                 }),
             );
@@ -4726,9 +9273,9 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 "strategy".into(),
                 json!({
                     "type": "string",
-                    "enum": ["merge", "squash", "rebase"],
+                    "enum": ["merge", "squash"],
                     "default": "merge",
-                    "description": "Requested merge strategy. The user may override in the FluxGit approval UI."
+                    "description": "Executable merge strategy. Use operation.preview.rebase for rebase semantics."
                 }),
             );
             required.push("sourceRef");
@@ -4762,8 +9309,9 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 "interactive".into(),
                 json!({
                     "type": "boolean",
+                    "const": false,
                     "default": false,
-                    "description": "Whether to open an interactive rebase plan editor in FluxGit. The user always edits the plan in the UI."
+                    "description": "Must be false. Interactive rebase requires the user to author step actions in FluxGit and is not executable through the approval handshake."
                 }),
             );
             required.push("ontoRef");
@@ -4774,8 +9322,9 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 "paths".into(),
                 json!({
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_PATH_CHARS },
                     "minItems": 1,
+                    "maxItems": MCP_MAX_PATH_ITEMS,
                     "description": "Paths whose working-tree changes the agent proposes to discard. FluxGit shows exactly what would be lost."
                 }),
             );
@@ -4857,18 +9406,55 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                                 "enum": ["merge", "rebase", "discard", "reset", "patch"],
                                 "description": "Which operation this step performs. A step cannot itself be a plan."
                             },
-                            "sourceRef": { "type": "string" },
-                            "targetRef": { "type": "string" },
-                            "strategy": { "type": "string" },
-                            "currentRef": { "type": "string" },
-                            "ontoRef": { "type": "string" },
-                            "interactive": { "type": "boolean" },
-                            "paths": { "type": "array", "items": { "type": "string" } },
+                            "sourceRef": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_REF_CHARS },
+                            "targetRef": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_REF_CHARS },
+                            "strategy": {
+                                "type": "string",
+                                "enum": ["merge", "squash"],
+                                "default": "merge"
+                            },
+                            "currentRef": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_REF_CHARS },
+                            "ontoRef": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_REF_CHARS },
+                            "interactive": {
+                                "type": "boolean",
+                                "const": false,
+                                "default": false,
+                                "description": "Must be false; interactive rebase steps are not executable through a batch approval."
+                            },
+                            "paths": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MCP_MAX_PATH_ITEMS,
+                                "items": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_PATH_CHARS }
+                            },
                             "mode": { "type": "string", "enum": ["soft", "mixed", "hard"] },
-                            "patchContent": { "type": "string" },
+                            "patchContent": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_PATCH_CHARS },
                             "applyToIndex": { "type": "boolean" }
                         },
-                        "required": ["operationType"]
+                        "required": ["operationType"],
+                        "additionalProperties": false,
+                        "oneOf": [
+                            {
+                                "properties": { "operationType": { "const": "merge" } },
+                                "required": ["sourceRef", "targetRef"]
+                            },
+                            {
+                                "properties": { "operationType": { "const": "rebase" } },
+                                "required": ["ontoRef"]
+                            },
+                            {
+                                "properties": { "operationType": { "const": "discard" } },
+                                "required": ["paths"]
+                            },
+                            {
+                                "properties": { "operationType": { "const": "reset" } },
+                                "required": ["targetRef"]
+                            },
+                            {
+                                "properties": { "operationType": { "const": "patch" } },
+                                "required": ["patchContent"]
+                            }
+                        ]
                     },
                     "description": "Ordered steps of the plan. Each step uses the same fields as the corresponding operation.preview.* tool. Executed in order after one approval; execution stops at the first failure."
                 }),
@@ -4920,7 +9506,8 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 "paths".into(),
                 json!({
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": { "type": "string", "minLength": 1, "maxLength": MCP_MAX_PATH_CHARS },
+                    "maxItems": MCP_MAX_PATH_ITEMS,
                     "description": "Optional paths FluxGit stages before committing. Omit (or pass an empty array) to commit exactly what is already staged."
                 }),
             );
@@ -5025,12 +9612,338 @@ fn tool_input_schema(kind: ToolKind) -> Value {
         }
     }
 
+    // Make required strings genuinely non-empty, and bound all top-level
+    // strings before they can reach Git, the gateway, or the audit log. The
+    // stdio frame limit remains the aggregate ceiling; these field ceilings
+    // provide clearer client errors and contain accidental payload abuse.
+    for field in &required {
+        if let Some(schema) = properties.get_mut(*field).and_then(Value::as_object_mut) {
+            if schema.get("type").and_then(Value::as_str) == Some("string") {
+                schema.entry("minLength").or_insert_with(|| json!(1));
+            }
+        }
+    }
+    for (field, schema) in &mut properties {
+        if let Some(schema) = schema.as_object_mut() {
+            if schema.get("type").and_then(Value::as_str) == Some("string") {
+                let maximum = match field.as_str() {
+                    "patchContent" => MCP_MAX_PATCH_CHARS,
+                    "message" => MCP_MAX_MESSAGE_CHARS,
+                    "repoPath" | "runDir" | "path" => MCP_MAX_PATH_CHARS,
+                    "reason" => MCP_MAX_REASON_CHARS,
+                    _ => MCP_MAX_REF_CHARS,
+                };
+                schema.entry("maxLength").or_insert_with(|| json!(maximum));
+            }
+        }
+    }
+
     json!({
         "type": "object",
         "properties": properties,
         "required": required,
-        "additionalProperties": true,
+        "additionalProperties": false,
     })
+}
+
+fn validate_and_canonicalize_tool_arguments(
+    kind: ToolKind,
+    arguments: &Value,
+) -> Result<Value, JsonRpcError> {
+    let configured = env::var_os(MCP_ALLOWED_ROOTS_ENV);
+    validate_and_canonicalize_tool_arguments_with_config(kind, arguments, configured.as_deref())
+}
+
+fn validate_and_canonicalize_tool_arguments_with_config(
+    kind: ToolKind,
+    arguments: &Value,
+    configured: Option<&std::ffi::OsStr>,
+) -> Result<Value, JsonRpcError> {
+    let schema = tool_input_schema(kind);
+    validate_json_schema_value(arguments, &schema, "arguments")
+        .map_err(|details| invalid_params_error(&details))?;
+    canonicalize_repository_arguments_with_config(arguments, configured)
+}
+
+#[cfg(test)]
+fn validate_repository_access_with_config(
+    arguments: &Value,
+    configured: Option<&std::ffi::OsStr>,
+) -> Result<(), JsonRpcError> {
+    canonicalize_repository_arguments_with_config(arguments, configured).map(|_| ())
+}
+
+fn canonicalize_repository_arguments_with_config(
+    arguments: &Value,
+    configured: Option<&std::ffi::OsStr>,
+) -> Result<Value, JsonRpcError> {
+    let mut canonical_arguments = arguments.clone();
+
+    let roots = match configured {
+        Some(configured) => {
+            if configured.to_string_lossy().trim().is_empty() {
+                return Err(JsonRpcError {
+                    code: -32010,
+                    message: "Invalid MCP allowed-roots configuration".into(),
+                    data: Some(json!({
+                        "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+                        "details": "the configured root list is empty",
+                    })),
+                });
+            }
+            let roots = env::split_paths(configured)
+                .map(|root| {
+                    if root.as_os_str().is_empty() || !root.is_absolute() {
+                        return Err(JsonRpcError {
+                            code: -32010,
+                            message: "Invalid MCP allowed-roots configuration".into(),
+                            data: Some(json!({
+                                "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+                                "details": "each configured root must be a non-empty absolute filesystem path",
+                            })),
+                        });
+                    }
+                    root.canonicalize().map_err(|error| JsonRpcError {
+                        code: -32010,
+                        message: "Invalid MCP allowed-roots configuration".into(),
+                        data: Some(json!({
+                            "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+                            "root": root,
+                            "details": error.to_string(),
+                        })),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if roots.is_empty() {
+                return Err(JsonRpcError {
+                    code: -32010,
+                    message: "Invalid MCP allowed-roots configuration".into(),
+                    data: Some(json!({
+                        "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+                        "details": "the configured root list is empty",
+                    })),
+                });
+            }
+            Some(roots)
+        }
+        None => None,
+    };
+
+    let rewrite = |value: &mut Value| -> Result<(), JsonRpcError> {
+        let raw_path = value
+            .as_str()
+            .ok_or_else(|| invalid_params_error("repoPath values must be strings"))?;
+        let path = Path::new(raw_path);
+        if raw_path.trim().is_empty() || !path.is_absolute() {
+            return Err(invalid_params_error(
+                "repoPath values must be absolute filesystem paths",
+            ));
+        }
+
+        // Without an allowlist, retain backward compatibility for absolute
+        // paths that do not exist yet (notably write-preview requests), while
+        // still canonicalizing every resolvable repository.  With an allowlist
+        // configured, resolution is mandatory: containment cannot be proved
+        // for a missing path and therefore fails closed.
+        let canonical = match path.canonicalize() {
+            Ok(canonical) => canonical,
+            Err(_) if roots.is_none() => return Ok(()),
+            Err(error) => {
+                return Err(JsonRpcError {
+                    code: -32602,
+                    message: "Repository path cannot be resolved".into(),
+                    data: Some(json!({ "details": error.to_string() })),
+                })
+            }
+        };
+        if let Some(roots) = roots.as_deref() {
+            if !canonical_path_is_within_roots(&canonical, roots) {
+                return Err(JsonRpcError {
+                    code: -32011,
+                    message: "Repository path is outside the MCP allowed roots".into(),
+                    data: Some(json!({
+                        "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+                        "repoPathFingerprint": arguments_fingerprint(&Value::String(raw_path.into())),
+                    })),
+                });
+            }
+        }
+        *value = Value::String(canonical.to_string_lossy().into_owned());
+        Ok(())
+    };
+
+    if let Some(object) = canonical_arguments.as_object_mut() {
+        if let Some(repo_path) = object.get_mut("repoPath") {
+            rewrite(repo_path)?;
+        }
+        if let Some(repo_paths) = object.get_mut("repoPaths").and_then(Value::as_array_mut) {
+            for repo_path in repo_paths {
+                rewrite(repo_path)?;
+            }
+        }
+        if let Some(repositories) = object.get_mut("repositories").and_then(Value::as_array_mut) {
+            for repository in repositories {
+                if let Some(repo_path) = repository
+                    .as_object_mut()
+                    .and_then(|repository| repository.get_mut("repoPath"))
+                {
+                    rewrite(repo_path)?;
+                }
+            }
+        }
+    }
+
+    Ok(canonical_arguments)
+}
+
+fn canonical_path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+/// Small, deterministic validator for the JSON-Schema vocabulary used by the
+/// sidecar's own tool contracts. Advertising a schema without enforcing it
+/// made missing fields and wrong types silently turn into empty strings or
+/// defaults before they reached the gateway.
+fn validate_json_schema_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    if let Some(options) = schema.get("anyOf").and_then(Value::as_array) {
+        if !options
+            .iter()
+            .any(|option| validate_json_schema_value(value, option, path).is_ok())
+        {
+            return Err(format!("{path} does not match any allowed schema"));
+        }
+    }
+
+    if let Some(options) = schema.get("oneOf").and_then(Value::as_array) {
+        let matches = options
+            .iter()
+            .filter(|option| validate_json_schema_value(value, option, path).is_ok())
+            .count();
+        if matches != 1 {
+            return Err(format!(
+                "{path} must match exactly one allowed schema (matched {matches})"
+            ));
+        }
+    }
+
+    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
+        let matches = match expected {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "integer" => value
+                .as_number()
+                .is_some_and(|number| number.is_i64() || number.is_u64()),
+            "number" => value.is_number(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        if !matches {
+            return Err(format!("{path} must be {expected}"));
+        }
+    }
+
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.iter().any(|candidate| candidate == value) {
+            return Err(format!("{path} is not one of the allowed values"));
+        }
+    }
+    if let Some(expected) = schema.get("const") {
+        if value != expected {
+            return Err(format!("{path} must equal the required constant"));
+        }
+    }
+
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(format!("{path}.{field} is required"));
+                }
+            }
+        }
+        let properties = schema.get("properties").and_then(Value::as_object);
+        if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+            for field in object.keys() {
+                if !properties.is_some_and(|properties| properties.contains_key(field)) {
+                    return Err(format!("{path}.{field} is not allowed"));
+                }
+            }
+        }
+        if let Some(properties) = properties {
+            for (field, field_schema) in properties {
+                if let Some(field_value) = object.get(field) {
+                    validate_json_schema_value(
+                        field_value,
+                        field_schema,
+                        &format!("{path}.{field}"),
+                    )?;
+                }
+            }
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64) {
+            if array.len() < minimum as usize {
+                return Err(format!("{path} must contain at least {minimum} item(s)"));
+            }
+        }
+        if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64) {
+            if array.len() > maximum as usize {
+                return Err(format!("{path} must contain at most {maximum} item(s)"));
+            }
+        }
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in array.iter().enumerate() {
+                validate_json_schema_value(item, item_schema, &format!("{path}[{index}]"))?;
+            }
+        }
+    }
+
+    if let Some(string) = value.as_str() {
+        let length = string.chars().count() as u64;
+        if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64) {
+            if length < minimum {
+                return Err(format!(
+                    "{path} must contain at least {minimum} character(s)"
+                ));
+            }
+        }
+        if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64) {
+            if length > maximum {
+                return Err(format!(
+                    "{path} must contain at most {maximum} character(s)"
+                ));
+            }
+        }
+        if schema.get("pattern").and_then(Value::as_str) == Some("^[A-Za-z0-9_-]+$")
+            && (string.is_empty()
+                || !string
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err(format!(
+                "{path} must contain only ASCII letters, digits, '_' or '-'"
+            ));
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Err(format!("{path} must be at least {minimum}"));
+            }
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Err(format!("{path} must be at most {maximum}"));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn gateway_not_configured_error(tool: &str) -> JsonRpcError {
@@ -5041,8 +9954,8 @@ fn gateway_not_configured_error(tool: &str) -> JsonRpcError {
             "tool": tool,
             "tier": "fluxgit",
             "gatewayConfigured": false,
-            "reason": "This tool produces FluxGit-only context from restore points or the safety timeline and requires a running FluxGit app with the MCP gateway configured.",
-            "upgradeHint": "Ask the user to install or launch FluxGit, then ensure FLUXGIT_MCP_HANDSHAKE_ADDR is set in the MCP host config. The in-app Agents / MCP settings panel provides a copy-ready config block.",
+            "reason": "This tool produces FluxGit-powered context (restore points, safety timeline, predictive preflight or multi-repo radar) and requires a running FluxGit app with the MCP gateway configured.",
+            "upgradeHint": "Ask the user to install or launch FluxGit, then ensure FLUXGIT_GATEWAY_ADDR is set in the MCP host config. The in-app Agents / MCP settings panel provides a copy-ready config block.",
             "learnMore": "https://fluxgit.com/features/mcp-agent-git/",
             "freeShellAlternative": "Use repo.status, repo.refs, repo.history, repo.reflog, commit.details, worktree.changes, submodule.status, diff.text or diff.semantic (with supported=false fallback) for read-only inspection without FluxGit."
         })),
@@ -5057,14 +9970,14 @@ fn gateway_unavailable_error(tool: &str) -> JsonRpcError {
             "tool": tool,
             "gatewayConfigured": true,
             "reason": "The sidecar could not produce this payload: no absolute repoPath argument was provided for the local read-only fallback, and the configured FluxGit gateway did not serve the request.",
-            "agentRecommendation": "Retry the call with an absolute `repoPath` argument (the local read-only fallback works for every free-shell tool). If the tool requires FluxGit context, ask the user to confirm the FluxGit app is running and reachable at FLUXGIT_MCP_HANDSHAKE_ADDR.",
+            "agentRecommendation": "Retry the call with an absolute `repoPath` argument (the local read-only fallback works for every free-shell tool). If the tool requires FluxGit context, ask the user to confirm the FluxGit app is running and reachable at FLUXGIT_GATEWAY_ADDR.",
             "learnMore": "https://fluxgit.com/features/mcp-agent-git/"
         })),
     }
 }
 
 /// Resolve the gateway handshake address per PLAYBOOK §14.2:
-/// `FLUXGIT_MCP_HANDSHAKE_ADDR` first, then the two legacy gateway names.
+/// `FLUXGIT_MCP_HANDSHAKE_ADDR` first, `FLUXGIT_GATEWAY_ADDR` as fallback.
 fn resolve_handshake_addr() -> Option<String> {
     [
         "FLUXGIT_MCP_HANDSHAKE_ADDR",
@@ -5079,9 +9992,9 @@ fn resolve_handshake_addr() -> Option<String> {
     })
 }
 
-/// Normalize the bridge address and reject non-loopback targets. The bridge
-/// carries repository paths, diffs and proposal intent, so environment values
-/// must never turn it into an outbound HTTP client.
+/// Normalize the bridge location and reject every non-loopback target. The
+/// bridge carries repo paths, diffs and write proposals, so accepting an
+/// arbitrary host here would turn a poisoned environment variable into SSRF.
 fn normalize_loopback_gateway_addr(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -5115,7 +10028,10 @@ fn normalize_loopback_gateway_addr(raw: &str) -> Option<String> {
     }
 }
 
-/// Build bridge clients with the same local-only transport boundary.
+/// Build every HTTP bridge client with the same SSRF boundary. Environment
+/// proxies are ignored because request bodies contain repository paths,
+/// patches, and proposal intent; redirects are never followed; both connect
+/// and whole-request time are bounded.
 fn loopback_bridge_client(
     request_timeout: Duration,
 ) -> Result<reqwest::blocking::Client, reqwest::Error> {
@@ -5128,9 +10044,31 @@ fn loopback_bridge_client(
         .build()
 }
 
-/// Dispatch any of the ten `operation.preview.*` write-handshake requests through
+fn response_json_limited(response: reqwest::blocking::Response) -> io::Result<Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MCP_MAX_BRIDGE_RESPONSE_BYTES as u64)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gateway response exceeds the safe MCP bridge-response limit",
+        ));
+    }
+    let mut reader = response.take(MCP_MAX_BRIDGE_RESPONSE_BYTES as u64 + 1);
+    let mut body = Vec::new();
+    reader.read_to_end(&mut body)?;
+    if body.len() > MCP_MAX_BRIDGE_RESPONSE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gateway response exceeds the safe MCP bridge-response limit",
+        ));
+    }
+    serde_json::from_slice(&body).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Dispatch any of the five `operation.preview.*` write-handshake requests through
 /// the FluxGit gateway over HTTP and poll for its outcome (PLAYBOOK §10 MVP for
-/// merge, §14.7 for the remaining operations).
+/// merge, §14.7 for the remaining four).
 ///
 /// The caller is responsible for assembling the operation-specific body. This
 /// helper only handles the transport: POST to `/v1/mcp/operation/preview/<op>`,
@@ -5151,7 +10089,6 @@ fn dispatch_operation_preview_request(
 ) -> Option<ToolCallResult> {
     let base = format!("http://{}", gateway_addr.trim_end_matches('/'));
     let dispatch_url = format!("{}/v1/mcp/operation/preview/{}", base, op_path_suffix);
-    let status_url = format!("{}/v1/mcp/operation/status/{}", base, preview_id);
 
     let client = match loopback_bridge_client(Duration::from_secs(5)) {
         Ok(client) => client,
@@ -5167,7 +10104,7 @@ fn dispatch_operation_preview_request(
         // cap 429, validation 422, ...). Relay the structured, self-guiding
         // body to the agent instead of collapsing it into the generic 10003.
         let http_status = post_response.status().as_u16();
-        if let Ok(body) = post_response.json::<Value>() {
+        if let Ok(body) = response_json_limited(post_response) {
             if body.get("error").is_some() {
                 return Some(operation_preview_gateway_refusal_result(
                     tool_name,
@@ -5180,91 +10117,80 @@ fn dispatch_operation_preview_request(
         return None;
     }
 
-    // Poll status every 1 second, up to 60 polls while the proposal is
-    // pending. `approved` is PROGRESS, not a terminal state: the UI sets
-    // approved, executes the git operation, then reports completed/failed.
-    // The first pending→approved transition therefore extends the poll
-    // budget once (up to 60 more polls) so execution has time to finish.
-    let poll_client = match loopback_bridge_client(Duration::from_secs(5)) {
-        Ok(client) => client,
-        Err(_) => return None,
-    };
-    let initial_polls = 60usize;
-    let approved_extension = 60usize;
-    let mut max_polls = initial_polls;
-    let mut budget_extended = false;
-    let mut last_status_label = String::from("pending");
-    let mut attempt = 0usize;
-    while attempt < max_polls {
-        attempt += 1;
-        let sleep_if_more = |attempt: usize, max_polls: usize| {
-            if attempt < max_polls {
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        };
-        let response = match poll_client.get(&status_url).send() {
-            Ok(response) => response,
-            Err(_) => {
-                sleep_if_more(attempt, max_polls);
-                continue;
-            }
-        };
-        if !response.status().is_success() {
-            sleep_if_more(attempt, max_polls);
-            continue;
+    // Idempotent replay may return the gateway's already-existing proposal,
+    // whose canonical id can differ from the fresh client-generated id. Always
+    // follow the server id when present or status polling can watch the wrong
+    // proposal forever.
+    let post_body = response_json_limited(post_response).unwrap_or(Value::Null);
+    let effective_preview_id = match post_body.get("previewId").and_then(Value::as_str) {
+        Some(value) if valid_preview_id(value) => value.to_string(),
+        Some(_) => {
+            return Some(text_tool_result(
+                json!({
+                    "tool": tool_name,
+                    "readOnly": false,
+                    "source": "fluxgit-app",
+                    "tier": "fluxgit-write-handshake",
+                    "error": {
+                        "code": 10007,
+                        "message": "FluxGit's gateway returned an invalid previewId.",
+                    }
+                }),
+                true,
+            ));
         }
-        let parsed: Value = match response.json() {
-            Ok(value) => value,
-            Err(_) => {
-                sleep_if_more(attempt, max_polls);
-                continue;
-            }
-        };
+        None => preview_id.to_string(),
+    };
+    let status_url = format!("{}/v1/mcp/operation/status/{}", base, effective_preview_id);
+
+    // Make one bounded status read so gateways that complete synchronously can
+    // return the terminal result. Human approval normally takes longer, so a
+    // live proposal is returned immediately for operation.status to continue.
+    let parsed = client
+        .get(&status_url)
+        .send()
+        .ok()
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response_json_limited(response).ok());
+    if let Some(parsed) = parsed {
         let status_label = parsed
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("pending")
             .to_string();
-        last_status_label = status_label.clone();
         match status_label.as_str() {
             "completed" => {
                 return Some(operation_preview_success_result(
-                    tool_name, preview_id, &parsed,
+                    tool_name,
+                    &effective_preview_id,
+                    &parsed,
                 ));
             }
             "rejected" | "failed" | "expired" | "cancelled" => {
                 return Some(operation_preview_terminal_error_result(
                     tool_name,
                     op_path_suffix,
-                    preview_id,
+                    &effective_preview_id,
                     &status_label,
                     &parsed,
                 ));
             }
-            "approved" => {
-                // Execution has started. Extend the budget exactly once.
-                if !budget_extended {
-                    max_polls = attempt + approved_extension;
-                    budget_extended = true;
-                }
-                sleep_if_more(attempt, max_polls);
-            }
             _ => {
-                // pending or unknown — keep polling unless this was the last attempt.
-                sleep_if_more(attempt, max_polls);
+                return Some(operation_preview_pending_result(
+                    tool_name,
+                    op_path_suffix,
+                    &effective_preview_id,
+                    &status_label,
+                ));
             }
         }
     }
 
-    // Polling stopped without a terminal status. The proposal is still open in
-    // FluxGit (5-minute TTL): tell the agent HOW to learn the real outcome
-    // (operation.status) instead of reporting an opaque failure for an
-    // operation the human may yet approve and complete.
-    Some(operation_preview_timeout_result(
+    Some(operation_preview_pending_result(
         tool_name,
         op_path_suffix,
-        preview_id,
-        &last_status_label,
+        &effective_preview_id,
+        "pending",
     ))
 }
 
@@ -5821,18 +10747,7 @@ fn operation_preview_success_result(
         "status": "completed",
         "data": status_body,
     });
-    ToolCallResult {
-        content: vec![ToolCallContent {
-            kind: "text",
-            text: serde_json::to_string_pretty(&payload).unwrap_or_else(|err| {
-                format!(
-                    "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
-                    err
-                )
-            }),
-        }],
-        is_error: false,
-    }
+    text_tool_result(payload, false)
 }
 
 fn operation_preview_terminal_error_result(
@@ -5866,24 +10781,35 @@ fn operation_preview_terminal_error_result(
             }
         }
     });
-    ToolCallResult {
-        content: vec![ToolCallContent {
-            kind: "text",
-            text: serde_json::to_string_pretty(&payload).unwrap_or_else(|err| {
-                format!(
-                    "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
-                    err
-                )
-            }),
-        }],
-        is_error: true,
-    }
+    text_tool_result(payload, true)
 }
 
-/// Poll budget exhausted without a terminal status. This is NOT a lost
-/// outcome: the proposal lives for 5 minutes on the gateway and the agent
-/// can (and should) keep checking with `operation.status`.
-fn operation_preview_timeout_result(
+fn tool_title(kind: ToolKind) -> String {
+    let mut title = String::with_capacity(kind.as_str().len() + 4);
+    let mut previous_was_lowercase = false;
+    for character in kind.as_str().chars() {
+        if character == '.' {
+            title.push(' ');
+            previous_was_lowercase = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_was_lowercase {
+            title.push(' ');
+        }
+        if title.is_empty() || title.ends_with(' ') {
+            title.push(character.to_ascii_uppercase());
+        } else {
+            title.push(character);
+        }
+        previous_was_lowercase = character.is_ascii_lowercase();
+    }
+    title
+}
+
+/// The proposal was accepted and remains live after the one immediate status
+/// read. Return it as a successful asynchronous result; operation.status is
+/// the authoritative continuation contract.
+fn operation_preview_pending_result(
     tool_name: &'static str,
     op_label: &str,
     preview_id: &str,
@@ -5896,22 +10822,23 @@ fn operation_preview_timeout_result(
         "tier": "fluxgit-write-handshake",
         "previewId": preview_id,
         "status": last_status,
-        "error": {
-            "code": 10003,
+        "accepted": true,
+        "nextAction": {
+            "tool": "operation.status",
             "message": format!(
-                "The {op_label} proposal did not reach a decision before the sidecar stopped polling."
+                "The {op_label} proposal is open in FluxGit for human review."
             ),
             "data": {
                 "previewId": preview_id,
                 "lastStatus": last_status,
-                "reason": "The proposal is still open inside FluxGit (proposals live for 5 minutes). The human may still approve it and FluxGit will execute it — this timeout does NOT mean the operation failed.",
+                "reason": "The proposal is open inside FluxGit (proposals live for 5 minutes). The human can approve it asynchronously; this response does not claim the Git operation completed.",
                 "agentRecommendation": format!(
                     "Poll operation.status with previewId '{preview_id}' to learn the real outcome before telling the user anything, or call operation.cancel with the same previewId to withdraw the proposal if it is no longer wanted."
                 ),
             }
         }
     });
-    text_tool_result(payload, true)
+    text_tool_result(payload, false)
 }
 
 /// The gateway answered the preview POST with a structured refusal
@@ -5944,12 +10871,29 @@ fn operation_preview_gateway_refusal_result(
 
 /// `operation.status` — read-only lookup of a proposal's lifecycle through
 /// the gateway handshake bridge (PLAYBOOK §10.6).
-fn operation_status_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonRpcError> {
+fn checked_preview_id(arguments: &Value) -> Result<&str, JsonRpcError> {
     let preview_id = arguments
         .get("previewId")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid_params_error("missing previewId"))?;
+    if !valid_preview_id(preview_id) {
+        return Err(invalid_params_error(
+            "previewId must be 1-128 ASCII letters, digits, '-' or '_'",
+        ));
+    }
+    Ok(preview_id)
+}
+
+fn valid_preview_id(preview_id: &str) -> bool {
+    !preview_id.is_empty()
+        && preview_id.len() <= 128
+        && preview_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn operation_status_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonRpcError> {
+    let preview_id = checked_preview_id(arguments)?;
     let Some(addr) = resolve_handshake_addr() else {
         return Ok(handshake_unreachable_result(
             ToolKind::OperationStatus,
@@ -5989,7 +10933,7 @@ fn operation_status_tool_call(arguments: &Value) -> Result<ToolCallResult, JsonR
             true,
         ));
     }
-    let body: Value = match response.json() {
+    let body: Value = match response_json_limited(response) {
         Ok(value) => value,
         Err(_) => {
             return Ok(handshake_unreachable_result(
@@ -6016,11 +10960,7 @@ fn operation_cancel_tool_call(
     agent_id: &str,
     arguments: &Value,
 ) -> Result<ToolCallResult, JsonRpcError> {
-    let preview_id = arguments
-        .get("previewId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| invalid_params_error("missing previewId"))?;
+    let preview_id = checked_preview_id(arguments)?;
     let Some(addr) = resolve_handshake_addr() else {
         return Ok(handshake_unreachable_result(
             ToolKind::OperationCancel,
@@ -6059,7 +10999,7 @@ fn operation_cancel_tool_call(
             false,
         ));
     }
-    let body: Value = response.json().unwrap_or(Value::Null);
+    let body: Value = response_json_limited(response).unwrap_or(Value::Null);
     if !(200..300).contains(&http_status) {
         // 403 (not this agent's proposal) or 409 (already decided/expired).
         return Ok(text_tool_result(
@@ -6112,8 +11052,9 @@ fn handshake_unreachable_result(kind: ToolKind, read_only: bool) -> ToolCallResu
     )
 }
 
-/// The gateway does not know this previewId (proposals are in-memory with a
-/// 5-minute TTL; a gateway restart also forgets them). Honest absence.
+/// The gateway does not know this previewId. Proposal lifecycle is journaled
+/// durably, so restart alone is not a reason to re-propose or re-run Git;
+/// Approved/Executing records are recovered for explicit UI reconciliation.
 fn preview_not_found_result(kind: ToolKind, preview_id: &str, read_only: bool) -> ToolCallResult {
     text_tool_result(
         json!({
@@ -6126,8 +11067,8 @@ fn preview_not_found_result(kind: ToolKind, preview_id: &str, read_only: bool) -
                 "message": format!("No proposal with previewId '{preview_id}' exists on the gateway."),
                 "data": {
                     "previewId": preview_id,
-                    "reason": "Proposals are kept in memory on the FluxGit gateway. They disappear after the FluxGit app restarts; expired/decided proposals are still queryable until then.",
-                    "agentRecommendation": "Double-check the previewId. If FluxGit restarted, re-propose the operation with a fresh operation.preview.* call.",
+                    "reason": "FluxGit journals proposal lifecycle durably. Approved and Executing proposals are recovered after restart for explicit UI reconciliation; this previewId is not present in the gateway's current journal view and may be invalid, never accepted, or already pruned after terminal retention.",
+                    "agentRecommendation": "Double-check the previewId and ask the user to inspect Agent Control and Safety Timeline. Do not re-propose or re-run Git blindly: if execution may have started, reconcile the repository outcome in FluxGit first.",
                 }
             }
         }),
@@ -6135,18 +11076,17 @@ fn preview_not_found_result(kind: ToolKind, preview_id: &str, read_only: bool) -
     )
 }
 
-/// Error returned when a write proposal cannot reach the FluxGit handshake
-/// bridge or does not receive a terminal decision within its polling window.
+/// Error returned for write-with-UI-handshake tools (PLAYBOOK §10) that are
+/// advertised in `tools/list` when the local FluxGit bridge is unreachable.
 fn write_handshake_pending_error(tool: &str) -> JsonRpcError {
-    let gateway_configured = resolve_handshake_addr().is_some();
     JsonRpcError {
         code: 10003,
         message: "FluxGit desktop is not connected for the write handshake".into(),
         data: Some(json!({
             "tool": tool,
             "tier": "fluxgit-write-handshake",
-            "gatewayConfigured": gateway_configured,
-            "reason": "This tool proposes a write that FluxGit must preview and the user must approve in the desktop UI. The sidecar could not reach the FluxGit handshake endpoint: either the FluxGit app is not running, FLUXGIT_MCP_HANDSHAKE_ADDR is not set for this MCP server, or the request timed out before the user decided.",
+            "gatewayConfigured": false,
+            "reason": "This tool proposes a write that FluxGit must preview and the user must approve in the desktop UI. The sidecar could not reach the FluxGit handshake endpoint: either the FluxGit app is not running, FLUXGIT_MCP_HANDSHAKE_ADDR is not set for this MCP server, or the local handshake request failed.",
             "agentRecommendation": "Tell the user: 'Open FluxGit and connect this agent from Operations > Agent Control (Quick Connect sets the handshake address), then I can propose this change for your approval.' Retry only after the user confirms FluxGit is running and connected.",
             "learnMore": "https://fluxgit.com/features/mcp-agent-git/"
         })),
@@ -6154,87 +11094,193 @@ fn write_handshake_pending_error(tool: &str) -> JsonRpcError {
 }
 
 fn serialize_response(response: &JsonRpcResponse) -> Vec<u8> {
-    serde_json::to_vec(response).unwrap_or_else(|err| {
-        serde_json::to_vec(&JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: Value::Null,
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32603,
-                message: "Internal error".into(),
-                data: Some(json!({ "details": err.to_string() })),
+    match serde_json::to_vec(response) {
+        Ok(serialized) if serialized.len() <= MCP_MAX_FRAME_BYTES => serialized,
+        Ok(serialized) => serialize_response_error(
+            &response.id,
+            "Response exceeds the MCP frame limit",
+            json!({
+                "details": "The result was replaced before writing stdout so the MCP stdio session can continue safely. Narrow the request or lower its output limit and retry.",
+                "limitBytes": MCP_MAX_FRAME_BYTES,
+                "serializedBytes": serialized.len(),
+                "retryable": true,
             }),
-        })
-        .unwrap_or_else(|_| b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}".to_vec())
+        ),
+        Err(error) => serialize_response_error(
+            &response.id,
+            "Internal response serialization error",
+            json!({ "details": error.to_string(), "retryable": false }),
+        ),
+    }
+}
+
+fn serialize_response_error(id: &Value, message: &str, data: Value) -> Vec<u8> {
+    let fallback = |id: Value| JsonRpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: -32603,
+            message: message.into(),
+            data: Some(data.clone()),
+        }),
+    };
+
+    // Normal request ids are bounded at ingress, so this branch preserves the
+    // exact correlation id. The null-id fallback is only a final defense for
+    // direct library callers that manually construct an impossible response.
+    if let Ok(serialized) = serde_json::to_vec(&fallback(id.clone())) {
+        if serialized.len() <= MCP_MAX_FRAME_BYTES {
+            return serialized;
+        }
+    }
+    serde_json::to_vec(&fallback(Value::Null)).unwrap_or_else(|_| {
+        b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}"
+            .to_vec()
     })
 }
 
 fn read_frame(reader: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
-    let mut first_line = String::new();
-    loop {
-        first_line.clear();
-        let bytes_read = reader.read_line(&mut first_line)?;
-        if bytes_read == 0 {
+    let first_line = loop {
+        let Some(line) = read_bounded_line(reader, MCP_MAX_FRAME_BYTES + 2)? else {
             return Ok(None);
+        };
+        if !trim_line_ending(&line).iter().all(u8::is_ascii_whitespace) {
+            break line;
         }
-        if !first_line.trim().is_empty() {
-            break;
-        }
-    }
+    };
 
-    let first_trimmed = first_line.trim_end_matches(['\r', '\n']);
-    if !first_trimmed.starts_with("Content-Length:") {
-        return Ok(Some(first_trimmed.as_bytes().to_vec()));
-    }
-
-    let mut content_length = None;
-
-    if let Some(value) = first_trimmed.strip_prefix("Content-Length:") {
-        let parsed = value.trim().parse::<usize>().map_err(|err| {
-            io::Error::new(
+    let first_trimmed = trim_line_ending(&first_line);
+    let Some(first_length) = parse_content_length_header(first_trimmed)? else {
+        if first_trimmed.len() > MCP_MAX_FRAME_BYTES {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid content length: {err}"),
-            )
-        })?;
-        content_length = Some(parsed);
-    }
-
-    loop {
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            return Ok(None);
+                format!("MCP frame exceeds the {MCP_MAX_FRAME_BYTES}-byte limit"),
+            ));
         }
+        return Ok(Some(first_trimmed.to_vec()));
+    };
 
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+    if first_trimmed.len() > MCP_MAX_LEGACY_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy MCP header line is too large",
+        ));
+    }
+    let content_length = first_length;
+    let mut total_header_bytes = first_line.len();
+    loop {
+        let Some(line) = read_bounded_line(reader, MCP_MAX_LEGACY_HEADER_BYTES)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "legacy MCP frame ended before its header terminator",
+            ));
+        };
+        total_header_bytes = total_header_bytes.saturating_add(line.len());
+        if total_header_bytes > MCP_MAX_LEGACY_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy MCP header block is too large",
+            ));
+        }
+        let trimmed = trim_line_ending(&line);
         if trimmed.is_empty() {
             break;
         }
-
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            let parsed = value.trim().parse::<usize>().map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid content length: {err}"),
-                )
-            })?;
-            content_length = Some(parsed);
+        if parse_content_length_header(trimmed)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate Content-Length headers are not allowed",
+            ));
         }
     }
 
-    let content_length = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
-    })?;
-
+    if content_length > MCP_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("MCP frame exceeds the {MCP_MAX_FRAME_BYTES}-byte limit"),
+        ));
+    }
     let mut body = vec![0_u8; content_length];
     reader.read_exact(&mut body)?;
     Ok(Some(body))
 }
 
 fn write_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    write!(writer, "Content-Length: {}\r\n\r\n", payload.len())?;
+    if payload.len() > MCP_MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("MCP frame exceeds the {MCP_MAX_FRAME_BYTES}-byte limit"),
+        ));
+    }
+    if payload.contains(&b'\n') || payload.contains(&b'\r') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "newline-delimited MCP output cannot contain a literal newline",
+        ));
+    }
     writer.write_all(payload)?;
+    writer.write_all(b"\n")?;
     writer.flush()
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("MCP line exceeds the {limit}-byte limit"),
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        let ended = available[take - 1] == b'\n';
+        reader.consume(take);
+        if ended {
+            return Ok(Some(line));
+        }
+    }
+}
+
+fn trim_line_ending(mut line: &[u8]) -> &[u8] {
+    while line
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
+fn parse_content_length_header(line: &[u8]) -> io::Result<Option<usize>> {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return Ok(None);
+    };
+    let Some((name, value)) = line.split_once(':') else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case("Content-Length") {
+        return Ok(None);
+    }
+    let length = value.trim().parse::<usize>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid Content-Length: {error}"),
+        )
+    })?;
+    Ok(Some(length))
 }
 
 #[cfg(test)]
@@ -6251,58 +11297,38 @@ mod tests {
 
     static TEST_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    /// Serializes mutation of the process-wide bridge variables so dispatch and
-    /// configuration tests cannot race when cargo runs the suite in parallel.
+    /// Serializes mutation of process-wide env vars (FLUXGIT_GATEWAY_ADDR) across the
+    /// operation.preview.merge dispatch tests so they can't race each other when cargo
+    /// runs the test suite in parallel.
     static GATEWAY_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static AUDIT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    const GATEWAY_ENV_VARS: [&str; 3] = [
-        "FLUXGIT_MCP_HANDSHAKE_ADDR",
-        "FLUXGIT_GATEWAY_ADDR",
-        "FLUXGIT_GATEWAY_URL",
-    ];
-
-    struct GatewayEnvGuard {
-        previous: Vec<(&'static str, Option<String>)>,
+    struct AuditEnvGuard {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
-    impl GatewayEnvGuard {
-        fn set(value: &str) -> Self {
-            Self::set_named("FLUXGIT_GATEWAY_ADDR", value)
-        }
-
-        fn set_canonical(value: &str) -> Self {
-            Self::set_named("FLUXGIT_MCP_HANDSHAKE_ADDR", value)
-        }
-
-        fn set_named(name: &'static str, value: &str) -> Self {
-            let guard = GATEWAY_ENV_LOCK
+    impl AuditEnvGuard {
+        fn isolated(run_dir: &Path, signing_key: Option<&Path>) -> Self {
+            let guard = AUDIT_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = GATEWAY_ENV_VARS
+            let names = [
+                "FLUXGIT_RUN_DIR",
+                "FLUXGIT_MCP_AUDIT_LOG",
+                "FLUXGIT_MCP_AUDIT_DISABLED",
+                "FLUXGIT_MCP_AUDIT_SIGN_KEY",
+            ];
+            let previous = names
                 .iter()
-                .map(|variable| (*variable, env::var(variable).ok()))
+                .map(|name| (*name, env::var_os(name)))
                 .collect();
-            for variable in GATEWAY_ENV_VARS {
-                env::remove_var(variable);
-            }
-            env::set_var(name, value);
-            Self {
-                previous,
-                _guard: guard,
-            }
-        }
-
-        fn unset() -> Self {
-            let guard = GATEWAY_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = GATEWAY_ENV_VARS
-                .iter()
-                .map(|variable| (*variable, env::var(variable).ok()))
-                .collect();
-            for variable in GATEWAY_ENV_VARS {
-                env::remove_var(variable);
+            env::set_var("FLUXGIT_RUN_DIR", run_dir);
+            env::remove_var("FLUXGIT_MCP_AUDIT_LOG");
+            env::remove_var("FLUXGIT_MCP_AUDIT_DISABLED");
+            match signing_key {
+                Some(path) => env::set_var("FLUXGIT_MCP_AUDIT_SIGN_KEY", path),
+                None => env::remove_var("FLUXGIT_MCP_AUDIT_SIGN_KEY"),
             }
             Self {
                 previous,
@@ -6311,7 +11337,7 @@ mod tests {
         }
     }
 
-    impl Drop for GatewayEnvGuard {
+    impl Drop for AuditEnvGuard {
         fn drop(&mut self) {
             for (name, value) in &self.previous {
                 match value {
@@ -6322,57 +11348,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn canonical_handshake_address_marks_gateway_configured() {
-        let _env = GatewayEnvGuard::set_canonical("127.0.0.1:59647");
-        let server = McpSidecar::from_env();
-        assert!(matches!(server.gateway_state, GatewayState::Configured));
-        assert_eq!(resolve_handshake_addr().as_deref(), Some("127.0.0.1:59647"));
+    struct GatewayEnvGuard {
+        previous: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
     }
 
-    #[test]
-    fn blank_gateway_addresses_are_not_configured() {
-        let _env = GatewayEnvGuard::set_canonical("   ");
-        let server = McpSidecar::from_env();
-        assert!(matches!(server.gateway_state, GatewayState::NotConfigured));
-        assert_eq!(resolve_handshake_addr(), None);
+    impl GatewayEnvGuard {
+        fn set(value: &str) -> Self {
+            let guard = GATEWAY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = env::var("FLUXGIT_GATEWAY_ADDR").ok();
+            env::set_var("FLUXGIT_GATEWAY_ADDR", value);
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
+
+        fn unset() -> Self {
+            let guard = GATEWAY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = env::var("FLUXGIT_GATEWAY_ADDR").ok();
+            env::remove_var("FLUXGIT_GATEWAY_ADDR");
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
     }
 
-    #[test]
-    fn gateway_resolution_prefers_canonical_then_supports_legacy_url() {
-        let _env = GatewayEnvGuard::unset();
-        env::set_var("FLUXGIT_MCP_HANDSHAKE_ADDR", "127.0.0.1:59647");
-        env::set_var("FLUXGIT_GATEWAY_ADDR", "127.0.0.1:59648");
-        assert_eq!(resolve_handshake_addr().as_deref(), Some("127.0.0.1:59647"));
-
-        env::remove_var("FLUXGIT_MCP_HANDSHAKE_ADDR");
-        env::remove_var("FLUXGIT_GATEWAY_ADDR");
-        env::set_var("FLUXGIT_GATEWAY_URL", "http://127.0.0.1:59649/");
-        assert_eq!(resolve_handshake_addr().as_deref(), Some("127.0.0.1:59649"));
-    }
-
-    #[test]
-    fn gateway_address_resolution_is_loopback_only() {
-        assert_eq!(
-            normalize_loopback_gateway_addr("http://127.0.0.1:59647/"),
-            Some("127.0.0.1:59647".into())
-        );
-        assert_eq!(
-            normalize_loopback_gateway_addr("[::1]:59647"),
-            Some("[::1]:59647".into())
-        );
-        for rejected in [
-            "https://127.0.0.1:59647",
-            "http://localhost:59647",
-            "http://192.0.2.1:59647",
-            "http://127.0.0.1:59647/path",
-            "http://user@127.0.0.1:59647",
-        ] {
-            assert_eq!(
-                normalize_loopback_gateway_addr(rejected),
-                None,
-                "{rejected} must be rejected"
-            );
+    impl Drop for GatewayEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var("FLUXGIT_GATEWAY_ADDR", value),
+                None => env::remove_var("FLUXGIT_GATEWAY_ADDR"),
+            }
         }
     }
 
@@ -6382,10 +11394,225 @@ mod tests {
             .unwrap()
             .as_nanos();
         let sequence = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        env::temp_dir().join(format!(
+        // Resolve the temp root before building the path.
+        //
+        // The audit ledger refuses to write when any directory component is a
+        // symlink -- correct, since a link planted in the chain could redirect
+        // the log. On macOS `env::temp_dir()` is /var/folders/... and /var is a
+        // symlink to /private/var on every Mac, so every audit test refused its
+        // own scratch directory. The guard is unix-only, which is why this
+        // passed on Windows and could not pass here.
+        // Unix only. The problem it solves is a unix one, and on Windows
+        // canonicalize returns an extended-length \\?\ path, which changes how
+        // ancestors iterate and how paths compare -- a fix on one platform
+        // becoming a hazard on another.
+        #[cfg(unix)]
+        let root = fs::canonicalize(env::temp_dir()).unwrap_or_else(|_| env::temp_dir());
+        #[cfg(not(unix))]
+        let root = env::temp_dir();
+        root.join(format!(
             "{prefix}-{}-{nonce}-{sequence}",
             std::process::id()
         ))
+    }
+
+    fn modern_request_meta() -> Value {
+        json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "fluxgit-sidecar-tests",
+                    "version": "1.0",
+                }
+            }
+        })
+    }
+
+    /// Focused JSON Schema validator for the output-contract keywords emitted
+    /// by this crate. Keeping it local to tests avoids raising the Rust 1.75
+    /// dependency floor merely to test schemas we construct ourselves.
+    fn validate_output_schema(schema: &Value, value: &Value) -> Result<(), String> {
+        validate_output_schema_at(schema, value, "$")
+    }
+
+    fn validate_output_schema_at(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+        if let Some(expected) = schema.get("const") {
+            if value != expected {
+                return Err(format!("{path}: expected const {expected}, got {value}"));
+            }
+        }
+        if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
+            if !variants.iter().any(|candidate| candidate == value) {
+                return Err(format!("{path}: {value} is not in enum {variants:?}"));
+            }
+        }
+        if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
+            let matches = match expected_type {
+                "object" => value.is_object(),
+                "array" => value.is_array(),
+                "string" => value.is_string(),
+                "integer" => value
+                    .as_number()
+                    .is_some_and(|number| number.is_i64() || number.is_u64()),
+                "number" => value.is_number(),
+                "boolean" => value.is_boolean(),
+                "null" => value.is_null(),
+                other => return Err(format!("{path}: unsupported test schema type {other}")),
+            };
+            if !matches {
+                return Err(format!(
+                    "{path}: expected type {expected_type}, got {value}"
+                ));
+            }
+        }
+
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            let object = value
+                .as_object()
+                .ok_or_else(|| format!("{path}: required applies to a non-object"))?;
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(format!("{path}: missing required property {field}"));
+                }
+            }
+        }
+        if let (Some(properties), Some(object)) = (
+            schema.get("properties").and_then(Value::as_object),
+            value.as_object(),
+        ) {
+            for (field, field_schema) in properties {
+                if let Some(field_value) = object.get(field) {
+                    validate_output_schema_at(
+                        field_schema,
+                        field_value,
+                        &format!("{path}.{field}"),
+                    )?;
+                }
+            }
+        }
+
+        if let Some(text) = value.as_str() {
+            let length = text.chars().count() as u64;
+            if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64) {
+                if length < minimum {
+                    return Err(format!("{path}: string length {length} < {minimum}"));
+                }
+            }
+            if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64) {
+                if length > maximum {
+                    return Err(format!("{path}: string length {length} > {maximum}"));
+                }
+            }
+            if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
+                let matches = match pattern {
+                    "^[A-Za-z0-9_-]+$" => text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+                    "^[a-z][a-z0-9_-]*$" => {
+                        let mut bytes = text.bytes();
+                        bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+                            && bytes.all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || matches!(byte, b'-' | b'_')
+                            })
+                    }
+                    other => {
+                        return Err(format!("{path}: unsupported test schema pattern {other}"))
+                    }
+                };
+                if !matches {
+                    return Err(format!("{path}: string does not match {pattern}"));
+                }
+            }
+            if schema.get("format").and_then(Value::as_str) == Some("date-time")
+                && chrono::DateTime::parse_from_rfc3339(text).is_err()
+            {
+                return Err(format!("{path}: string is not an RFC 3339 date-time"));
+            }
+        }
+
+        if let Some(number) = value.as_f64() {
+            if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+                if number < minimum {
+                    return Err(format!("{path}: number {number} < {minimum}"));
+                }
+            }
+            if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+                if number > maximum {
+                    return Err(format!("{path}: number {number} > {maximum}"));
+                }
+            }
+        }
+
+        if let Some(items) = value.as_array() {
+            if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64) {
+                if items.len() < minimum as usize {
+                    return Err(format!("{path}: {} items < {minimum}", items.len()));
+                }
+            }
+            if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64) {
+                if items.len() > maximum as usize {
+                    return Err(format!("{path}: {} items > {maximum}", items.len()));
+                }
+            }
+            if let Some(item_schema) = schema.get("items") {
+                for (index, item) in items.iter().enumerate() {
+                    validate_output_schema_at(item_schema, item, &format!("{path}[{index}]"))?;
+                }
+            }
+        }
+
+        if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
+            let failures = branches
+                .iter()
+                .filter_map(|branch| validate_output_schema_at(branch, value, path).err())
+                .collect::<Vec<_>>();
+            if failures.len() == branches.len() {
+                return Err(format!(
+                    "{path}: no anyOf branch matched ({})",
+                    failures.join(" | ")
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn assert_tool_result_contract(tool_name: &str, response: &Value) {
+        let Some(result) = response.get("result") else {
+            // Argument/schema failures are JSON-RPC errors, not MCP tool
+            // results, and therefore have no structuredContent to validate.
+            return;
+        };
+        let Some(structured) = result.get("structuredContent") else {
+            panic!("modern {tool_name} result omitted structuredContent: {response:?}");
+        };
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool_name} result omitted text content"));
+        let parsed_text: Value = serde_json::from_str(text)
+            .unwrap_or_else(|error| panic!("{tool_name} text is not JSON: {error}"));
+        assert_eq!(
+            parsed_text, *structured,
+            "{tool_name} text and structuredContent must carry the same payload"
+        );
+
+        let kind = ToolKind::from_name(tool_name).expect("known test tool");
+        let read_only = READ_ONLY_TOOL_KINDS.contains(&kind);
+        let schema = tool_output_schema(kind, read_only);
+        if let Err(error) = validate_output_schema(&schema, structured) {
+            panic!(
+                "{tool_name} structuredContent violated outputSchema: {error}\npayload={structured}\nschema={schema}"
+            );
+        }
+
+        assert_eq!(
+            result["isError"].as_bool(),
+            Some(structured.get("error").is_some()),
+            "{tool_name} must set isError exactly when its structured payload is an error"
+        );
     }
 
     #[test]
@@ -6411,6 +11638,286 @@ mod tests {
     }
 
     #[test]
+    fn modern_discovery_advertises_dual_era_capabilities() {
+        let server = McpSidecar::new_for_tests(false);
+        let response = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": "discover-1",
+                "method": "server/discover",
+                "params": modern_request_meta(),
+            }))
+            .unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        let result = &response["result"];
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"][0], LATEST_PROTOCOL_VERSION);
+        assert!(result["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|version| version == LEGACY_PROTOCOL_VERSION));
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+        assert!(result.get("serverInfo").is_none());
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            SERVER_NAME
+        );
+        assert_eq!(result["cacheScope"], "public");
+        assert!(result["ttlMs"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn modern_requests_require_supported_version_and_capabilities() {
+        let server = McpSidecar::new_for_tests(false);
+        let unsupported = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }}
+            }))
+            .unwrap();
+        let unsupported = serde_json::to_value(unsupported).unwrap();
+        assert_eq!(unsupported["error"]["code"], -32022);
+        assert_eq!(unsupported["error"]["data"]["requested"], "2099-01-01");
+
+        let missing_capabilities = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+                }}
+            }))
+            .unwrap();
+        let missing_capabilities = serde_json::to_value(missing_capabilities).unwrap();
+        assert_eq!(missing_capabilities["error"]["code"], -32602);
+
+        let malformed_client_info = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/list",
+                "params": { "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": { "name": "missing-version" },
+                }}
+            }))
+            .unwrap();
+        let malformed_client_info = serde_json::to_value(malformed_client_info).unwrap();
+        assert_eq!(malformed_client_info["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn modern_and_legacy_results_only_expose_members_valid_for_their_era() {
+        let server = McpSidecar::new_for_tests(false);
+        let legacy = server
+            .handle_value(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+            }))
+            .unwrap();
+        let legacy = serde_json::to_value(legacy).unwrap();
+        assert!(legacy["result"].get("resultType").is_none());
+        let legacy_tools = legacy["result"]["tools"].as_array().unwrap();
+        assert_eq!(legacy_tools.len(), 34);
+        assert!(legacy_tools
+            .iter()
+            .all(|tool| tool.get("outputSchema").is_none()));
+        assert!(legacy_tools
+            .iter()
+            .all(|tool| tool.get("annotations").is_none()));
+
+        let modern = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": modern_request_meta(),
+            }))
+            .unwrap();
+        let modern = serde_json::to_value(modern).unwrap();
+        assert_eq!(modern["result"]["resultType"], "complete");
+        assert_eq!(modern["result"]["cacheScope"], "public");
+        assert_eq!(modern["result"]["tools"].as_array().unwrap().len(), 34);
+        assert_eq!(
+            modern["result"]["tools"][0]["outputSchema"]["type"],
+            "object"
+        );
+        assert_eq!(
+            modern["result"]["tools"][0]["annotations"]["readOnlyHint"],
+            true
+        );
+        assert!(modern["result"]["tools"][0]["title"].is_string());
+    }
+
+    #[test]
+    fn tools_list_rejects_non_empty_cursor_in_both_protocol_eras() {
+        let server = McpSidecar::new_for_tests(false);
+        let legacy = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": { "cursor": "page-2" },
+            }))
+            .unwrap();
+        let legacy = serde_json::to_value(legacy).unwrap();
+        assert_eq!(legacy["error"]["code"], -32602);
+        assert!(legacy["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("single complete page"));
+
+        let mut modern_params = modern_request_meta();
+        modern_params["cursor"] = json!("page-2");
+        let modern = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": modern_params,
+            }))
+            .unwrap();
+        let modern = serde_json::to_value(modern).unwrap();
+        assert_eq!(modern["error"]["code"], -32602);
+
+        // Missing/null/empty all mean "the one complete page" and preserve
+        // compatibility with hosts that always serialize a cursor member.
+        for cursor in [Value::Null, json!("")] {
+            let response = server
+                .handle_value(json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/list",
+                    "params": { "cursor": cursor },
+                }))
+                .unwrap();
+            let response = serde_json::to_value(response).unwrap();
+            assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 34);
+            assert!(response["result"].get("nextCursor").is_none());
+        }
+    }
+
+    #[test]
+    fn notifications_are_silent_and_request_ids_are_strict() {
+        let server = McpSidecar::new_for_tests(false);
+        assert!(server
+            .handle_value(json!({
+                "jsonrpc": "2.0", "method": "unknown/notification", "params": {}
+            }))
+            .is_none());
+        assert!(server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": { "name": "operation.preview.reset", "arguments": {} }
+            }))
+            .is_none());
+
+        for invalid_id in [json!(null), json!(true), json!(1.5), json!({"x": 1})] {
+            let response = server
+                .handle_value(json!({
+                    "jsonrpc": "2.0", "id": invalid_id, "method": "ping"
+                }))
+                .unwrap();
+            let response = serde_json::to_value(response).unwrap();
+            assert_eq!(response["error"]["code"], -32600);
+            assert!(response["id"].is_null());
+        }
+
+        let response = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": "x".repeat(MCP_MAX_REQUEST_ID_BYTES + 1),
+                "method": "ping"
+            }))
+            .unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response["id"].is_null());
+    }
+
+    #[test]
+    fn modern_tool_calls_return_structured_content_and_server_metadata() {
+        let repo = fixture_repo();
+        let server = McpSidecar::new_for_tests(false);
+        let mut params = modern_request_meta();
+        params["name"] = json!("repo.status");
+        params["arguments"] = json!({ "repoPath": repo.path() });
+        let response = server
+            .handle_value(json!({
+                "jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": params
+            }))
+            .unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        assert_tool_result_contract("repo.status", &response);
+        assert_eq!(response["result"]["resultType"], "complete");
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["tool"],
+            "repo.status"
+        );
+        assert_eq!(
+            response["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            SERVER_NAME
+        );
+    }
+
+    #[test]
+    fn preview_terminal_error_matches_its_advertised_contract() {
+        let result = operation_preview_terminal_error_result(
+            ToolKind::OperationPreviewMerge.as_str(),
+            "merge",
+            "p-terminal-1",
+            "rejected",
+            &json!({
+                "previewId": "p-terminal-1",
+                "operationType": "merge",
+                "status": "rejected",
+                "rejectionReason": "The reviewer chose another approach",
+            }),
+        );
+        let response = json!({ "result": result });
+        assert_tool_result_contract(ToolKind::OperationPreviewMerge.as_str(), &response);
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            response["result"]["structuredContent"]["status"],
+            "rejected"
+        );
+    }
+
+    #[test]
+    fn status_and_cancel_schemas_accept_legacy_empty_success_bodies() {
+        // Both bridge helpers relay a successful 2xx JSON body verbatim. Old
+        // custom loopback bridges sometimes returned JSON null; advertise the
+        // official typed object while keeping that real compatibility path.
+        for (kind, read_only, status) in [
+            (ToolKind::OperationStatus, true, None),
+            (ToolKind::OperationCancel, false, Some("cancelled")),
+        ] {
+            let mut payload = json!({
+                "tool": kind.as_str(),
+                "readOnly": read_only,
+                "source": "fluxgit-app",
+                "tier": "fluxgit-write-handshake",
+                "previewId": "p-legacy-null",
+                "data": null,
+            });
+            if let Some(status) = status {
+                payload["status"] = json!(status);
+            }
+            validate_output_schema(&tool_output_schema(kind, read_only), &payload)
+                .unwrap_or_else(|error| panic!("{} rejected legacy null: {error}", kind.as_str()));
+        }
+    }
+
+    #[test]
     fn stdio_transport_accepts_newline_delimited_json_rpc_and_writes_mcp_frames() {
         let mut input =
             io::Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n");
@@ -6428,7 +11935,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "Content-Length: 46\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}"
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n"
         );
     }
 
@@ -6440,6 +11947,98 @@ mod tests {
 
         let frame = read_frame(&mut input).unwrap().unwrap();
         assert_eq!(frame, body);
+    }
+
+    #[test]
+    fn stdio_transport_rejects_oversized_or_ambiguous_frames_before_allocating_body() {
+        let oversized = format!("Content-Length: {}\r\n\r\n", MCP_MAX_FRAME_BYTES + 1);
+        let error = read_frame(&mut io::Cursor::new(oversized.into_bytes())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let ambiguous = b"Content-Length: 2\r\nContent-Length: 3\r\n\r\n{}";
+        let error = read_frame(&mut io::Cursor::new(ambiguous)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let duplicate = b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}";
+        let error = read_frame(&mut io::Cursor::new(duplicate)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut header_bomb = String::from("Content-Length: 2\r\n");
+        for _ in 0..100 {
+            header_bomb.push_str("X-Fill: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+        header_bomb.push_str("\r\n{}");
+        let error = read_frame(&mut io::Cursor::new(header_bomb.into_bytes())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let mut output = Vec::new();
+        let error = write_frame(&mut output, b"{}\n{}").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn outbound_guard_preserves_id_and_keeps_the_stdio_session_writable() {
+        let make_response = |id: Value, blob_bytes: usize| {
+            let tool_result = text_tool_result(
+                json!({
+                    "tool": "repo.status",
+                    "readOnly": true,
+                    "source": "local-git",
+                    "repoPath": "C:\\repo",
+                    "data": { "blob": "x".repeat(blob_bytes) },
+                }),
+                false,
+            );
+            JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!(tool_result)),
+                error: None,
+            }
+        };
+
+        // A bridge response at its own cap still leaves room for both modern
+        // representations and preserves the normal text/structured contract.
+        let normal = serialize_response(&make_response(
+            json!("bridge-near-cap"),
+            MCP_MAX_BRIDGE_RESPONSE_BYTES - 1_024,
+        ));
+        assert!(normal.len() < MCP_MAX_FRAME_BYTES);
+        let normal_json: Value = serde_json::from_slice(&normal).unwrap();
+        assert!(normal_json.get("error").is_none());
+        let normal_text: Value = serde_json::from_str(
+            normal_json["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(normal_text, normal_json["result"]["structuredContent"]);
+
+        // A result whose duplicated modern representation crosses the 8 MiB
+        // wire ceiling is replaced with a compact correlated error. write_frame
+        // then succeeds, and a following response can still be emitted.
+        let oversized = serialize_response(&make_response(
+            json!("oversized-request-77"),
+            MCP_MAX_FRAME_BYTES / 2,
+        ));
+        assert!(oversized.len() < MCP_MAX_FRAME_BYTES);
+        let oversized_json: Value = serde_json::from_slice(&oversized).unwrap();
+        assert_eq!(oversized_json["id"], "oversized-request-77");
+        assert_eq!(oversized_json["error"]["code"], -32603);
+        assert!(oversized_json["error"]["data"]["serializedBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > MCP_MAX_FRAME_BYTES as u64));
+
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &oversized).unwrap();
+        let following = serialize_response(&JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: json!("after-oversized"),
+            result: Some(json!({})),
+            error: None,
+        });
+        write_frame(&mut wire, &following).unwrap();
+        assert_eq!(wire.iter().filter(|byte| **byte == b'\n').count(), 2);
     }
 
     // A "read-only" tool that hands an agent-supplied rev straight to git as
@@ -6492,26 +12091,32 @@ mod tests {
     }
 
     #[test]
-    fn the_same_request_retried_carries_the_same_idempotency_key() {
-        // The gateway's find_active_by_idempotency was correct and dead: the
-        // sidecar never sent a key, so a retrying agent produced one approval
-        // card per attempt and then a 429 — the approval fatigue the per-agent
-        // cap exists to prevent.
-        let args = json!({ "repoPath": "/tmp/r", "sourceRef": "feature", "targetRef": "main" });
-        let a = idempotency_key_for("merge", &args).expect("a key");
-        let b = idempotency_key_for("merge", &args).expect("a key");
+    fn explicit_idempotency_keys_dedupe_retries_but_unkeyed_calls_are_new_intents() {
+        let keyed_args = json!({
+            "repoPath": "/tmp/r",
+            "sourceRef": "feature",
+            "targetRef": "main",
+            "idempotencyKey": "intent-42"
+        });
+        let a = idempotency_key_for("merge", &keyed_args).expect("a key");
+        let b = idempotency_key_for("merge", &keyed_args).expect("a key");
         assert_eq!(
             a, b,
-            "the same request must reuse its card, not mint a new one"
+            "an explicit retry key must reuse the same gateway proposal"
         );
 
-        // A different operation over identical arguments is a different card.
-        let other_op = idempotency_key_for("rebase", &args).expect("a key");
+        // The same caller key cannot alias a different operation type.
+        let other_op = idempotency_key_for("rebase", &keyed_args).expect("a key");
         assert_ne!(a, other_op);
 
-        // And a different request is genuinely different.
-        let other_args = json!({ "repoPath": "/tmp/r", "sourceRef": "other", "targetRef": "main" });
-        assert_ne!(a, idempotency_key_for("merge", &other_args).expect("a key"));
+        // Two identical calls without an explicit key are new intentions. This
+        // prevents a retained terminal record from suppressing a legitimate
+        // commit/push after repository state changes.
+        let unkeyed_args =
+            json!({ "repoPath": "/tmp/r", "sourceRef": "feature", "targetRef": "main" });
+        let first_intent = idempotency_key_for("merge", &unkeyed_args).expect("a key");
+        let second_intent = idempotency_key_for("merge", &unkeyed_args).expect("a key");
+        assert_ne!(first_intent, second_intent);
 
         // Null arguments carry no key rather than a misleading constant one.
         assert!(idempotency_key_for("merge", &Value::Null).is_none());
@@ -6550,6 +12155,495 @@ mod tests {
     }
 
     #[test]
+    fn client_attribution_is_bounded_and_sanitized() {
+        assert_eq!(
+            client_id_from_info(Some(&json!({ "name": "  claude code\r\nadmin  " }))),
+            Some("claude-code-admin".to_string())
+        );
+        let long = "a".repeat(500);
+        let sanitized = client_id_from_info(Some(&json!({ "name": long }))).unwrap();
+        assert_eq!(sanitized.len(), 128);
+        assert!(client_id_from_info(Some(&json!({ "name": "💥" }))).is_none());
+    }
+
+    #[test]
+    fn gateway_bridge_accepts_only_explicit_loopback_http_endpoints() {
+        assert_eq!(
+            normalize_loopback_gateway_addr("127.0.0.1:8765"),
+            Some("127.0.0.1:8765".to_string())
+        );
+        assert_eq!(
+            normalize_loopback_gateway_addr("http://[::1]:8765"),
+            Some("[::1]:8765".to_string())
+        );
+        for rejected in [
+            "https://127.0.0.1:8765",
+            "http://localhost:8765",
+            "http://10.0.0.2:8765",
+            "http://example.com:8765",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8765/admin",
+            "http://user@127.0.0.1:8765",
+        ] {
+            assert_eq!(
+                normalize_loopback_gateway_addr(rejected),
+                None,
+                "{rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_bridge_client_does_not_follow_redirects() {
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let destination_addr = destination.local_addr().unwrap();
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_addr = redirect.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{destination_addr}/exfiltrate\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let response = loopback_bridge_client(Duration::from_secs(2))
+            .unwrap()
+            .get(format!("http://{redirect_addr}/proposal"))
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+        responder.join().unwrap();
+        assert!(matches!(
+            destination.accept(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn loopback_bridge_client_ignores_environment_proxies() {
+        use std::sync::atomic::AtomicBool;
+
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let target_server = thread::spawn(move || {
+            let (mut stream, _) = target.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let header = header.trim_end_matches(['\r', '\n']);
+                if header.is_empty() {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            body_tx.send(String::from_utf8(body).unwrap()).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+        });
+
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        let proxy_hit = Arc::new(AtomicBool::new(false));
+        let proxy_stop = Arc::new(AtomicBool::new(false));
+        let hit = Arc::clone(&proxy_hit);
+        let stop = Arc::clone(&proxy_stop);
+        let proxy_server = thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                match proxy.accept() {
+                    Ok((mut stream, _)) => {
+                        hit.store(true, Ordering::Release);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let proxy_url = format!("http://{proxy_addr}");
+        let status = Command::new(env::current_exe().unwrap())
+            .arg("tests::loopback_proxy_child_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("FLUXGIT_TEST_LOOPBACK_PROXY_ROLE", "child")
+            .env("FLUXGIT_TEST_LOOPBACK_TARGET", target_addr.to_string())
+            .env("HTTP_PROXY", &proxy_url)
+            .env("http_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .unwrap();
+        proxy_stop.store(true, Ordering::Release);
+        proxy_server.join().unwrap();
+        target_server.join().unwrap();
+        assert!(status.success());
+        assert!(!proxy_hit.load(Ordering::Acquire));
+        let body = body_rx.recv().unwrap();
+        assert!(body.contains("MCP_PROXY_SECRET_SENTINEL"));
+    }
+
+    #[test]
+    fn loopback_proxy_child_helper() {
+        if env::var("FLUXGIT_TEST_LOOPBACK_PROXY_ROLE").as_deref() != Ok("child") {
+            return;
+        }
+        let target = env::var("FLUXGIT_TEST_LOOPBACK_TARGET").unwrap();
+        let response = fetch_semantic_diff_from_gateway(
+            &target,
+            "repo-proxy-test",
+            Path::new("C:/MCP_PROXY_SECRET_SENTINEL/repo"),
+            "HEAD~1",
+            "HEAD",
+            &["MCP_PROXY_SECRET_SENTINEL.txt".to_string()],
+        );
+        assert_eq!(response, Some(json!({})));
+    }
+
+    #[test]
+    fn hardened_git_boundary_removes_repo_config_helper_and_pager_overrides() {
+        let inherited = [
+            ("GIT_DIR", "C:/redirected/.git"),
+            ("GIT_WORK_TREE", "C:/redirected"),
+            ("GIT_COMMON_DIR", "C:/redirected/common"),
+            ("GIT_INDEX_FILE", "C:/redirected/index"),
+            ("GIT_OBJECT_DIRECTORY", "C:/redirected/objects"),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "C:/alternate"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.bare"),
+            ("GIT_CONFIG_VALUE_0", "true"),
+            ("GIT_EXEC_PATH", "C:/helpers"),
+            ("GIT_EXTERNAL_DIFF", "malicious-diff"),
+            ("GIT_ASKPASS", "malicious-askpass"),
+            ("GIT_PAGER", "malicious-pager"),
+            ("GCM_INTERACTIVE", "always"),
+            ("SSH_ASKPASS", "malicious-ssh-askpass"),
+            ("PAGER", "malicious-pager"),
+            ("LD_PRELOAD", "malicious-library"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect::<Vec<(std::ffi::OsString, std::ffi::OsString)>>();
+        let mut command = Command::new("git");
+        remove_untrusted_git_environment(&mut command, inherited);
+        let changes = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_ascii_uppercase(),
+                    value.map(|value| value.to_os_string()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_EXEC_PATH",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_ASKPASS",
+            "GIT_PAGER",
+            "GCM_INTERACTIVE",
+            "SSH_ASKPASS",
+            "PAGER",
+            "LD_PRELOAD",
+        ] {
+            assert_eq!(changes.get(key), Some(&None), "{key} must be removed");
+        }
+
+        let hardened = hardened_git_command(Path::new("C:/explicit-repo"), &["status"])
+            .expect("safe absolute Git executable");
+        let controlled = hardened
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_ascii_uppercase(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            controlled.get("GIT_OPTIONAL_LOCKS"),
+            Some(&Some("0".to_string()))
+        );
+        assert_eq!(
+            controlled.get("GIT_TERMINAL_PROMPT"),
+            Some(&Some("0".to_string()))
+        );
+        assert_eq!(
+            controlled.get("GIT_CONFIG_NOSYSTEM"),
+            Some(&Some("1".to_string()))
+        );
+        let args = hardened
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        for required in [
+            "--no-pager",
+            "--no-optional-locks",
+            "--no-replace-objects",
+            "--literal-pathspecs",
+        ] {
+            assert!(args.iter().any(|arg| arg == required));
+        }
+    }
+
+    #[test]
+    fn hardened_git_boundary_fails_on_output_cap_and_timeout() {
+        let repo = fixture_repo();
+        let capped = execute_git(
+            repo.path(),
+            &["rev-parse", "HEAD"],
+            8,
+            8,
+            Duration::from_secs(2),
+        );
+        let capped = match capped {
+            Err(error) => error,
+            Ok(_) => panic!("oversized complete output must fail closed"),
+        };
+        let capped_details = capped.data.unwrap()["details"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            capped_details.contains("no partial result was returned as complete"),
+            "unexpected cap failure: {capped_details}"
+        );
+
+        let timed_out = execute_git(
+            repo.path(),
+            &["rev-parse", "HEAD"],
+            128,
+            128,
+            Duration::ZERO,
+        );
+        let timed_out = match timed_out {
+            Err(error) => error,
+            Ok(_) => panic!("zero-duration deadline must terminate Git"),
+        };
+        assert!(timed_out.data.unwrap()["details"]
+            .as_str()
+            .unwrap()
+            .contains("timeout"));
+    }
+
+    #[test]
+    fn git_resolution_rejects_a_malicious_executable_in_the_working_directory() {
+        let repo = fixture_repo();
+        let attacker_dir = TestDir::new("fluxgit-mcp-path-poison");
+        let fake_git = attacker_dir
+            .path()
+            .join(if cfg!(windows) { "git.exe" } else { "git" });
+        fs::write(&fake_git, b"malicious executable sentinel").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert!(validate_git_executable_candidate(
+            fake_git.clone(),
+            repo.path(),
+            attacker_dir.path(),
+            false,
+        )
+        .is_none());
+        let command = hardened_git_command(repo.path(), &["status", "--short"]).unwrap();
+        let program = PathBuf::from(command.get_program());
+        assert!(program.is_absolute());
+        assert_ne!(
+            fs::canonicalize(program).unwrap(),
+            fs::canonicalize(fake_git).unwrap(),
+            "a Git executable from the process working directory was selected"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn descendant_held_output_pipe_is_killed_and_readers_always_join() {
+        let test_dir = TestDir::new("fluxgit-mcp-git-descendant");
+        let marker = test_dir.path().join("descendant-survived");
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .arg("tests::git_pipe_descendant_parent_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("FLUXGIT_TEST_GIT_PIPE_ROLE", "parent")
+            .env("FLUXGIT_TEST_GIT_PIPE_MARKER", &marker)
+            .stdin(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let started = Instant::now();
+        let error = match execute_git_command(
+            command,
+            &["descendant-held-pipe-test"],
+            1024,
+            1024,
+            Duration::from_secs(5),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a descendant-held pipe must fail closed"),
+        };
+        assert!(error.data.unwrap()["details"]
+            .as_str()
+            .unwrap()
+            .contains("descendant retained an output pipe"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "pipe cancellation waited for the hostile descendant"
+        );
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert!(
+            !marker.exists(),
+            "the descendant survived process-tree termination"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn descendant_that_closes_output_is_still_killed_on_successful_git_exit() {
+        let test_dir = TestDir::new("fluxgit-mcp-git-closed-pipes");
+        let marker = test_dir.path().join("closed-pipe-descendant-survived");
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .arg("tests::git_pipe_descendant_parent_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("FLUXGIT_TEST_GIT_PIPE_ROLE", "parent")
+            .env("FLUXGIT_TEST_GIT_PIPE_MARKER", &marker)
+            .env("FLUXGIT_TEST_GIT_PIPE_CLOSE_OUTPUT", "1")
+            .env("FLUXGIT_TEST_GIT_PIPE_DELAY_MS", "2000")
+            .stdin(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let output = execute_git_command(
+            command,
+            &["descendant-closed-pipe-test"],
+            1024,
+            1024,
+            Duration::from_secs(5),
+        )
+        .expect("the direct helper exits successfully with closed descendant pipes");
+        assert!(output.status.success());
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(
+            !marker.exists(),
+            "a pipe-closing descendant survived the successful command boundary"
+        );
+    }
+
+    // This helper intentionally detaches its child so the production process
+    // boundary, not the test harness, must reap/kill the process tree.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn git_pipe_descendant_parent_helper() {
+        if env::var("FLUXGIT_TEST_GIT_PIPE_ROLE").as_deref() != Ok("parent") {
+            return;
+        }
+        let mut command = Command::new(env::current_exe().unwrap());
+        command
+            .arg("tests::git_pipe_descendant_grandchild_helper")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("FLUXGIT_TEST_GIT_PIPE_ROLE", "grandchild")
+            .env(
+                "FLUXGIT_TEST_GIT_PIPE_MARKER",
+                env::var_os("FLUXGIT_TEST_GIT_PIPE_MARKER").unwrap(),
+            );
+        if env::var_os("FLUXGIT_TEST_GIT_PIPE_CLOSE_OUTPUT").is_some() {
+            #[cfg(windows)]
+            unsafe {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::Foundation::{
+                    SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+                };
+                // Model a helper that deliberately closes both captured
+                // streams instead of retaining inheritable duplicates.
+                let _ = SetHandleInformation(
+                    std::io::stdout().as_raw_handle() as HANDLE,
+                    HANDLE_FLAG_INHERIT,
+                    0,
+                );
+                let _ = SetHandleInformation(
+                    std::io::stderr().as_raw_handle() as HANDLE,
+                    HANDLE_FLAG_INHERIT,
+                    0,
+                );
+            }
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        command.spawn().expect("spawn process-tree test descendant");
+    }
+
+    #[test]
+    fn git_pipe_descendant_grandchild_helper() {
+        if env::var("FLUXGIT_TEST_GIT_PIPE_ROLE").as_deref() != Ok("grandchild") {
+            return;
+        }
+        let delay = env::var("FLUXGIT_TEST_GIT_PIPE_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000);
+        std::thread::sleep(Duration::from_millis(delay));
+        fs::write(
+            PathBuf::from(env::var_os("FLUXGIT_TEST_GIT_PIPE_MARKER").unwrap()),
+            b"survived",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn preview_ids_cannot_escape_gateway_endpoint_paths() {
+        for rejected in ["", "../status", "a/b", "a?x=1", "white space"] {
+            let error = checked_preview_id(&json!({ "previewId": rejected })).unwrap_err();
+            assert_eq!(error.code, -32602);
+        }
+        assert_eq!(
+            checked_preview_id(&json!({ "previewId": "p_123-safe" })).unwrap(),
+            "p_123-safe"
+        );
+    }
+
+    #[test]
     fn a_repo_id_cannot_escape_the_run_directory() {
         // Demonstrated against the real binary before the fix: repoId
         // "../../secret" made flux.restorePoints return restoreCount 1 and echo
@@ -6566,6 +12660,157 @@ mod tests {
         // A normal id still resolves, or the tools would simply stop working.
         let ok = flux_checkpoint_path("repo-1", &args).expect("a plain id must resolve");
         assert!(ok.ends_with("rebase/repo-1.json"), "got {ok:?}");
+    }
+
+    #[test]
+    fn canonical_repo_paths_are_constrained_to_configured_roots() {
+        let allowed = TestDir::new("fluxgit-mcp-allowed-root");
+        let inside = allowed.path().join("team").join("repo");
+        fs::create_dir_all(&inside).unwrap();
+        let outside = TestDir::new("fluxgit-mcp-outside-root");
+        let roots = vec![allowed.path().canonicalize().unwrap()];
+        assert!(canonical_path_is_within_roots(
+            &inside.canonicalize().unwrap(),
+            &roots
+        ));
+        assert!(!canonical_path_is_within_roots(
+            &outside.path().canonicalize().unwrap(),
+            &roots
+        ));
+
+        let configured = env::join_paths([allowed.path()]).unwrap();
+        assert!(validate_repository_access_with_config(
+            &json!({ "repoPath": inside }),
+            Some(&configured)
+        )
+        .is_ok());
+        let denied = validate_repository_access_with_config(
+            &json!({ "repoPath": outside.path() }),
+            Some(&configured),
+        )
+        .unwrap_err();
+        assert_eq!(denied.code, -32011);
+        assert!(denied.data.unwrap().get("repoPathFingerprint").is_some());
+
+        let relative_config = env::join_paths([Path::new("relative-root")]).unwrap();
+        let invalid_config = validate_repository_access_with_config(
+            &json!({ "repoPath": inside }),
+            Some(&relative_config),
+        )
+        .unwrap_err();
+        assert_eq!(invalid_config.code, -32010);
+
+        let second = allowed.path().join("other-repo");
+        fs::create_dir(&second).unwrap();
+        let lexical_inside = inside.join("..").join("repo");
+        let fleet = validate_and_canonicalize_tool_arguments_with_config(
+            ToolKind::FleetRadar,
+            &json!({
+                "repoPaths": [lexical_inside],
+                "repositories": [{ "repoPath": second, "label": "second" }]
+            }),
+            Some(&configured),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(fleet["repoPaths"][0].as_str().unwrap()),
+            inside.canonicalize().unwrap()
+        );
+        assert_eq!(
+            Path::new(fleet["repositories"][0]["repoPath"].as_str().unwrap()),
+            second.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_allowed_repo_is_dispatched_even_after_alias_retarget() {
+        let allowed = TestDir::new("fluxgit-mcp-canonical-dispatch-root");
+        let canonical_repo = allowed.path().join("canonical-repo");
+        fs::create_dir(&canonical_repo).unwrap();
+        let outside = TestDir::new("fluxgit-mcp-canonical-dispatch-outside");
+        let alias = allowed.path().join("repo-alias");
+        let alias_was_symlink = match test_symlink_dir(&canonical_repo, &alias) {
+            Ok(()) => true,
+            Err(error) => {
+                // Creating directory symlinks can require an OS capability that
+                // is intentionally unavailable on locked-down Windows builders.
+                // Such builders still exercise canonical dispatch through a
+                // lexical alias; Unix failures remain real test failures.
+                #[cfg(windows)]
+                {
+                    eprintln!("testing lexical alias without symlink privilege: {error}");
+                    false
+                }
+                #[cfg(unix)]
+                panic!("create repository alias: {error}");
+            }
+        };
+        let requested_path = if alias_was_symlink {
+            alias.clone()
+        } else {
+            let intermediate = allowed.path().join("intermediate");
+            fs::create_dir(&intermediate).unwrap();
+            intermediate.join("..").join("canonical-repo")
+        };
+
+        let configured = env::join_paths([allowed.path()]).unwrap();
+        let arguments = validate_and_canonicalize_tool_arguments_with_config(
+            ToolKind::OperationPreviewMerge,
+            &json!({
+                "repoPath": requested_path,
+                "sourceRef": "feature/canonical",
+                "targetRef": "main",
+                "reason": "prove canonical dispatch"
+            }),
+            Some(&configured),
+        )
+        .expect("the alias initially resolves inside the allowed root");
+        let expected = canonical_repo.canonicalize().unwrap();
+        assert_eq!(Path::new(arguments["repoPath"].as_str().unwrap()), expected);
+
+        // Retarget the original alias outside the allowlist after validation.
+        // Dispatch must continue to use the captured canonical target, never
+        // look the alias up a second time.
+        if alias_was_symlink {
+            remove_test_dir_symlink(&alias).unwrap();
+            test_symlink_dir(outside.path(), &alias).unwrap();
+        }
+
+        let (addr, body_rx) =
+            spawn_operation_gateway_mock("merge", "completed", json!({ "ok": true }));
+        let result = dispatch_operation_preview_merge(&addr, "canonical-test-agent", &arguments);
+        assert!(result.is_some());
+        let dispatched = body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive canonical proposal");
+        assert_eq!(
+            Path::new(dispatched["repoPath"].as_str().unwrap()),
+            expected
+        );
+        assert_ne!(
+            Path::new(dispatched["repoPath"].as_str().unwrap()),
+            outside.path().canonicalize().unwrap()
+        );
+
+        if alias_was_symlink {
+            remove_test_dir_symlink(&alias).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_repo_paths_reject_drive_relative_roots_but_accept_absolute_unc() {
+        let root_relative =
+            validate_repository_access_with_config(&json!({ "repoPath": r"\repo" }), None)
+                .unwrap_err();
+        assert_eq!(root_relative.code, -32602);
+        assert!(root_relative.message.contains("Invalid params"));
+
+        assert!(validate_repository_access_with_config(
+            &json!({ "repoPath": r"\\server\share\repo" }),
+            None,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -6615,10 +12860,16 @@ mod tests {
             .handle_value(json!({
                 "jsonrpc": "2.0",
                 "id": 2,
-                "method": "tools/list"
+                "method": "tools/list",
+                "params": modern_request_meta(),
             }))
             .unwrap();
         let response = serde_json::to_value(response).unwrap();
+
+        assert!(
+            serde_json::to_vec(&response).unwrap().len() < MCP_MAX_FRAME_BYTES,
+            "the fully typed 34-tool catalog must fit in one MCP frame"
+        );
 
         let tools = response["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools
@@ -6674,8 +12925,8 @@ mod tests {
             ]
         );
 
-        // Advertisement counts pinned: 23 read-only + 10 write proposals
-        // + operation.cancel = 34 tools.
+        // Advertisement counts pinned: 23 read-only + 11 write-handshake = 34.
+        // operation.status is read-only; operation.cancel mutates proposal state.
         assert_eq!(tools.len(), 34, "34 tools must be advertised");
         assert_eq!(
             tools
@@ -6685,8 +12936,45 @@ mod tests {
             23,
             "exactly 23 tools must advertise readOnlyHint: true"
         );
+        for tool in tools {
+            let output_schema = &tool["outputSchema"];
+            assert_eq!(
+                output_schema["$schema"],
+                "https://json-schema.org/draft/2020-12/schema"
+            );
+            assert_eq!(
+                output_schema["properties"]["tool"]["const"], tool["name"],
+                "structured output must identify the exact tool"
+            );
+            assert_eq!(
+                output_schema["properties"]["readOnly"]["const"],
+                tool["annotations"]["readOnlyHint"],
+                "the machine-readable output envelope must match the safety annotation"
+            );
+            assert_eq!(output_schema["required"], json!(["tool", "readOnly"]));
+            let data = &output_schema["properties"]["data"];
+            assert_ne!(
+                data,
+                &json!({}),
+                "{} must not advertise generic data",
+                tool["name"]
+            );
+            assert!(
+                data.get("type").is_some() || data.get("anyOf").is_some(),
+                "{} data schema must describe an object or explicit variants: {data}",
+                tool["name"]
+            );
+            assert!(
+                output_schema["anyOf"]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "{} must advertise success/error lifecycle variants",
+                tool["name"]
+            );
+        }
 
-        // Verify all ten proposals plus cancellation advertise readOnlyHint: false.
+        // Verify all 11 write-handshake tools advertise readOnlyHint: false
+        // (10 operation.preview.* proposals + the write-adjacent cancel).
         for handshake_name in [
             "operation.preview.merge",
             "operation.preview.rebase",
@@ -6707,6 +12995,16 @@ mod tests {
             assert_eq!(
                 tool["annotations"]["readOnlyHint"], false,
                 "{handshake_name} must advertise readOnlyHint: false"
+            );
+            assert_eq!(
+                tool["annotations"]["idempotentHint"],
+                handshake_name == "operation.cancel",
+                "only cancellation is strongly idempotent across lifecycle retention"
+            );
+            assert_eq!(
+                tool["annotations"]["openWorldHint"],
+                handshake_name == "operation.preview.push",
+                "only push crosses the local FluxGit boundary"
             );
         }
 
@@ -6766,29 +13064,26 @@ mod tests {
         assert_eq!(cancel_tool["annotations"]["readOnlyHint"], false);
         assert_eq!(cancel_tool["inputSchema"]["required"], json!(["previewId"]));
 
-        // destructiveHint: true only on the two work-destroying proposals.
+        // Pin every write hint explicitly: MCP defaults destructiveHint to
+        // true when omitted, so absence would make additive tools ambiguous.
         for (name, expect_destructive) in [
+            ("operation.preview.merge", true),
+            ("operation.preview.rebase", true),
             ("operation.preview.reset", true),
             ("operation.preview.discard", true),
-            ("operation.preview.merge", false),
+            ("operation.preview.patch", true),
+            ("operation.preview.plan", true),
+            ("operation.preview.push", true),
             ("operation.preview.worktree", false),
             ("operation.preview.commit", false),
-            ("operation.preview.push", false),
             ("operation.preview.branch", false),
-            ("repo.status", false),
+            ("operation.cancel", false),
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
-            if expect_destructive {
-                assert_eq!(
-                    tool["annotations"]["destructiveHint"], true,
-                    "{name} must advertise destructiveHint: true"
-                );
-            } else {
-                assert!(
-                    tool["annotations"].get("destructiveHint").is_none(),
-                    "{name} must not carry a destructiveHint"
-                );
-            }
+            assert_eq!(
+                tool["annotations"]["destructiveHint"], expect_destructive,
+                "{name} has the wrong destructiveHint"
+            );
         }
         let fleet_schema = tools
             .iter()
@@ -6798,16 +13093,15 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("attention stack"));
-        assert!(fleet_schema["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item == "repoPaths"));
-        assert!(fleet_schema["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item != "repoPath"));
+        assert_eq!(fleet_schema["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            fleet_schema["inputSchema"]["anyOf"][0]["required"],
+            json!(["repoPaths"])
+        );
+        assert_eq!(
+            fleet_schema["inputSchema"]["anyOf"][1]["required"],
+            json!(["repositories"])
+        );
         let stack_schema = tools
             .iter()
             .find(|tool| tool["name"] == "repo.branchStack")
@@ -6876,8 +13170,8 @@ mod tests {
         let payload = tool_payload(&response);
         assert_eq!(payload["source"], "local-git");
         assert_eq!(
-            payload["repoPath"].as_str(),
-            Some(repo.path().to_string_lossy().as_ref())
+            Path::new(payload["repoPath"].as_str().unwrap()),
+            repo.path().canonicalize().unwrap()
         );
     }
 
@@ -6922,7 +13216,8 @@ mod tests {
             .handle_value(json!({
                 "jsonrpc": "2.0",
                 "id": 30,
-                "method": "tools/list"
+                "method": "tools/list",
+                "params": modern_request_meta(),
             }))
             .unwrap();
         let listed = serde_json::to_value(listed).unwrap();
@@ -6945,7 +13240,7 @@ mod tests {
         ] {
             assert!(
                 !listed_names.contains(&blocked_tool),
-                "{blocked_tool} must not be advertised by the read-only MCP sidecar"
+                "direct-write tool {blocked_tool} must not be advertised by the safe MCP surface"
             );
 
             let response = server
@@ -7007,6 +13302,76 @@ mod tests {
         assert!(event["args_fingerprint"]
             .as_str()
             .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
+    }
+
+    #[test]
+    fn audit_append_rejects_records_above_the_verifier_line_limit() {
+        let audit_dir = TestDir::new("fluxgit-mcp-audit-line-limit");
+        let audit_log = audit_dir.path().join("mcp.jsonl");
+        let ledger = AuditLedger::new(audit_log.clone(), None).unwrap();
+        let error = ledger
+            .append(json!({ "oversized": "x".repeat(AUDIT_MAX_LINE_BYTES) }))
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum JSONL line"));
+        assert!(!audit_log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_append_uses_private_permissions_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let audit_dir = TestDir::new("fluxgit-mcp-private-audit");
+        let nested = audit_dir.path().join("private");
+        let audit_log = nested.join("mcp.jsonl");
+        let server = McpSidecar::new_for_tests_with_audit(false, audit_log.clone());
+        server.append_audit_event(json!({ "tool": "repo.status" }));
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&audit_log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let target = audit_dir.path().join("target.jsonl");
+        fs::write(&target, b"sentinel\n").unwrap();
+        let link = audit_dir.path().join("linked.jsonl");
+        symlink(&target, &link).unwrap();
+        let error = AuditLedger::new(link, None)
+            .unwrap()
+            .append(json!({ "tool": "must-not-follow" }))
+            .unwrap_err();
+        assert!(error.to_string().contains("symlink") || error.to_string().contains("reparse"));
+        assert_eq!(fs::read(&target).unwrap(), b"sentinel\n");
+
+        let hard_target = audit_dir.path().join("hard-target.jsonl");
+        fs::write(&hard_target, b"hardlink-sentinel\n").unwrap();
+        let hard_link = audit_dir.path().join("hard-linked.jsonl");
+        fs::hard_link(&hard_target, &hard_link).unwrap();
+        let error = AuditLedger::new(hard_link, None)
+            .unwrap()
+            .append(json!({ "tool": "must-not-hardlink" }))
+            .unwrap_err();
+        // The message is "must not be hard-linked"; asserting "hard link" with a
+        // space never matched. This test is unix-only (there is a separate
+        // windows variant), so it could not fail on the machine it was written on.
+        assert!(error.to_string().contains("hard-linked"), "got: {error}");
+        assert_eq!(fs::read(&hard_target).unwrap(), b"hardlink-sentinel\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_append_rejects_windows_hardlinks() {
+        let audit_dir = TestDir::new("fluxgit-mcp-hardlink-audit");
+        let target = audit_dir.path().join("target.jsonl");
+        fs::write(&target, b"hardlink-sentinel\n").unwrap();
+        let link = audit_dir.path().join("linked.jsonl");
+        fs::hard_link(&target, &link).unwrap();
+        let server = McpSidecar::new_for_tests_with_audit(false, link.clone());
+        server.append_audit_event(json!({ "tool": "must-not-hardlink" }));
+        assert_eq!(fs::read(&target).unwrap(), b"hardlink-sentinel\n");
     }
 
     #[test]
@@ -7919,7 +14284,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_gateway_without_repo_path_still_returns_structured_error() {
+    fn configured_gateway_without_repo_path_is_rejected_by_the_advertised_schema() {
         let result = call_tool(
             "repo.status",
             json!({
@@ -7928,12 +14293,189 @@ mod tests {
             true,
         );
 
-        assert!(result.get("error").is_none());
-        assert_eq!(result["result"]["isError"], true);
-        let payload: Value =
-            serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(payload["error"]["code"], 10002);
-        assert_eq!(payload["error"]["data"]["gatewayConfigured"], true);
+        assert_eq!(result["error"]["code"], -32602);
+        assert!(result["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("repoPath"));
+    }
+
+    #[test]
+    fn enforced_tool_schemas_reject_empty_unknown_and_incomplete_plan_inputs() {
+        let empty_ref = call_tool(
+            "operation.preview.merge",
+            json!({
+                "repoPath": "/tmp/example",
+                "sourceRef": "",
+                "targetRef": "main",
+                "reason": "validate before dispatch"
+            }),
+            true,
+        );
+        assert_eq!(empty_ref["error"]["code"], -32602);
+        assert!(empty_ref["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("sourceRef"));
+
+        let unsafe_idempotency_key = call_tool(
+            "operation.preview.merge",
+            json!({
+                "repoPath": "/tmp/example",
+                "sourceRef": "feature/x",
+                "targetRef": "main",
+                "reason": "validate retry key before dispatch",
+                "idempotencyKey": "not a safe key"
+            }),
+            true,
+        );
+        assert_eq!(unsafe_idempotency_key["error"]["code"], -32602);
+        assert!(unsafe_idempotency_key["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("idempotencyKey"));
+
+        let unknown = call_tool(
+            "repo.status",
+            json!({ "repoPath": "/tmp/example", "execute": true }),
+            false,
+        );
+        assert_eq!(unknown["error"]["code"], -32602);
+        assert!(unknown["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("execute"));
+
+        let incomplete_plan = call_tool(
+            "operation.preview.plan",
+            json!({
+                "repoPath": "/tmp/example",
+                "reason": "missing the merge target",
+                "steps": [{ "operationType": "merge", "sourceRef": "feature/x" }]
+            }),
+            true,
+        );
+        assert_eq!(incomplete_plan["error"]["code"], -32602);
+        assert!(incomplete_plan["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one"));
+
+        let merge_with_rebase_semantics = call_tool(
+            "operation.preview.merge",
+            json!({
+                "repoPath": "/tmp/example",
+                "sourceRef": "feature/x",
+                "targetRef": "main",
+                "strategy": "rebase",
+                "reason": "must use the dedicated rebase contract"
+            }),
+            true,
+        );
+        assert_eq!(merge_with_rebase_semantics["error"]["code"], -32602);
+        assert!(merge_with_rebase_semantics["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("strategy"));
+
+        let plan_with_rebase_merge_strategy = call_tool(
+            "operation.preview.plan",
+            json!({
+                "repoPath": "/tmp/example",
+                "reason": "invalid mixed semantics",
+                "steps": [{
+                    "operationType": "merge",
+                    "sourceRef": "feature/x",
+                    "targetRef": "main",
+                    "strategy": "rebase"
+                }]
+            }),
+            true,
+        );
+        assert_eq!(plan_with_rebase_merge_strategy["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn preview_contracts_bound_nested_refs_patches_paths_and_messages() {
+        let plan = tool_input_schema(ToolKind::OperationPreviewPlan);
+        let step = &plan["properties"]["steps"]["items"]["properties"];
+        for field in ["sourceRef", "targetRef", "currentRef", "ontoRef"] {
+            assert_eq!(step[field]["minLength"], 1, "{field} must be non-empty");
+            assert_eq!(step[field]["maxLength"], MCP_MAX_REF_CHARS);
+        }
+        assert_eq!(step["patchContent"]["minLength"], 1);
+        assert_eq!(step["patchContent"]["maxLength"], MCP_MAX_PATCH_CHARS);
+        assert_eq!(step["paths"]["maxItems"], MCP_MAX_PATH_ITEMS);
+        assert_eq!(step["paths"]["items"]["maxLength"], MCP_MAX_PATH_CHARS);
+
+        let discard = tool_input_schema(ToolKind::OperationPreviewDiscard);
+        assert_eq!(
+            discard["properties"]["paths"]["maxItems"],
+            MCP_MAX_PATH_ITEMS
+        );
+        assert_eq!(
+            discard["properties"]["paths"]["items"]["maxLength"],
+            MCP_MAX_PATH_CHARS
+        );
+        let commit = tool_input_schema(ToolKind::OperationPreviewCommit);
+        assert_eq!(
+            commit["properties"]["message"]["maxLength"],
+            MCP_MAX_MESSAGE_CHARS
+        );
+        assert_eq!(
+            commit["properties"]["paths"]["maxItems"],
+            MCP_MAX_PATH_ITEMS
+        );
+        let patch = tool_input_schema(ToolKind::OperationPreviewPatch);
+        assert_eq!(
+            patch["properties"]["patchContent"]["maxLength"],
+            MCP_MAX_PATCH_CHARS
+        );
+        assert_eq!(
+            patch["properties"]["reason"]["maxLength"],
+            MCP_MAX_REASON_CHARS
+        );
+
+        let nested_empty_patch = call_tool(
+            "operation.preview.plan",
+            json!({
+                "repoPath": "/tmp/example",
+                "reason": "nested bounds",
+                "steps": [{ "operationType": "patch", "patchContent": "" }]
+            }),
+            true,
+        );
+        assert_eq!(nested_empty_patch["error"]["code"], -32602);
+        assert!(nested_empty_patch["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("patchContent"));
+
+        let oversized_nested_ref = call_tool(
+            "operation.preview.plan",
+            json!({
+                "repoPath": "/tmp/example",
+                "reason": "nested bounds",
+                "steps": [{
+                    "operationType": "merge",
+                    "sourceRef": "x".repeat(MCP_MAX_REF_CHARS + 1),
+                    "targetRef": "main"
+                }]
+            }),
+            true,
+        );
+        assert_eq!(oversized_nested_ref["error"]["code"], -32602);
+
+        let invalid_preview_id = call_tool(
+            "operation.status",
+            json!({ "previewId": "contains/slash" }),
+            true,
+        );
+        assert_eq!(invalid_preview_id["error"]["code"], -32602);
+        assert!(invalid_preview_id["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("ASCII"));
     }
 
     #[test]
@@ -8102,7 +14644,6 @@ mod tests {
             "safety.eventDetails",
             json!({
                 "repoPath": repo.path(),
-                "limit": 5,
             }),
             true,
         ));
@@ -8162,7 +14703,38 @@ mod tests {
             .contains("FluxGit app"));
     }
 
-    fn call_tool(name: &str, arguments: Value, gateway_configured: bool) -> Value {
+    fn platform_test_repo_path(path: &str) -> String {
+        if cfg!(windows) && path.starts_with('/') {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
+    fn normalize_test_repo_paths(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(Value::String(path)) = object.get_mut("repoPath") {
+                    *path = platform_test_repo_path(path);
+                }
+                for child in object.values_mut() {
+                    normalize_test_repo_paths(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    normalize_test_repo_paths(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn call_tool(name: &str, mut arguments: Value, gateway_configured: bool) -> Value {
+        // Cross-platform fixtures historically use POSIX-looking /tmp paths.
+        // Convert only repoPath fields on Windows so production validation can
+        // enforce Path::is_absolute without weakening the test contract.
+        normalize_test_repo_paths(&mut arguments);
         let server = McpSidecar::new_for_tests(gateway_configured);
         let response = server
             .handle_value(json!({
@@ -8170,12 +14742,18 @@ mod tests {
                 "id": 42,
                 "method": "tools/call",
                 "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
                     "name": name,
                     "arguments": arguments,
                 }
             }))
             .unwrap();
-        serde_json::to_value(response).unwrap()
+        let response = serde_json::to_value(response).unwrap();
+        assert_tool_result_contract(name, &response);
+        response
     }
 
     fn tool_payload(response: &Value) -> Value {
@@ -8224,6 +14802,18 @@ mod tests {
         fn new(prefix: &str) -> Self {
             let path = unique_test_temp_path(prefix);
             fs::create_dir(&path).unwrap();
+            // Private, like the directory production creates for itself.
+            //
+            // secure_audit_directory only applies 0700 to a directory it just
+            // created; one that already exists must already be private or the
+            // append is refused. `fs::create_dir` uses the default 0755, so
+            // every audit test handed the ledger a directory it was right to
+            // reject. Unix-only, which is why this passed on Windows.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Self { path }
         }
 
@@ -8236,6 +14826,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[cfg(unix)]
+    fn test_symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn test_symlink_dir(target: &Path, link: &Path) -> io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(unix)]
+    fn remove_test_dir_symlink(link: &Path) -> io::Result<()> {
+        fs::remove_file(link)
+    }
+
+    #[cfg(windows)]
+    fn remove_test_dir_symlink(link: &Path) -> io::Result<()> {
+        fs::remove_dir(link)
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -8320,11 +14930,7 @@ mod tests {
             "flux.restorePointDetails",
         ];
         for tool in required_tools {
-            let response = call_tool(
-                tool,
-                json!({ "repoPath": repo.path(), "eventId": "evt-0", "restorePointId": "rp-0" }),
-                false,
-            );
+            let response = call_tool(tool, json!({ "repoPath": repo.path() }), false);
             assert_eq!(
                 response["result"]["isError"], true,
                 "tool {tool} should error without gateway"
@@ -8366,6 +14972,49 @@ mod tests {
             assert_eq!(
                 response["result"]["isError"], false,
                 "tool {tool} should work without gateway"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_refs_never_exposes_remote_url_credentials_in_any_mcp_or_audit_surface() {
+        let repo = fixture_repo();
+        let userinfo_secret = "MCP_USERINFO_SECRET_SENTINEL";
+        let query_secret = "MCP_QUERY_SECRET_SENTINEL";
+        let remote_url = format!(
+            "https://alice:{userinfo_secret}@example.invalid/repo.git?access_token={query_secret}#private"
+        );
+        git(repo.path(), &["remote", "add", "origin", &remote_url]);
+        let audit_dir = TestDir::new("fluxgit-mcp-remote-redaction-audit");
+        let audit_log = audit_dir.path().join("mcp.jsonl");
+        let server = McpSidecar::new_for_tests_with_audit(false, audit_log.clone());
+        let mut params = modern_request_meta();
+        params["name"] = json!("repo.refs");
+        params["arguments"] = json!({ "repoPath": repo.path() });
+        let response = server
+            .handle_value(json!({
+                "jsonrpc": "2.0",
+                "id": 991,
+                "method": "tools/call",
+                "params": params,
+            }))
+            .unwrap();
+        let response_value = serde_json::to_value(response).unwrap();
+        assert_eq!(response_value["result"]["isError"], false);
+        assert_eq!(
+            response_value["result"]["structuredContent"]["data"]["remotes"],
+            json!(["origin"])
+        );
+        let all_response_surfaces = serde_json::to_string(&response_value).unwrap();
+        let audit = fs::read_to_string(audit_log).unwrap();
+        for secret in [userinfo_secret, query_secret, "alice:"] {
+            assert!(
+                !all_response_surfaces.contains(secret),
+                "repo.refs leaked remote credentials through text, structuredContent, or error"
+            );
+            assert!(
+                !audit.contains(secret),
+                "repo.refs leaked remote credentials through audit"
             );
         }
     }
@@ -8481,7 +15130,7 @@ mod tests {
             }],
             "pathsTruncated": false,
         }));
-        let _env = GatewayEnvGuard::set_canonical(&addr);
+        let _env = GatewayEnvGuard::set(&addr);
 
         let payload = tool_payload(&call_tool(
             "diff.semantic",
@@ -8698,7 +15347,8 @@ mod tests {
             .handle_value(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "tools/list"
+                "method": "tools/list",
+                "params": modern_request_meta(),
             }))
             .unwrap();
         let response = serde_json::to_value(response).unwrap();
@@ -8777,7 +15427,7 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_write_handshake_operations_return_pending_with_proper_schemas() {
+    fn all_write_handshake_operations_return_pending_with_proper_schemas() {
         // Each operation must:
         // 1. Be advertised in tools/list with readOnlyHint: false
         // 2. Require its operation-specific fields plus a `reason`
@@ -8787,7 +15437,12 @@ mod tests {
         let _env = GatewayEnvGuard::unset();
         let server = McpSidecar::new_for_tests(true);
         let list_response = server
-            .handle_value(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+            .handle_value(json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/list",
+                "params": modern_request_meta(),
+            }))
             .unwrap();
         let list_value = serde_json::to_value(list_response).unwrap();
         let tools = list_value["result"]["tools"].as_array().unwrap();
@@ -8892,6 +15547,11 @@ mod tests {
                 tool["annotations"]["readOnlyHint"], false,
                 "{name} must advertise readOnlyHint: false"
             );
+            assert_eq!(
+                tool["annotations"]["idempotentHint"],
+                name == "operation.cancel",
+                "preview dedupe is bounded and must not be advertised as permanent idempotence"
+            );
 
             // 2) Schema must require its fields
             let required: Vec<&str> = tool["inputSchema"]["required"]
@@ -8905,6 +15565,20 @@ mod tests {
                     required.contains(field),
                     "{name} schema must require '{field}'"
                 );
+            }
+            if name.starts_with("operation.preview.") {
+                let idempotency = &tool["inputSchema"]["properties"]["idempotencyKey"];
+                assert_eq!(idempotency["minLength"], 1);
+                assert_eq!(idempotency["maxLength"], 128);
+                assert_eq!(idempotency["pattern"], "^[A-Za-z0-9_-]+$");
+                assert!(
+                    !required.contains(&"idempotencyKey"),
+                    "{name} must keep retry deduplication opt-in"
+                );
+            } else {
+                assert!(tool["inputSchema"]["properties"]
+                    .get("idempotencyKey")
+                    .is_none());
             }
 
             // 3) Calling it returns write_handshake_pending (code 10003)
@@ -8920,7 +15594,7 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // operation.preview.* gateway dispatch (PLAYBOOK §10).
-    // All ten proposal operations round-trip through the gateway when the handshake
+    // All five operations round-trip through the gateway when the handshake
     // address is configured; without it they fall back to code 10003.
     // ---------------------------------------------------------------------
 
@@ -8928,8 +15602,9 @@ mod tests {
     ///   POST /v1/mcp/operation/preview/<op_path_suffix> -> 200 {"accepted": true}
     ///   GET  /v1/mcp/operation/status/<id>              -> 200 {"previewId": "...", "status": "<status>", "result": {...}}
     /// Returns the parsed POST body via a oneshot channel so tests can assert the
-    /// exact JSON the sidecar dispatched. It accepts every proposal path suffix
-    /// so all operation.preview.* tests reuse the same harness.
+    /// exact JSON the sidecar dispatched. Generalized in 2026-05-28 to accept any
+    /// of the five operation path suffixes (merge|rebase|discard|reset|patch) so
+    /// the four new operation.preview.* tests reuse the same harness.
     fn spawn_operation_gateway_mock(
         op_path_suffix: &'static str,
         status: &'static str,
@@ -9071,7 +15746,10 @@ mod tests {
             Value::String(preview_id.to_string())
         );
         assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["sourceRef"], "feature/login");
         assert_eq!(dispatched["targetRef"], "main");
         assert_eq!(dispatched["reason"], "Closes ticket #123");
@@ -9138,7 +15816,7 @@ mod tests {
                 "currentRef": "feature/topic",
                 "ontoRef": "main",
                 "reason": "Linearize history before merge",
-                "interactive": true
+                "interactive": false
             }),
             true,
         );
@@ -9172,15 +15850,54 @@ mod tests {
             dispatched["operationType"], "rebase",
             "rebase body must include operationType per §14.7"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["currentRef"], "feature/topic");
         assert_eq!(dispatched["ontoRef"], "main");
         assert_eq!(dispatched["reason"], "Linearize history before merge");
-        assert_eq!(dispatched["interactive"], true);
+        assert_eq!(dispatched["interactive"], false);
         assert!(
             dispatched["requestedAt"].is_string(),
             "requestedAt must be an ISO-8601 string"
         );
+    }
+
+    #[test]
+    fn operation_preview_rebase_rejects_interactive_mode_before_dispatch() {
+        let response = call_tool(
+            "operation.preview.rebase",
+            json!({
+                "repoPath": "/tmp/example",
+                "currentRef": "feature/topic",
+                "ontoRef": "main",
+                "reason": "Rewrite individual commits",
+                "interactive": true
+            }),
+            true,
+        );
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(response["error"]["data"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("arguments.interactive"));
+
+        let plan = call_tool(
+            "operation.preview.plan",
+            json!({
+                "repoPath": "/tmp/example",
+                "reason": "Interactive plan",
+                "steps": [{
+                    "operationType": "rebase",
+                    "ontoRef": "main",
+                    "interactive": true
+                }]
+            }),
+            true,
+        );
+        assert_eq!(plan["error"]["code"], -32602);
     }
 
     #[test]
@@ -9258,7 +15975,10 @@ mod tests {
             dispatched["operationType"], "discard",
             "discard body must include operationType per §14.7"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["paths"][0], "src/a.ts");
         assert_eq!(dispatched["paths"][1], "src/b.ts");
         assert_eq!(dispatched["reason"], "Reset WIP after retry");
@@ -9345,7 +16065,10 @@ mod tests {
             dispatched["operationType"], "reset",
             "reset body must include operationType per §14.7"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["targetRef"], "HEAD~3");
         assert_eq!(dispatched["mode"], "soft");
         assert_eq!(dispatched["reason"], "Undo last 3 commits");
@@ -9432,7 +16155,10 @@ mod tests {
             dispatched["operationType"], "patch",
             "patch body must include operationType per §14.7"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["patchContent"], "@@ -1,3 +1,3 @@\n-old\n+new");
         assert_eq!(dispatched["reason"], "Apply suggested fix");
         assert_eq!(dispatched["applyToIndex"], true);
@@ -9528,7 +16254,10 @@ mod tests {
             dispatched["operationType"], "worktree",
             "worktree body must include operationType"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["branch"], "agent/fix-flaky-test");
         assert_eq!(dispatched["path"], "/tmp/example.worktrees/agent-fix");
         assert_eq!(
@@ -9656,7 +16385,10 @@ mod tests {
             dispatched["operationType"], "commit",
             "commit body must include operationType"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(
             dispatched["message"],
             "fix: handle empty refs\n\nGuards the ref parser against empty input."
@@ -9790,7 +16522,10 @@ mod tests {
             dispatched["operationType"], "push",
             "push body must include operationType"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["remote"], "origin");
         assert_eq!(dispatched["branch"], "agent/fix-empty-refs");
         assert_eq!(dispatched["setUpstream"], true);
@@ -9915,7 +16650,10 @@ mod tests {
             dispatched["operationType"], "branch",
             "branch body must include operationType"
         );
-        assert_eq!(dispatched["repoPath"], "/tmp/example");
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
         assert_eq!(dispatched["name"], "agent/fix-empty-refs");
         assert_eq!(dispatched["startPoint"], "origin/main");
         assert_eq!(dispatched["checkout"], true);
@@ -10138,12 +16876,65 @@ mod tests {
         format!("{}:{}", addr.ip(), addr.port())
     }
 
+    /// Simulates an idempotent POST replay where the gateway returns the id of
+    /// the proposal it admitted previously rather than the fresh caller id.
+    fn spawn_replay_gateway_mock(
+        canonical_preview_id: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind replay mock");
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept replay request");
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let trimmed = header.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some(value) =
+                        trimmed.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                }
+
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let body = if request_line.starts_with("POST ") {
+                    json!({ "accepted": true, "previewId": canonical_preview_id })
+                } else {
+                    tx.send(path.to_string()).unwrap();
+                    json!({ "previewId": canonical_preview_id, "status": "pending" })
+                };
+                let body = serde_json::to_string(&body).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        (format!("{}:{}", addr.ip(), addr.port()), rx)
+    }
+
     #[test]
-    fn operation_preview_approved_status_keeps_polling_until_completed() {
-        // Regression for the approved-race bug: `approved` is a TRANSIENT
-        // state (UI approved, execution running). A poll landing in that
-        // window must keep polling — never report a terminal 10004 failure
-        // for an operation that goes on to succeed.
+    fn operation_preview_returns_live_proposal_without_blocking_stdio() {
+        // Human approval is asynchronous. Perform one immediate status read,
+        // then return the stable preview id so operation.status can observe
+        // completion without monopolizing the single stdio request loop.
         let addr = spawn_status_sequence_gateway_mock(
             "merge",
             &["pending", "approved", "completed"],
@@ -10164,12 +16955,47 @@ mod tests {
 
         assert_eq!(
             response["result"]["isError"], false,
-            "approved must be treated as progress, not terminal; got {response:?}"
+            "an accepted pending proposal is a successful tool call; got {response:?}"
         );
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         let payload: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(payload["status"], "completed");
-        assert_eq!(payload["data"]["result"]["mergeCommit"], "cafe123");
+        assert_eq!(payload["status"], "pending");
+        assert_eq!(payload["accepted"], true);
+        assert_eq!(payload["nextAction"]["tool"], "operation.status");
+        assert_eq!(
+            payload["nextAction"]["data"]["previewId"],
+            payload["previewId"]
+        );
+    }
+
+    #[test]
+    fn operation_preview_replay_follows_the_gateway_canonical_id() {
+        let canonical_id = "p-existing-idempotent-proposal";
+        let (addr, status_path_rx) = spawn_replay_gateway_mock(canonical_id);
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.merge",
+            json!({
+                "repoPath": "/tmp/example",
+                "sourceRef": "feature/x",
+                "targetRef": "main",
+                "reason": "idempotent replay regression"
+            }),
+            true,
+        );
+        let payload = tool_payload(&response);
+
+        assert_eq!(payload["previewId"], canonical_id);
+        assert_eq!(
+            payload["nextAction"]["data"]["previewId"], canonical_id,
+            "the follow-up contract must expose the gateway's stable id"
+        );
+        assert_eq!(
+            status_path_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            format!("/v1/mcp/operation/status/{canonical_id}"),
+            "the immediate status read must not use the discarded caller id"
+        );
     }
 
     #[test]
@@ -10257,6 +17083,14 @@ mod tests {
         let payload: Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["error"]["code"], 10005);
         assert_eq!(payload["previewId"], "ghost");
+        assert!(payload["error"]["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("journals proposal lifecycle durably"));
+        assert!(payload["error"]["data"]["agentRecommendation"]
+            .as_str()
+            .unwrap()
+            .contains("Do not re-propose or re-run Git blindly"));
     }
 
     #[test]
@@ -10397,7 +17231,7 @@ mod tests {
         let audit_log = audit_dir.path().join("mcp.jsonl");
         let server = McpSidecar::new_for_tests_with_audit(true, audit_log.clone());
 
-        for (tool, args) in [
+        for (tool, mut args) in [
             (
                 "operation.preview.merge",
                 json!({ "repoPath": "/tmp/x", "sourceRef": "a", "targetRef": "b", "reason": "audit label test" }),
@@ -10419,6 +17253,7 @@ mod tests {
                 json!({ "repoPath": "/tmp/x", "name": "agent/x", "reason": "audit label test" }),
             ),
         ] {
+            normalize_test_repo_paths(&mut args);
             let response = server
                 .handle_value(json!({
                     "jsonrpc": "2.0",
@@ -10471,17 +17306,23 @@ mod tests {
     }
 
     #[test]
-    fn arguments_fingerprint_is_sha256_of_serialized_arguments() {
+    fn arguments_fingerprint_is_sha256_of_canonical_arguments() {
         use sha2::{Digest, Sha256};
         let args = json!({ "repoPath": "/tmp/x", "limit": 5 });
         let fingerprint = arguments_fingerprint(&args).expect("fingerprint for non-null args");
-        let digest = Sha256::digest(serde_json::to_vec(&args).unwrap());
+        let digest = Sha256::digest(canonical_json_bytes(&args));
         let mut expected = String::from("sha256:");
         for byte in digest {
             use std::fmt::Write;
             let _ = write!(expected, "{:02x}", byte);
         }
         assert_eq!(fingerprint, expected);
+        let reordered: Value = serde_json::from_str(r#"{"repoPath":"/tmp/x","limit":5}"#).unwrap();
+        assert_eq!(
+            fingerprint,
+            arguments_fingerprint(&reordered).unwrap(),
+            "object key order must not mint a second idempotency key"
+        );
         assert_eq!(fingerprint.len(), "sha256:".len() + 64);
         assert!(arguments_fingerprint(&Value::Null).is_none());
     }
@@ -10540,6 +17381,10 @@ mod tests {
             signer.key_id(),
             "signatureKeyId must match the short hex prefix of the public key"
         );
+        assert_eq!(
+            event["signatureVersion"], 3,
+            "new chained entries must bind key id and entry hash through signature format v3"
+        );
 
         // And it must verify under the matching public key.
         assert!(
@@ -10579,10 +17424,46 @@ mod tests {
         // Tamper a non-signature field after signing.
         event["tool"] = Value::String("repo.delete".to_string());
 
-        assert_eq!(
-            verify_audit_event_signature(&event, &public).unwrap(),
-            false,
+        assert!(
+            !verify_audit_event_signature(&event, &public).unwrap(),
             "tampered event must fail signature verification (Ok(false))"
+        );
+    }
+
+    #[test]
+    fn audit_signature_v2_binds_the_key_id_but_legacy_entries_still_verify() {
+        let signer = fixed_test_signer(12);
+        let public = signer.verifying_key();
+
+        let mut v2 = json!({
+            "tool": "repo.status",
+            "timestamp": 1717000000000u64,
+            "signatureKeyId": signer.key_id(),
+            "signatureVersion": 2,
+        });
+        let v2_signature = signer.sign_event(&v2);
+        v2["signature"] = Value::String(v2_signature);
+        assert!(verify_audit_event_signature(&v2, &public).unwrap());
+        v2["signatureKeyId"] = Value::String("untrusted-key-id".to_string());
+        assert!(
+            !verify_audit_event_signature(&v2, &public).unwrap(),
+            "v2 key-id relabelling must invalidate the signature"
+        );
+
+        // Compatibility with entries emitted before signatureVersion existed:
+        // their key id was metadata attached after signing and was therefore
+        // deliberately excluded from the verified canonical bytes.
+        let legacy_unsigned = json!({
+            "tool": "repo.status",
+            "timestamp": 1717000000000u64,
+        });
+        let legacy_signature = signer.sign_event(&legacy_unsigned);
+        let mut legacy = legacy_unsigned;
+        legacy["signatureKeyId"] = Value::String(signer.key_id().to_string());
+        legacy["signature"] = Value::String(legacy_signature);
+        assert!(
+            verify_audit_event_signature(&legacy, &public).unwrap(),
+            "pre-v2 signed audit entries must remain verifiable"
         );
     }
 
@@ -10639,9 +17520,8 @@ mod tests {
 
         // The signature is real and well-formed, but the public key does
         // not match — verification must return Ok(false), not an error.
-        assert_eq!(
-            verify_audit_event_signature(&event, &wrong_public).unwrap(),
-            false,
+        assert!(
+            !verify_audit_event_signature(&event, &wrong_public).unwrap(),
             "verification under a different public key must return Ok(false)"
         );
 
@@ -10683,6 +17563,224 @@ mod tests {
             event.get("signatureKeyId").is_none(),
             "unsigned audit entry must NOT have a signatureKeyId field"
         );
+        assert!(
+            event.get("signatureVersion").is_none(),
+            "unsigned audit entry must NOT have a signatureVersion field"
+        );
+    }
+
+    #[test]
+    fn shared_ledger_concurrent_appenders_keep_one_contiguous_chain() {
+        let audit_dir = TestDir::new("fluxgit-mcp-concurrent-ledger");
+        let audit_log = audit_dir.path().join("mcp.jsonl");
+        let signer = fixed_test_signer(31);
+        let ledger = AuditLedger::new(audit_log.clone(), Some(signer.clone())).unwrap();
+        let mut workers = Vec::new();
+        for worker in 0..8 {
+            let ledger = ledger.clone();
+            workers.push(std::thread::spawn(move || {
+                for index in 0..25 {
+                    ledger
+                        .append(json!({
+                            "timestamp": now_ms(),
+                            "tool": "repo.status",
+                            "repo_scope": format!("worker-{worker}"),
+                            "event_type": "tool_call",
+                            "risk": "none",
+                            "approval": "not_required",
+                            "result": "success",
+                            "summary": format!("worker {worker} event {index}"),
+                        }))
+                        .unwrap();
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let report = verify_audit_ledger(&audit_log, &signer.verifying_key(), true).unwrap();
+        assert_eq!(report.entries, 200);
+        assert_eq!(report.chained, 200);
+        assert_eq!(report.first_sequence, Some(1));
+        assert_eq!(report.last_sequence, Some(200));
+    }
+
+    #[test]
+    fn audit_environment_uses_shared_default_path_and_invalid_explicit_key_fails_closed() {
+        let run_dir = TestDir::new("fluxgit-mcp-audit-default-run");
+        {
+            let _env = AuditEnvGuard::isolated(run_dir.path(), None);
+            let ledger = AuditLedger::from_env().unwrap().unwrap();
+            assert_eq!(
+                ledger.path(),
+                audit_log_path_for_run_dir(run_dir.path()),
+                "sidecar and gateway must resolve exactly one default ledger path"
+            );
+        }
+        let missing_key = run_dir.path().join("missing-private-key.pem");
+        let _env = AuditEnvGuard::isolated(run_dir.path(), Some(&missing_key));
+        let error = AuditLedger::from_env()
+            .expect_err("an explicitly configured missing signing key must fail closed");
+        assert!(error.to_string().contains("cannot read audit signing key"));
+    }
+
+    #[test]
+    fn ledger_rotation_retention_and_checkpoint_verify_streaming() {
+        let audit_dir = TestDir::new("fluxgit-mcp-rotating-ledger");
+        let audit_log = audit_dir.path().join("mcp.jsonl");
+        let signer = fixed_test_signer(32);
+        let ledger =
+            AuditLedger::with_limits(audit_log.clone(), Some(signer.clone()), 900, 2).unwrap();
+        for index in 0..24 {
+            ledger
+                .append(json!({
+                    "timestamp": now_ms(),
+                    "tool": "repo.status",
+                    "repo_scope": "rotation-test",
+                    "event_type": "tool_call",
+                    "risk": "none",
+                    "approval": "not_required",
+                    "result": "success",
+                    "summary": format!("rotation event {index} {}", "x".repeat(180)),
+                }))
+                .unwrap();
+        }
+        let report =
+            scan_audit_ledger(&audit_log, Some(&signer.verifying_key()), true, 900, 2).unwrap();
+        assert!(
+            report.checkpoint_used,
+            "retention prefix was not checkpointed"
+        );
+        assert!(report.first_sequence.unwrap() > 1);
+        let rotated = collect_ledger_files(&audit_log)
+            .unwrap()
+            .into_iter()
+            .filter(|file| matches!(&file.kind, LedgerFileKind::Rotated(_)))
+            .count();
+        assert!(rotated <= 2);
+    }
+
+    #[test]
+    fn ledger_verifier_detects_mutation_deletion_duplication_and_reordering() {
+        let audit_dir = TestDir::new("fluxgit-mcp-chain-adversarial");
+        let audit_log = audit_dir.path().join("mcp.jsonl");
+        let signer = fixed_test_signer(33);
+        let ledger = AuditLedger::new(audit_log.clone(), Some(signer.clone())).unwrap();
+        for index in 0..4 {
+            ledger
+                .append(json!({
+                    "timestamp": now_ms(),
+                    "tool": "repo.status",
+                    "repo_scope": "adversarial",
+                    "event_type": "tool_call",
+                    "risk": "none",
+                    "approval": "not_required",
+                    "result": "success",
+                    "summary": format!("event {index}"),
+                }))
+                .unwrap();
+        }
+        let original = fs::read_to_string(&audit_log).unwrap();
+        let lines = original.lines().map(str::to_string).collect::<Vec<_>>();
+
+        let mut mutated: Value = serde_json::from_str(&lines[1]).unwrap();
+        mutated["summary"] = Value::String("changed".into());
+        let mut mutation_lines = lines.clone();
+        mutation_lines[1] = serde_json::to_string(&mutated).unwrap();
+        fs::write(&audit_log, format!("{}\n", mutation_lines.join("\n"))).unwrap();
+        assert!(verify_audit_ledger(&audit_log, &signer.verifying_key(), true).is_err());
+
+        fs::write(
+            &audit_log,
+            format!(
+                "{}\n",
+                [lines[0].clone(), lines[2].clone(), lines[3].clone()].join("\n")
+            ),
+        )
+        .unwrap();
+        assert!(verify_audit_ledger(&audit_log, &signer.verifying_key(), true).is_err());
+
+        fs::write(
+            &audit_log,
+            format!(
+                "{}\n",
+                [
+                    lines[0].clone(),
+                    lines[1].clone(),
+                    lines[1].clone(),
+                    lines[2].clone(),
+                    lines[3].clone()
+                ]
+                .join("\n")
+            ),
+        )
+        .unwrap();
+        assert!(verify_audit_ledger(&audit_log, &signer.verifying_key(), true).is_err());
+
+        fs::write(
+            &audit_log,
+            format!(
+                "{}\n",
+                [
+                    lines[1].clone(),
+                    lines[0].clone(),
+                    lines[2].clone(),
+                    lines[3].clone()
+                ]
+                .join("\n")
+            ),
+        )
+        .unwrap();
+        assert!(verify_audit_ledger(&audit_log, &signer.verifying_key(), true).is_err());
+    }
+
+    #[test]
+    fn legacy_entries_remain_verifiable_but_are_reported_as_unchained() {
+        let audit_dir = TestDir::new("fluxgit-mcp-legacy-chain-boundary");
+        let audit_log = audit_dir.path().join("mcp.jsonl");
+        let signer = fixed_test_signer(34);
+        let unsigned_legacy = json!({
+            "id": "old-unsigned",
+            "timestamp": 1,
+            "tool": "repo.status",
+            "summary": "legacy unsigned"
+        });
+        let mut signed_legacy = json!({
+            "id": "old-signed",
+            "timestamp": 2,
+            "tool": "repo.status",
+            "summary": "legacy signed",
+            "signatureKeyId": signer.key_id(),
+            "signatureVersion": 2,
+        });
+        signed_legacy["signature"] = Value::String(signer.sign_event(&signed_legacy));
+        fs::write(
+            &audit_log,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&unsigned_legacy).unwrap(),
+                serde_json::to_string(&signed_legacy).unwrap()
+            ),
+        )
+        .unwrap();
+        let ledger = AuditLedger::new(audit_log.clone(), Some(signer.clone())).unwrap();
+        ledger
+            .append(json!({
+                "timestamp": 3,
+                "tool": "repo.status",
+                "repo_scope": "legacy-boundary",
+                "event_type": "tool_call",
+                "risk": "none",
+                "approval": "not_required",
+                "result": "success",
+                "summary": "first chained event"
+            }))
+            .unwrap();
+        let report = verify_audit_ledger(&audit_log, &signer.verifying_key(), false).unwrap();
+        assert_eq!(report.legacy, 2);
+        assert_eq!(report.chained, 1);
+        assert_eq!(report.signed, 2);
+        assert_eq!(report.unsigned, 1);
     }
 
     #[test]
