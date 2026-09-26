@@ -212,10 +212,16 @@ Tier classification:
 
 ## Quick start
 
-One-line install (puts `fluxgit-mcp-sidecar` on your `PATH`):
+Install the published crate (puts `fluxgit-mcp-sidecar` on your `PATH`):
 
 ```bash
-cargo install --git https://github.com/fluxgit-hq/fluxgit-mcp-server fluxgit-mcp-sidecar
+cargo install fluxgit-mcp-sidecar --locked
+```
+
+To install the current source branch instead:
+
+```bash
+cargo install --git https://github.com/fluxgit-hq/fluxgit-mcp-server fluxgit-mcp-sidecar --locked
 ```
 
 Or build from a clone:
@@ -488,7 +494,7 @@ it is self-reported and must never be treated as authenticated identity.
 - **End-to-end demo video** — public recording of the agent-proposes → user-approves → FluxGit-executes loop, captured from a live install.
 - **Audit log exportable CSV/JSON** — shipped: per-entry Ed25519 signing (2026-05-28). Remaining: exportable CSV/JSON and retention policy for the FluxGit app's audit panel.
 - **HTTP / SSE transport** — for cloud / shared MCP host deployments.
-- **MCP registry entry** — `server.json` is validated and ready for submission after the crates.io package is published.
+- **Official MCP Registry** — [`io.github.fluxgit-hq/fluxgit-mcp-server`](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.fluxgit-hq%2Ffluxgit-mcp-server) is live and resolves to the published [`fluxgit-mcp-sidecar`](https://crates.io/crates/fluxgit-mcp-sidecar) crate.
 
 ## License
 
