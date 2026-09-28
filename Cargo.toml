@@ -4,7 +4,7 @@ name = "fluxgit-mcp-sidecar"
 # semver describes MCP server wire compatibility. It is also the version
 # reported in the MCP handshake (SERVER_VERSION in src/lib.rs) and must stay
 # identical to server.json.
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Safety-first Git MCP server: rich read tools plus human-approved FluxGit operation proposals."
 license = "Apache-2.0"
