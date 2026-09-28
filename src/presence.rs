@@ -90,6 +90,11 @@ impl PresenceRecorder {
         &self.file
     }
 
+    /// The directory holding every sidecar's presence file.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Remember the version from the `initialize` request's `clientInfo`, for
     /// legacy-era calls that do not repeat it per request.
     pub fn note_initialize_version(&self, version: Option<&str>) {

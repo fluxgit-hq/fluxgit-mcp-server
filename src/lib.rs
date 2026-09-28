@@ -17,6 +17,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+// The shared agent detector (see the comment in agent_detect.rs).
+#[allow(dead_code)]
+mod agent_detect;
 pub mod presence;
 pub use presence::{presence_dir_for_run_dir, PresenceRecorder};
 
@@ -48,6 +51,13 @@ const MCP_MAX_REASON_CHARS: usize = 4096;
 const MCP_MAX_REF_CHARS: usize = 4096;
 const MCP_MAX_PATH_CHARS: usize = 32 * 1024;
 const MCP_MAX_PATH_ITEMS: usize = 10_000;
+/// `operation.preview.branchDelete` bounds (mirrors the gateway validation).
+const BRANCH_DELETE_MAX_TARGETS: usize = 20;
+const BRANCH_DELETE_MAX_BRANCHES_PER_TARGET: usize = 20;
+/// Native commit-message limit of the Fleet submodule record flow.
+const SUBMODULE_POINTER_MAX_MESSAGE_CHARS: usize = 2000;
+/// A full SHA-1 or SHA-256 object id in lowercase hex.
+const FULL_OID_PATTERN: &str = "^(?:[0-9a-f]{40}|[0-9a-f]{64})$";
 
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -101,6 +111,9 @@ pub struct McpSidecar {
     /// Local "client X used repository Y at time T" record for the desktop's
     /// agent presence (see `presence.rs`). `None` in tests and when disabled.
     presence: Option<Arc<PresenceRecorder>>,
+    /// Where `agents.presence` and the preview collision hints get their
+    /// findings (the shared local detector, unless disabled).
+    agent_detector: AgentDetector,
 }
 
 /// Per-install Ed25519 audit signer. Loaded once at startup from
@@ -1814,6 +1827,8 @@ enum ToolKind {
     SafetyTimeline,
     SafetyEventDetails,
     FleetRadar,
+    FleetDigest,
+    AgentsPresence,
     RepoBrief,
     RepoScope,
     RepoStatus,
@@ -1853,6 +1868,8 @@ enum ToolKind {
     OperationPreviewCommit,
     OperationPreviewPush,
     OperationPreviewBranch,
+    OperationPreviewBranchDelete,
+    OperationPreviewSubmodulePointer,
     /// Write-adjacent: withdraws one of THIS agent's still-pending proposals
     /// by `previewId`. Never touches the repository and can only cancel
     /// proposals created by the same agent, so it needs no policy gating.
@@ -1865,6 +1882,8 @@ impl ToolKind {
             ToolKind::SafetyTimeline => "safety.timeline",
             ToolKind::SafetyEventDetails => "safety.eventDetails",
             ToolKind::FleetRadar => "fleet.radar",
+            ToolKind::FleetDigest => "fleet.digest",
+            ToolKind::AgentsPresence => "agents.presence",
             ToolKind::RepoBrief => "repo.brief",
             ToolKind::RepoScope => "repo.scope",
             ToolKind::RepoStatus => "repo.status",
@@ -1896,6 +1915,8 @@ impl ToolKind {
             ToolKind::OperationPreviewCommit => "operation.preview.commit",
             ToolKind::OperationPreviewPush => "operation.preview.push",
             ToolKind::OperationPreviewBranch => "operation.preview.branch",
+            ToolKind::OperationPreviewBranchDelete => "operation.preview.branchDelete",
+            ToolKind::OperationPreviewSubmodulePointer => "operation.preview.submodulePointer",
         }
     }
 }
@@ -1918,6 +1939,8 @@ const WRITE_HANDSHAKE_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::OperationPreviewCommit,
     ToolKind::OperationPreviewPush,
     ToolKind::OperationPreviewBranch,
+    ToolKind::OperationPreviewBranchDelete,
+    ToolKind::OperationPreviewSubmodulePointer,
     // operation.cancel is write-adjacent (it mutates handshake state, never
     // the repository). It is short-circuited in handle_tools_call before the
     // generic preview dispatch runs.
@@ -1928,6 +1951,21 @@ fn is_write_handshake(kind: ToolKind) -> bool {
     WRITE_HANDSHAKE_TOOL_KINDS.contains(&kind)
 }
 
+/// The twelve `operation.preview.*` tools (every write-handshake tool except
+/// `operation.cancel`).
+fn is_operation_preview(kind: ToolKind) -> bool {
+    is_write_handshake(kind) && kind != ToolKind::OperationCancel
+}
+
+/// A proposal the gateway admitted: it has a previewId and was not refused
+/// (policy 403, quota, validation) or answered with 10003 (no FluxGit).
+/// Terminal outcomes the human decided later still count as accepted.
+fn preview_was_accepted(result: &ToolCallResult) -> bool {
+    let payload = &result.structured_content;
+    payload.get("previewId").and_then(Value::as_str).is_some()
+        && payload.get("status").and_then(Value::as_str) != Some("refused")
+}
+
 const READ_ONLY_TOOL_KINDS: &[ToolKind] = &[
     // repo.brief is intentionally first: it is the recommended first call of an
     // agent session and hosts that scan tools in order should see it up front.
@@ -1936,6 +1974,8 @@ const READ_ONLY_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::SafetyTimeline,
     ToolKind::SafetyEventDetails,
     ToolKind::FleetRadar,
+    ToolKind::FleetDigest,
+    ToolKind::AgentsPresence,
     ToolKind::RepoStatus,
     ToolKind::RepoRefs,
     ToolKind::RepoBranchStack,
@@ -1997,6 +2037,7 @@ impl McpSidecar {
             audit_ledger: AuditLedger::from_env()?,
             client_id: Default::default(),
             presence: PresenceRecorder::from_env(fluxgit_run_dir()).map(Arc::new),
+            agent_detector: AgentDetector::from_env(),
         })
     }
 
@@ -2016,6 +2057,7 @@ impl McpSidecar {
             audit_ledger: None,
             client_id: Default::default(),
             presence: None,
+            agent_detector: AgentDetector::Disabled,
         }
     }
 
@@ -2031,6 +2073,7 @@ impl McpSidecar {
             ),
             client_id: Default::default(),
             presence: None,
+            agent_detector: AgentDetector::Disabled,
         }
     }
 
@@ -2053,7 +2096,15 @@ impl McpSidecar {
             ),
             client_id: Default::default(),
             presence: None,
+            agent_detector: AgentDetector::Disabled,
         }
+    }
+
+    /// Tests: answer agent detection with a fixed list.
+    #[cfg(test)]
+    fn with_detected_agents(mut self, found: Vec<agent_detect::AgentPresence>) -> Self {
+        self.agent_detector = AgentDetector::Fixed(Arc::new(found));
+        self
     }
 
     pub fn run_stdio(&self) -> io::Result<()> {
@@ -2394,8 +2445,26 @@ impl McpSidecar {
         // proposal, semantic request, fleet scan, or local Git invocation).
         let validated_arguments = validate_and_canonicalize_tool_arguments(kind, raw_arguments)?;
         let arguments = &validated_arguments;
-        self.record_presence(object, agent_id, kind, arguments);
+        let mut result = self.dispatch_validated_tool(kind, arguments, agent_id)?;
+        if is_operation_preview(kind) {
+            // Informational only: added after the gateway decided, so it can
+            // never influence admission, policy or approval.
+            result = self.with_collision_hint(result, arguments, agent_id);
+        }
+        // Presence records accepted work only: a proposal the agent policy
+        // (or a missing FluxGit) refused is not "working here".
+        if !is_write_handshake(kind) || preview_was_accepted(&result) {
+            self.record_presence(object, agent_id, kind, arguments);
+        }
+        Ok(result)
+    }
 
+    fn dispatch_validated_tool(
+        &self,
+        kind: ToolKind,
+        arguments: &Value,
+        agent_id: &str,
+    ) -> Result<ToolCallResult, JsonRpcError> {
         // operation.status / operation.cancel talk directly to the gateway
         // handshake bridge (they take only a previewId, no repoPath), so they
         // are short-circuited before every other dispatch path — including the
@@ -2409,7 +2478,7 @@ impl McpSidecar {
         }
 
         // Write-with-UI-handshake tools (PLAYBOOK §10, §14.2, §14.7):
-        // All ten `operation.preview.*` tools dispatch through the gateway HTTP
+        // All twelve `operation.preview.*` tools dispatch through the gateway HTTP
         // bridge when the handshake address is configured. Resolution order per
         // playbook §14.2:
         //   1. FLUXGIT_MCP_HANDSHAKE_ADDR (canonical for the handshake server)
@@ -2449,6 +2518,12 @@ impl McpSidecar {
                     }
                     ToolKind::OperationPreviewBranch => {
                         dispatch_operation_preview_branch(&addr, agent_id, arguments)
+                    }
+                    ToolKind::OperationPreviewBranchDelete => {
+                        dispatch_operation_preview_branch_delete(&addr, agent_id, arguments)
+                    }
+                    ToolKind::OperationPreviewSubmodulePointer => {
+                        dispatch_operation_preview_submodule_pointer(&addr, agent_id, arguments)
                     }
                     _ => None,
                 };
@@ -2491,6 +2566,14 @@ impl McpSidecar {
 
         if kind == ToolKind::FleetRadar {
             return Ok(render_fleet_radar_tool_result(arguments));
+        }
+        if kind == ToolKind::FleetDigest {
+            return Ok(render_fleet_digest_tool_result(arguments));
+        }
+        if kind == ToolKind::AgentsPresence {
+            if let Some(repo_path) = repo_path_from_arguments(arguments) {
+                return Ok(self.render_agents_presence(&repo_path, agent_id));
+            }
         }
 
         // Hybrid semantic tier (PLAYBOOK §4): when the FluxGit gateway is
@@ -3139,6 +3222,12 @@ fn operation_risk(kind: ToolKind) -> &'static str {
         | ToolKind::OperationPreviewPatch
         | ToolKind::OperationPreviewPlan
         | ToolKind::OperationPreviewPush => "medium",
+        // Deleting merged local branches (each tip recorded for restore) and
+        // recording/returning a submodule pointer go through the guarded
+        // Fleet flows; the gateway audit labels both medium as well.
+        ToolKind::OperationPreviewBranchDelete | ToolKind::OperationPreviewSubmodulePointer => {
+            "medium"
+        }
         // Worktree/branch creation and committing staged work are
         // non-destructive (they only add state, never rewrite or delete);
         // cancel touches no repo state.
@@ -3258,6 +3347,14 @@ fn local_tool_payload(
         ToolKind::SafetyTimeline => safety_timeline_payload(repo_path, arguments)?,
         ToolKind::SafetyEventDetails => safety_event_details_payload(repo_path, arguments)?,
         ToolKind::FleetRadar => fleet_radar_payload(arguments)?,
+        ToolKind::FleetDigest => fleet_digest_payload(
+            arguments,
+            fluxgit_run_dir().as_deref(),
+            parse_allowed_roots(env::var_os(MCP_ALLOWED_ROOTS_ENV).as_deref())?.as_deref(),
+        )?,
+        // Served by McpSidecar::render_agents_presence, which knows the
+        // caller; this path has no caller to exclude and no detector.
+        ToolKind::AgentsPresence => return Err(agent_detection_disabled_error()),
         ToolKind::RepoBrief => repo_brief_payload(repo_path, arguments)?,
         ToolKind::RepoScope => repo_scope_payload(repo_path, arguments)?,
         ToolKind::RepoStatus => repo_status_payload(repo_path)?,
@@ -3289,6 +3386,8 @@ fn local_tool_payload(
         | ToolKind::OperationPreviewCommit
         | ToolKind::OperationPreviewPush
         | ToolKind::OperationPreviewBranch
+        | ToolKind::OperationPreviewBranchDelete
+        | ToolKind::OperationPreviewSubmodulePointer
         | ToolKind::OperationStatus
         | ToolKind::OperationCancel => {
             // Handshake-bridge tools are short-circuited in handle_tools_call
@@ -3963,6 +4062,869 @@ fn fleet_attention_stack(entries: &[Value]) -> Vec<Value> {
         right_priority.cmp(&left_priority)
     });
     items
+}
+
+// ----------------------------------------------------------------------------
+// agents.presence and collision hints (PLAYBOOK §14.11)
+//
+// Both read the shared local detector (agent_detect.rs). Nothing here blocks,
+// admits or rejects anything: the detector reports what local sources say,
+// and names are what each tool or MCP client declares about itself.
+// ----------------------------------------------------------------------------
+
+/// Env var that turns off agent detection in the sidecar: `agents.presence`
+/// then returns error 10011 and previews carry no `otherAgents` hint.
+const MCP_AGENT_DETECTION_DISABLED_ENV: &str = "FLUXGIT_MCP_AGENT_DETECTION_DISABLED";
+/// Agents listed per answer; a repository rarely has more than a handful.
+const AGENTS_PRESENCE_MAX_AGENTS: usize = 32;
+/// Paths extracted from a proposal for the overlap check.
+const COLLISION_MAX_PROPOSAL_PATHS: usize = 1_000;
+/// Overlapping paths listed per agent in a hint.
+const COLLISION_MAX_OVERLAPS: usize = 20;
+const UNIDENTIFIED_AGENT_ID: &str = "external-mcp-sidecar";
+
+#[derive(Debug, Clone)]
+enum AgentDetector {
+    /// Scan the machine (processes, session stores, MCP presence files).
+    Live,
+    /// `FLUXGIT_MCP_AGENT_DETECTION_DISABLED`, and the default for tests.
+    Disabled,
+    /// A fixed answer, for tests.
+    #[cfg(test)]
+    Fixed(Arc<Vec<agent_detect::AgentPresence>>),
+}
+
+impl AgentDetector {
+    fn from_env() -> Self {
+        if env::var_os(MCP_AGENT_DETECTION_DISABLED_ENV).is_some() {
+            AgentDetector::Disabled
+        } else {
+            AgentDetector::Live
+        }
+    }
+}
+
+/// Who is asking, as far as the sidecar can tell.
+struct CallerIdentity {
+    /// Sanitized `clientInfo.name`; `None` when the client did not say.
+    client_name: Option<String>,
+    /// The detector's id for that name (`claude-code-cli` -> `claude-code`).
+    agent: Option<&'static str>,
+    /// This sidecar's ancestor processes: the agent that spawned it over
+    /// stdio is among them.
+    ancestor_pids: &'static [u32],
+}
+
+impl CallerIdentity {
+    fn from_agent_id(agent_id: &str) -> Self {
+        let client_name = (agent_id != UNIDENTIFIED_AGENT_ID).then(|| agent_id.to_string());
+        let agent = client_name
+            .as_deref()
+            .map(|name| agent_detect::mcp_agent_id(Some(name)));
+        Self {
+            client_name,
+            agent,
+            ancestor_pids: sidecar_ancestor_pids(),
+        }
+    }
+
+    fn same_agent(&self, presence: &agent_detect::AgentPresence) -> bool {
+        self.agent == Some(presence.agent)
+    }
+
+    /// The same agent with no process of its own, or whose process is one of
+    /// this sidecar's ancestors, is most likely the session that is asking.
+    /// The same agent running under another process is another session.
+    fn likely_caller(&self, presence: &agent_detect::AgentPresence) -> bool {
+        self.same_agent(presence)
+            && presence
+                .pid
+                .is_none_or(|pid| self.ancestor_pids.contains(&pid))
+    }
+}
+
+/// Up to eight ancestors of this process, read once (they do not change).
+fn sidecar_ancestor_pids() -> &'static [u32] {
+    static ANCESTORS: OnceLock<Vec<u32>> = OnceLock::new();
+    ANCESTORS.get_or_init(|| {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut ancestors = Vec::new();
+        let mut system = System::new();
+        let mut current = Pid::from_u32(std::process::id());
+        for _ in 0..8 {
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[current]),
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            let Some(parent) = system.process(current).and_then(|process| process.parent()) else {
+                break;
+            };
+            if parent.as_u32() == 0 || ancestors.contains(&parent.as_u32()) {
+                break;
+            }
+            ancestors.push(parent.as_u32());
+            current = parent;
+        }
+        ancestors
+    })
+}
+
+impl McpSidecar {
+    /// Agents working in `repo_path`, without this sidecar's own MCP presence
+    /// record. `None` when detection is disabled.
+    fn detect_agents(&self, repo_path: &Path) -> Option<Vec<agent_detect::AgentPresence>> {
+        match &self.agent_detector {
+            AgentDetector::Disabled => None,
+            #[cfg(test)]
+            AgentDetector::Fixed(found) => Some(found.as_ref().clone()),
+            AgentDetector::Live => {
+                let options = agent_detect::ScanOptions {
+                    mcp_presence_dir: self
+                        .presence
+                        .as_ref()
+                        .map(|presence| presence.dir().to_path_buf())
+                        .or_else(|| fluxgit_run_dir().map(|dir| presence_dir_for_run_dir(&dir))),
+                    exclude_mcp_pids: vec![std::process::id()],
+                    ..Default::default()
+                };
+                Some(agent_detect::scan_with(
+                    &[repo_path.to_string_lossy().into_owned()],
+                    &options,
+                ))
+            }
+        }
+    }
+
+    fn render_agents_presence(&self, repo_path: &Path, agent_id: &str) -> ToolCallResult {
+        let kind = ToolKind::AgentsPresence;
+        let error_result = |error: JsonRpcError| {
+            text_tool_result(
+                json!({
+                    "error": error,
+                    "tool": kind.as_str(),
+                    "readOnly": true,
+                    "source": "local-agent-detector",
+                }),
+                true,
+            )
+        };
+        if let Err(error) = ensure_git_repo(repo_path) {
+            return error_result(error);
+        }
+        let Some(found) = self.detect_agents(repo_path) else {
+            return error_result(agent_detection_disabled_error());
+        };
+        let caller = CallerIdentity::from_agent_id(agent_id);
+        text_tool_result(
+            json!({
+                "tool": kind.as_str(),
+                "readOnly": true,
+                "source": "local-agent-detector",
+                "repoPath": repo_path,
+                "data": agents_presence_data(repo_path, &found, &caller),
+            }),
+            false,
+        )
+    }
+
+    /// Adds the informational `otherAgents` hint to a preview result. Never
+    /// changes `isError`, the status or any other field.
+    fn with_collision_hint(
+        &self,
+        result: ToolCallResult,
+        arguments: &Value,
+        agent_id: &str,
+    ) -> ToolCallResult {
+        let Some(repo_path) = repo_path_from_arguments(arguments) else {
+            return result;
+        };
+        if !result.structured_content.is_object() {
+            return result;
+        }
+        let Some(found) = self.detect_agents(&repo_path) else {
+            return result;
+        };
+        let caller = CallerIdentity::from_agent_id(agent_id);
+        let hint = collision_hint(&found, &caller, proposal_paths(arguments, &repo_path));
+        let mut payload = result.structured_content;
+        payload["otherAgents"] = hint;
+        text_tool_result(payload, result.is_error)
+    }
+}
+
+fn agent_detection_disabled_error() -> JsonRpcError {
+    JsonRpcError {
+        code: 10011,
+        message: "Agent detection is disabled".into(),
+        data: Some(json!({
+            "environmentVariable": MCP_AGENT_DETECTION_DISABLED_ENV,
+            "reason": "The user turned off local agent detection for this MCP server, so it does not read other agents' processes or session stores.",
+            "agentRecommendation": "Do not assume the repository is free of other agents. Ask the user, or check worktree.changes before proposing edits.",
+        })),
+    }
+}
+
+fn presence_agent_json(
+    presence: &agent_detect::AgentPresence,
+    caller: &CallerIdentity,
+) -> Map<String, Value> {
+    let mut entry = Map::new();
+    entry.insert("agent".into(), json!(presence.agent));
+    entry.insert("state".into(), json!(presence.state));
+    entry.insert("sources".into(), json!(presence.sources));
+    entry.insert("pid".into(), json!(presence.pid));
+    entry.insert("lastActivityMs".into(), json!(presence.last_activity_ms));
+    entry.insert("branch".into(), json!(presence.branch));
+    entry.insert("lastTool".into(), json!(presence.last_tool));
+    entry.insert("files".into(), json!(presence.files));
+    entry.insert(
+        "mcpClient".into(),
+        presence
+            .mcp_client
+            .as_ref()
+            .map(|client| json!({ "name": client.name, "version": client.version }))
+            .unwrap_or(Value::Null),
+    );
+    entry.insert(
+        "sameAgentAsCaller".into(),
+        json!(caller.same_agent(presence)),
+    );
+    entry
+}
+
+fn agents_presence_data(
+    repo_path: &Path,
+    found: &[agent_detect::AgentPresence],
+    caller: &CallerIdentity,
+) -> Value {
+    let agents = found
+        .iter()
+        .take(AGENTS_PRESENCE_MAX_AGENTS)
+        .map(|presence| {
+            let mut entry = presence_agent_json(presence, caller);
+            entry.insert("likelyCaller".into(), json!(caller.likely_caller(presence)));
+            Value::Object(entry)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "repoPath": repo_path,
+        "agents": agents,
+        "agentCount": agents.len(),
+        "truncated": found.len() > AGENTS_PRESENCE_MAX_AGENTS,
+        "caller": {
+            "clientName": caller.client_name,
+            "agent": caller.agent,
+            "ownMcpPresenceExcluded": true,
+        },
+        "privacy": "Only agent ids, states, sources, branches, tool names, times and repository-relative paths. Never prompts, messages or file contents.",
+        "guidance": "Findings come from local sources and differ in certainty: process (a running agent or its child has its working directory here), session (the agent's own session store names this repository), repo-trace (a file the agent keeps in the repository changed), ide (an editor with a built-in agent has the folder open), mcp (the agent called FluxGit's MCP server on this repository). Agent names are what each tool or MCP client declares about itself, never authenticated. Your own MCP record is excluded; a finding marked likelyCaller is probably your own session seen through its process or session log. Coordinate with the user before touching files another agent is working on.",
+    })
+}
+
+/// Repository-relative paths a proposal names, when its arguments say. `None`
+/// when the operation carries no file list (merge, rebase, reset, push,
+/// branch, worktree, a commit of whatever is staged).
+fn proposal_paths(arguments: &Value, repo_path: &Path) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    collect_proposal_paths(arguments, repo_path, &mut paths);
+    if let Some(steps) = arguments.get("steps").and_then(Value::as_array) {
+        for step in steps {
+            collect_proposal_paths(step, repo_path, &mut paths);
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn collect_proposal_paths(arguments: &Value, repo_path: &Path, out: &mut Vec<String>) {
+    if let Some(paths) = arguments.get("paths").and_then(Value::as_array) {
+        for path in paths.iter().filter_map(Value::as_str) {
+            push_proposal_path(out, repo_path, path);
+        }
+    }
+    // submodulePointer touches exactly one submodule directory.
+    if let Some(relative) = arguments.get("relativePath").and_then(Value::as_str) {
+        let parent = arguments
+            .get("parentPath")
+            .and_then(Value::as_str)
+            .map(|parent| parent.trim_matches('/'))
+            .unwrap_or("");
+        let joined = if parent.is_empty() {
+            relative.to_string()
+        } else {
+            format!("{parent}/{relative}")
+        };
+        push_proposal_path(out, repo_path, &joined);
+    }
+    if let Some(patch) = arguments.get("patchContent").and_then(Value::as_str) {
+        for line in patch.lines() {
+            let path = if let Some(rest) = line.strip_prefix("diff --git ") {
+                // `diff --git a/x b/x`: the destination side.
+                rest.rsplit_once(" b/").map(|(_, path)| path)
+            } else {
+                line.strip_prefix("+++ b/")
+                    .or_else(|| line.strip_prefix("--- a/"))
+            };
+            if let Some(path) = path {
+                push_proposal_path(out, repo_path, path.trim_end_matches('\r'));
+            }
+        }
+    }
+}
+
+fn push_proposal_path(out: &mut Vec<String>, repo_path: &Path, raw: &str) {
+    if out.len() >= COLLISION_MAX_PROPOSAL_PATHS {
+        return;
+    }
+    let raw = raw.trim();
+    let relative = Path::new(raw)
+        .strip_prefix(repo_path)
+        .map(|rest| rest.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+        .replace('\\', "/");
+    let relative = relative.trim_start_matches("./").trim_end_matches('/');
+    let relative = if relative.is_empty() { "." } else { relative };
+    if !out.iter().any(|existing| existing == relative) {
+        out.push(relative.to_string());
+    }
+}
+
+/// Two repository-relative paths overlap when they are the same file or one
+/// is a directory containing the other; `.` is the whole repository.
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == "."
+        || right == "."
+        || left == right
+        || right
+            .strip_prefix(left)
+            .is_some_and(|rest| rest.starts_with('/'))
+        || left
+            .strip_prefix(right)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn collision_hint(
+    found: &[agent_detect::AgentPresence],
+    caller: &CallerIdentity,
+    proposal_paths: Option<Vec<String>>,
+) -> Value {
+    let mut omitted = 0usize;
+    let mut overlapping_agents = 0usize;
+    let mut agents = Vec::new();
+    for presence in found {
+        if caller.likely_caller(presence) {
+            omitted += 1;
+            continue;
+        }
+        if agents.len() >= AGENTS_PRESENCE_MAX_AGENTS {
+            break;
+        }
+        let mut entry = presence_agent_json(presence, caller);
+        // Overlap is only computed when both sides name their files.
+        let overlapping = match (&proposal_paths, presence.files.is_empty()) {
+            (Some(paths), false) => {
+                let overlaps = presence
+                    .files
+                    .iter()
+                    .filter(|file| paths.iter().any(|path| paths_overlap(path, file)))
+                    .take(COLLISION_MAX_OVERLAPS)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !overlaps.is_empty() {
+                    overlapping_agents += 1;
+                }
+                json!(overlaps)
+            }
+            _ => Value::Null,
+        };
+        entry.insert("overlappingPaths".into(), overlapping);
+        agents.push(Value::Object(entry));
+    }
+    json!({
+        "informational": true,
+        "agents": agents,
+        "agentCount": agents.len(),
+        "overlappingAgentCount": overlapping_agents,
+        "proposalPathsKnown": proposal_paths.is_some(),
+        "omittedLikelyCaller": omitted,
+        "note": "Informational only: this never blocks the proposal or changes how it is approved. Other agents found working in this repository from local sources (process, session, repo-trace, ide, mcp); names are self-declared. overlappingPaths lists files both this proposal and that agent touch, and is null when either side's file list is unknown. Tell the user when another agent is working on the same files.",
+    })
+}
+
+// ----------------------------------------------------------------------------
+// fleet.digest: chronological Git activity across repositories (reflogs)
+//
+// The sidecar counterpart of the desktop's Fleet digest
+// (app/ui/src-tauri/src/fleet_digest.rs), with the same honesty rules:
+// identity is exactly what Git recorded for the ref move (the configured
+// committer identity, not proof of a person or an agent), and moves that
+// drop the previous tip from history (reset, amend, rebase, forced moves) are
+// flagged `rewrote`. Reflog files are read directly, tail-bounded; nothing
+// is written, fetched or checked out. The desktop's own Fleet batch record is
+// not read here.
+// ----------------------------------------------------------------------------
+
+const FLEET_DIGEST_MAX_REPOS: usize = 500;
+const FLEET_DIGEST_MAX_EVENTS_PER_REPO: usize = 200;
+const FLEET_DIGEST_DEFAULT_MAX_EVENTS: u64 = 200;
+const FLEET_DIGEST_MAX_EVENTS: u64 = 1_000;
+const FLEET_DIGEST_MAX_MESSAGE_CHARS: usize = 200;
+const FLEET_DIGEST_MAX_IDENTITY_CHARS: usize = 256;
+const FLEET_DIGEST_REFLOG_TAIL_BYTES: u64 = 1024 * 1024;
+const FLEET_DIGEST_MAX_REFLOG_FILES: usize = 2_000;
+const FLEET_DIGEST_MAX_REGISTRY_ENTRIES: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DigestEvent {
+    repo_path: String,
+    at_ms: i64,
+    ref_name: String,
+    /// Classification of the reflog message, before `fluxgit` is folded in.
+    raw_kind: &'static str,
+    old_oid: Option<String>,
+    new_oid: Option<String>,
+    message: String,
+    identity: String,
+}
+
+/// Same classification as the desktop digest.
+fn classify_reflog_message(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.starts_with("fleet radar:") {
+        "fluxgit"
+    } else if lower.starts_with("commit (amend)") {
+        "amend"
+    } else if lower.starts_with("commit (merge)") || lower.starts_with("merge ") {
+        "merge"
+    } else if lower.starts_with("commit") {
+        "commit"
+    } else if lower.starts_with("checkout:") || lower.starts_with("switch") {
+        "checkout"
+    } else if lower.starts_with("pull") {
+        "pull"
+    } else if lower.starts_with("reset:") {
+        "reset"
+    } else if lower.starts_with("rebase") {
+        "rebase"
+    } else if lower.starts_with("cherry-pick") {
+        "cherryPick"
+    } else if lower.starts_with("revert") {
+        "revert"
+    } else if lower.starts_with("branch:") {
+        "branch"
+    } else if lower.starts_with("fetch") {
+        "fetch"
+    } else {
+        "other"
+    }
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max {
+        trimmed.to_owned()
+    } else {
+        format!("{}…", trimmed.chars().take(max - 1).collect::<String>())
+    }
+}
+
+fn is_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// One reflog file line: `<old> <new> <name> <<email>> <seconds> <tz>\t<msg>`.
+fn parse_reflog_file_line(line: &str) -> Option<(String, String, String, i64, String)> {
+    let (header, message) = line.split_once('\t').unwrap_or((line, ""));
+    let mut parts = header.splitn(3, ' ');
+    let old = parts.next()?;
+    let new = parts.next()?;
+    let rest = parts.next()?;
+    if !is_object_id(old) || !is_object_id(new) {
+        return None;
+    }
+    let mut tail = rest.rsplitn(3, ' ');
+    let _timezone = tail.next()?;
+    let seconds = tail.next()?.parse::<i64>().ok()?;
+    let identity = tail.next()?;
+    Some((
+        old.to_ascii_lowercase(),
+        new.to_ascii_lowercase(),
+        identity.to_string(),
+        seconds,
+        message.to_string(),
+    ))
+}
+
+fn is_zero_oid(oid: &str) -> bool {
+    oid.bytes().all(|byte| byte == b'0')
+}
+
+/// The last `FLEET_DIGEST_REFLOG_TAIL_BYTES` of a reflog, whole lines only.
+fn read_reflog_tail(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let start = metadata
+        .len()
+        .saturating_sub(FLEET_DIGEST_REFLOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(FLEET_DIGEST_REFLOG_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Some(if start > 0 {
+        text.split_once('\n')
+            .map(|(_, rest)| rest.to_owned())
+            .unwrap_or_default()
+    } else {
+        text
+    })
+}
+
+/// `refs/heads/...` reflog files under `<common dir>/logs/refs/heads`,
+/// without following symlinks.
+fn branch_reflog_files(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= FLEET_DIGEST_MAX_REFLOG_FILES {
+            return;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ref_name = format!("{prefix}/{name}");
+        if kind.is_dir() && depth > 0 {
+            branch_reflog_files(&entry.path(), &ref_name, depth - 1, out);
+        } else if kind.is_file() {
+            out.push((ref_name, entry.path()));
+        }
+    }
+}
+
+/// The repository's own git dir and the common dir holding branch reflogs
+/// (they differ in a linked worktree).
+fn reflog_dirs(repo_path: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let git_dir =
+        run_git(repo_path, &["rev-parse", "--absolute-git-dir"]).map_err(|error| error.message)?;
+    let git_dir = PathBuf::from(git_dir.trim());
+    let common = fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .map(|relative| git_dir.join(relative.trim()))
+        .and_then(|path| path.canonicalize().ok())
+        .unwrap_or_else(|| git_dir.clone());
+    Ok((git_dir, common))
+}
+
+/// Reflog events of HEAD and local branches at or after `since_ms`, newest
+/// first, at most `FLEET_DIGEST_MAX_EVENTS_PER_REPO` (the flag says if more).
+fn repo_digest_events(repo_path: &Path, since_ms: i64) -> Result<(Vec<DigestEvent>, bool), String> {
+    ensure_git_repo(repo_path).map_err(|error| error.message)?;
+    let (git_dir, common_dir) = reflog_dirs(repo_path)?;
+    let mut files = Vec::new();
+    branch_reflog_files(
+        &common_dir.join("logs").join("refs").join("heads"),
+        "refs/heads",
+        16,
+        &mut files,
+    );
+    files.sort();
+    // Branch reflogs first, so a commit on the checked-out branch is
+    // reported against its branch and the identical HEAD entry is dropped.
+    files.push(("HEAD".to_string(), git_dir.join("logs").join("HEAD")));
+    let repo_label = repo_path.to_string_lossy().into_owned();
+    let mut seen = std::collections::HashSet::new();
+    let mut events = Vec::new();
+    for (ref_name, file) in files {
+        let Some(text) = read_reflog_tail(&file) else {
+            continue;
+        };
+        for line in text.lines().rev() {
+            let Some((old, new, identity, seconds, message)) = parse_reflog_file_line(line) else {
+                continue;
+            };
+            let at_ms = seconds.saturating_mul(1000);
+            if at_ms < since_ms {
+                break;
+            }
+            if !seen.insert((old.clone(), new.clone(), at_ms, message.clone())) {
+                continue;
+            }
+            events.push(DigestEvent {
+                repo_path: repo_label.clone(),
+                at_ms,
+                ref_name: ref_name.clone(),
+                raw_kind: classify_reflog_message(&message),
+                old_oid: (!is_zero_oid(&old)).then_some(old),
+                new_oid: (!is_zero_oid(&new)).then_some(new),
+                message: clip_chars(&message, FLEET_DIGEST_MAX_MESSAGE_CHARS),
+                identity: clip_chars(&identity, FLEET_DIGEST_MAX_IDENTITY_CHARS),
+            });
+        }
+    }
+    events.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    let truncated = events.len() > FLEET_DIGEST_MAX_EVENTS_PER_REPO;
+    events.truncate(FLEET_DIGEST_MAX_EVENTS_PER_REPO);
+    Ok((events, truncated))
+}
+
+/// Whether a ref move dropped its previous tip from history. Moving HEAD
+/// between branches is not a rewrite; moving a branch, or resetting,
+/// amending or rebasing HEAD, is unless the new tip still contains the old.
+/// A previous tip Git can no longer find counts as rewritten, as on the
+/// desktop.
+fn digest_event_rewrote(event: &DigestEvent) -> bool {
+    let (Some(old), Some(new)) = (&event.old_oid, &event.new_oid) else {
+        return false;
+    };
+    if old == new {
+        return false;
+    }
+    if event.ref_name == "HEAD" && !matches!(event.raw_kind, "reset" | "amend" | "rebase") {
+        return false;
+    }
+    !run_git_status(
+        Path::new(&event.repo_path),
+        &["merge-base", "--is-ancestor", old, new],
+    )
+}
+
+fn digest_event_json(event: &DigestEvent) -> Value {
+    let fluxgit = event.raw_kind == "fluxgit";
+    json!({
+        "repoPath": event.repo_path,
+        "atMs": event.at_ms,
+        "refName": event.ref_name,
+        "kind": if fluxgit { "branch" } else { event.raw_kind },
+        "oldOid": event.old_oid,
+        "newOid": event.new_oid,
+        "message": event.message,
+        "identity": event.identity,
+        "rewrote": digest_event_rewrote(event),
+        "source": if fluxgit { "fluxgit" } else { "git" },
+    })
+}
+
+/// Parsed `FLUXGIT_MCP_ALLOWED_ROOTS` (canonical), or `None` when unset.
+fn parse_allowed_roots(
+    configured: Option<&std::ffi::OsStr>,
+) -> Result<Option<Vec<PathBuf>>, JsonRpcError> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    let invalid = |details: Value| JsonRpcError {
+        code: -32010,
+        message: "Invalid MCP allowed-roots configuration".into(),
+        data: Some(details),
+    };
+    if configured.to_string_lossy().trim().is_empty() {
+        return Err(invalid(json!({
+            "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+            "details": "the configured root list is empty",
+        })));
+    }
+    let roots = env::split_paths(configured)
+        .map(|root| {
+            if root.as_os_str().is_empty() || !root.is_absolute() {
+                return Err(invalid(json!({
+                    "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+                    "details": "each configured root must be a non-empty absolute filesystem path",
+                })));
+            }
+            root.canonicalize().map_err(|error| {
+                invalid(json!({
+                    "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+                    "root": root,
+                    "details": error.to_string(),
+                }))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if roots.is_empty() {
+        return Err(invalid(json!({
+            "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
+            "details": "the configured root list is empty",
+        })));
+    }
+    Ok(Some(roots))
+}
+
+/// Repositories FluxGit has registered (`<run_dir>/repos/*.path`), canonical,
+/// inside the allowed roots when those are configured. Returns the paths and
+/// how many registered repositories were left out by the allowed roots.
+fn registered_repositories(
+    run_dir: Option<&Path>,
+    roots: Option<&[PathBuf]>,
+) -> (Vec<PathBuf>, usize) {
+    let Some(run_dir) = run_dir else {
+        return (Vec::new(), 0);
+    };
+    let Ok(entries) = fs::read_dir(run_dir.join("repos")) else {
+        return (Vec::new(), 0);
+    };
+    let mut paths = Vec::new();
+    let mut excluded = 0;
+    for entry in entries.flatten().take(FLEET_DIGEST_MAX_REGISTRY_ENTRIES) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("path") {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MCP_MAX_PATH_CHARS as u64 {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let raw = Path::new(contents.trim());
+        if !raw.is_absolute() {
+            continue;
+        }
+        let Ok(canonical) = raw.canonicalize() else {
+            continue;
+        };
+        if roots.is_some_and(|roots| !canonical_path_is_within_roots(&canonical, roots)) {
+            excluded += 1;
+            continue;
+        }
+        if !paths.contains(&canonical) {
+            paths.push(canonical);
+        }
+    }
+    paths.sort();
+    (paths, excluded)
+}
+
+fn render_fleet_digest_tool_result(arguments: &Value) -> ToolCallResult {
+    let kind = ToolKind::FleetDigest;
+    let configured = env::var_os(MCP_ALLOWED_ROOTS_ENV);
+    let payload = parse_allowed_roots(configured.as_deref()).and_then(|roots| {
+        fleet_digest_payload(arguments, fluxgit_run_dir().as_deref(), roots.as_deref())
+    });
+    match payload {
+        Ok(payload) => text_tool_result(
+            json!({
+                "tool": kind.as_str(),
+                "readOnly": true,
+                "source": "local-git",
+                "data": payload,
+            }),
+            false,
+        ),
+        Err(error) => text_tool_result(
+            json!({
+                "error": error,
+                "tool": kind.as_str(),
+                "readOnly": true,
+                "source": "local-git",
+            }),
+            true,
+        ),
+    }
+}
+
+/// `repoPaths` arrive canonical and inside the allowed roots (checked by the
+/// shared argument validation); without them the FluxGit registry is used,
+/// filtered by the same roots.
+fn fleet_digest_payload(
+    arguments: &Value,
+    run_dir: Option<&Path>,
+    roots: Option<&[PathBuf]>,
+) -> Result<Value, JsonRpcError> {
+    let started = now_ms();
+    let since_ms = arguments
+        .get("sinceMs")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| invalid_params_error("fleet.digest requires sinceMs"))?;
+    let max_events = arguments
+        .get("maxEvents")
+        .and_then(Value::as_u64)
+        .unwrap_or(FLEET_DIGEST_DEFAULT_MAX_EVENTS)
+        .clamp(1, FLEET_DIGEST_MAX_EVENTS) as usize;
+    let (paths, repo_source, excluded) = match arguments.get("repoPaths").and_then(Value::as_array)
+    {
+        Some(values) => (
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect::<Vec<_>>(),
+            "arguments",
+            0,
+        ),
+        None => {
+            let (paths, excluded) = registered_repositories(run_dir, roots);
+            (paths, "fluxgit-registry", excluded)
+        }
+    };
+    if paths.is_empty() {
+        return Err(invalid_params_error(
+            "fleet.digest found no repositories: pass repoPaths (FluxGit has no registered repositories here, or none inside FLUXGIT_MCP_ALLOWED_ROOTS)",
+        ));
+    }
+    let mut unique = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !unique.contains(&path) {
+            unique.push(path);
+        }
+    }
+    let mut paths = unique;
+    let requested = paths.len();
+    paths.truncate(FLEET_DIGEST_MAX_REPOS);
+
+    let mut repos = Vec::with_capacity(paths.len());
+    let mut events = Vec::new();
+    for path in &paths {
+        match repo_digest_events(path, since_ms) {
+            Ok((mut found, truncated)) => {
+                repos.push(json!({
+                    "repoPath": path,
+                    "error": null,
+                    "truncated": truncated,
+                    "eventCount": found.len(),
+                }));
+                events.append(&mut found);
+            }
+            Err(error) => repos.push(json!({
+                "repoPath": path,
+                "error": clip_chars(&error, 512),
+                "truncated": false,
+                "eventCount": 0,
+            })),
+        }
+    }
+    events.sort_by(|a, b| {
+        b.at_ms
+            .cmp(&a.at_ms)
+            .then_with(|| a.repo_path.cmp(&b.repo_path))
+    });
+    let repo_truncated = repos
+        .iter()
+        .any(|repo| repo["truncated"].as_bool() == Some(true));
+    let truncated = events.len() > max_events || repo_truncated || requested > paths.len();
+    events.truncate(max_events);
+    // The rewrite check runs Git, so only for the events actually returned.
+    let events = events.iter().map(digest_event_json).collect::<Vec<_>>();
+    Ok(json!({
+        "sinceMs": since_ms,
+        "events": events,
+        "eventCount": events.len(),
+        "repos": repos,
+        "repoSource": repo_source,
+        "requestedRepoCount": requested,
+        "excludedOutsideAllowedRoots": excluded,
+        "truncated": truncated,
+        "elapsedMs": now_ms().saturating_sub(started),
+        "attribution": "identity is exactly what Git recorded for each ref move: the identity configured in that repository, not proof of whether a person or an agent made the change. rewrote marks moves whose previous tip is no longer in the new history (reset, amend, rebase, forced moves).",
+        "guidance": "Read-only: reflogs of HEAD and local branches, newest first. Nothing is fetched, written or checked out. FluxGit's own Fleet batch record is not included; open the Fleet digest in FluxGit for it.",
+    }))
 }
 
 fn ensure_git_repo(repo_path: &Path) -> Result<(), JsonRpcError> {
@@ -5007,7 +5969,10 @@ fn repo_reflog_payload(repo_path: &Path, arguments: &Value) -> Result<Value, Jso
             "show",
             ref_name,
             "--date=unix",
-            "--pretty=format:%H%x1f%h%x1f%gd%x1f%gs%x1f%gn%x1f%ge%x1f%gt",
+            // There is no reflog-time placeholder: `%gt` never existed and git
+            // printed it literally, so every timestamp parsed as 0. Under
+            // --date=unix the selector itself is `<ref>@{<unix seconds>}`.
+            "--pretty=format:%H%x1f%h%x1f%gd%x1f%gs%x1f%gn%x1f%ge",
             &max_arg,
         ],
     )?;
@@ -7075,8 +8040,8 @@ fn parse_commit_details(details: &str) -> Value {
 }
 
 fn parse_reflog_line(line: &str) -> Option<Value> {
-    let parts: Vec<&str> = line.splitn(7, '\x1f').collect();
-    if parts.len() != 7 {
+    let parts: Vec<&str> = line.splitn(6, '\x1f').collect();
+    if parts.len() != 6 {
         return None;
     }
     Some(json!({
@@ -7086,8 +8051,18 @@ fn parse_reflog_line(line: &str) -> Option<Value> {
         "message": parts[3],
         "authorName": parts[4],
         "authorEmail": parts[5],
-        "timestamp": parts[6].parse::<i64>().unwrap_or_default(),
+        "timestamp": reflog_selector_unix_seconds(parts[2]).unwrap_or_default(),
     }))
+}
+
+/// `HEAD@{1780480800}` (a selector printed under `--date=unix`) to its
+/// reflog time in Unix seconds. Positional selectors (`HEAD@{0}`) are not
+/// times and are refused rather than misread.
+fn reflog_selector_unix_seconds(selector: &str) -> Option<i64> {
+    let inner = selector.rsplit_once("@{")?.1.strip_suffix('}')?;
+    let seconds = inner.parse::<i64>().ok()?;
+    // Index selectors are small; any real reflog time is after 2001.
+    (seconds >= 1_000_000_000).then_some(seconds)
 }
 
 fn parse_name_status(line: &str) -> Value {
@@ -7118,6 +8093,8 @@ impl ToolKind {
             "safety.timeline" => Some(Self::SafetyTimeline),
             "safety.eventDetails" => Some(Self::SafetyEventDetails),
             "fleet.radar" => Some(Self::FleetRadar),
+            "fleet.digest" => Some(Self::FleetDigest),
+            "agents.presence" => Some(Self::AgentsPresence),
             "repo.brief" => Some(Self::RepoBrief),
             "repo.scope" => Some(Self::RepoScope),
             "repo.status" => Some(Self::RepoStatus),
@@ -7149,6 +8126,8 @@ impl ToolKind {
             "operation.preview.commit" => Some(Self::OperationPreviewCommit),
             "operation.preview.push" => Some(Self::OperationPreviewPush),
             "operation.preview.branch" => Some(Self::OperationPreviewBranch),
+            "operation.preview.branchDelete" => Some(Self::OperationPreviewBranchDelete),
+            "operation.preview.submodulePointer" => Some(Self::OperationPreviewSubmodulePointer),
             _ => None,
         }
     }
@@ -7199,6 +8178,7 @@ fn write_handshake_tools() -> Vec<ToolSpec> {
                         | ToolKind::OperationPreviewPatch
                         | ToolKind::OperationPreviewPlan
                         | ToolKind::OperationPreviewPush
+                        | ToolKind::OperationPreviewBranchDelete
                 )),
                 // Cancellation is idempotent. Preview admission has bounded
                 // deduplication, but after lifecycle retention/pruning the same
@@ -7236,12 +8216,16 @@ fn tool_output_schema(kind: ToolKind, read_only: bool) -> Value {
         // sidecar and app can be upgraded independently.
         "additionalProperties": true
     });
+    if is_operation_preview(kind) {
+        schema["properties"]["otherAgents"] = other_agents_hint_output_schema();
+    }
     schema["anyOf"] = tool_output_variants(kind);
     schema
 }
 
 fn tool_output_source_schema(kind: ToolKind) -> Value {
     match kind {
+        ToolKind::AgentsPresence => json!({ "const": "local-agent-detector" }),
         ToolKind::DiffSemantic | ToolKind::DiffSemanticFallbacks => {
             json!({ "enum": ["local-git", "fluxgit-gateway"] })
         }
@@ -7256,7 +8240,9 @@ fn tool_output_source_schema(kind: ToolKind) -> Value {
         | ToolKind::OperationPreviewWorktree
         | ToolKind::OperationPreviewCommit
         | ToolKind::OperationPreviewPush
-        | ToolKind::OperationPreviewBranch => json!({ "const": "fluxgit-app" }),
+        | ToolKind::OperationPreviewBranch
+        | ToolKind::OperationPreviewBranchDelete
+        | ToolKind::OperationPreviewSubmodulePointer => json!({ "const": "fluxgit-app" }),
         _ => json!({ "const": "local-git" }),
     }
 }
@@ -7274,7 +8260,9 @@ fn tool_output_tier_schema(kind: ToolKind) -> Value {
         | ToolKind::OperationPreviewWorktree
         | ToolKind::OperationPreviewCommit
         | ToolKind::OperationPreviewPush
-        | ToolKind::OperationPreviewBranch => {
+        | ToolKind::OperationPreviewBranch
+        | ToolKind::OperationPreviewBranchDelete
+        | ToolKind::OperationPreviewSubmodulePointer => {
             json!({ "const": "fluxgit-write-handshake" })
         }
         ToolKind::SafetyTimeline
@@ -7301,7 +8289,9 @@ fn tool_output_variants(kind: ToolKind) -> Value {
         | ToolKind::OperationPreviewWorktree
         | ToolKind::OperationPreviewCommit
         | ToolKind::OperationPreviewPush
-        | ToolKind::OperationPreviewBranch => json!([
+        | ToolKind::OperationPreviewBranch
+        | ToolKind::OperationPreviewBranchDelete
+        | ToolKind::OperationPreviewSubmodulePointer => json!([
             {
                 "type": "object",
                 "properties": { "status": { "const": "completed" } },
@@ -7353,7 +8343,7 @@ fn tool_output_variants(kind: ToolKind) -> Value {
                 "required": ["tier", "error"]
             }
         ]),
-        ToolKind::FleetRadar => json!([
+        ToolKind::FleetRadar | ToolKind::FleetDigest => json!([
             { "type": "object", "required": ["source", "data"] },
             { "type": "object", "required": ["error"] }
         ]),
@@ -7371,6 +8361,8 @@ fn tool_data_schema(kind: ToolKind) -> Value {
         ToolKind::SafetyTimeline => safety_timeline_output_schema(),
         ToolKind::SafetyEventDetails => safety_event_details_output_schema(),
         ToolKind::FleetRadar => fleet_radar_output_schema(),
+        ToolKind::FleetDigest => fleet_digest_output_schema(),
+        ToolKind::AgentsPresence => agents_presence_output_schema(),
         ToolKind::RepoStatus => repo_status_output_schema(),
         ToolKind::RepoRefs => repo_refs_output_schema(),
         ToolKind::RepoBranchStack => repo_branch_stack_output_schema(),
@@ -7405,7 +8397,9 @@ fn tool_data_schema(kind: ToolKind) -> Value {
         | ToolKind::OperationPreviewWorktree
         | ToolKind::OperationPreviewCommit
         | ToolKind::OperationPreviewPush
-        | ToolKind::OperationPreviewBranch => {
+        | ToolKind::OperationPreviewBranch
+        | ToolKind::OperationPreviewBranchDelete
+        | ToolKind::OperationPreviewSubmodulePointer => {
             operation_status_data_schema(Some(kind), Some("completed"))
         }
     }
@@ -7954,6 +8948,182 @@ fn fleet_radar_output_schema() -> Value {
             "elapsedMs",
             "network",
             "guidance",
+        ],
+    )
+}
+
+fn fleet_digest_output_schema() -> Value {
+    let event = output_object(
+        json!({
+            "repoPath": { "type": "string", "minLength": 1 },
+            "atMs": { "type": "integer" },
+            "refName": { "type": "string", "minLength": 1 },
+            "kind": {
+                "enum": [
+                    "commit", "amend", "merge", "checkout", "pull", "reset", "rebase",
+                    "cherryPick", "revert", "branch", "fetch", "other"
+                ]
+            },
+            "oldOid": nullable_string_output_schema(),
+            "newOid": nullable_string_output_schema(),
+            "message": { "type": "string" },
+            "identity": { "type": "string" },
+            "rewrote": { "type": "boolean" },
+            "source": { "enum": ["git", "fluxgit"] },
+        }),
+        &[
+            "repoPath", "atMs", "refName", "kind", "oldOid", "newOid", "message", "identity",
+            "rewrote", "source",
+        ],
+    );
+    let repo = output_object(
+        json!({
+            "repoPath": { "type": "string", "minLength": 1 },
+            "error": nullable_string_output_schema(),
+            "truncated": { "type": "boolean" },
+            "eventCount": non_negative_integer_output_schema(),
+        }),
+        &["repoPath", "error", "truncated", "eventCount"],
+    );
+    output_object(
+        json!({
+            "sinceMs": { "type": "integer" },
+            "events": bounded_output_array(event, 1000),
+            "eventCount": { "type": "integer", "minimum": 0, "maximum": 1000 },
+            "repos": bounded_output_array(repo, 500),
+            "repoSource": { "enum": ["arguments", "fluxgit-registry"] },
+            "requestedRepoCount": non_negative_integer_output_schema(),
+            "excludedOutsideAllowedRoots": non_negative_integer_output_schema(),
+            "truncated": { "type": "boolean" },
+            "elapsedMs": non_negative_integer_output_schema(),
+            "attribution": { "type": "string", "minLength": 1 },
+            "guidance": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "sinceMs",
+            "events",
+            "eventCount",
+            "repos",
+            "repoSource",
+            "requestedRepoCount",
+            "excludedOutsideAllowedRoots",
+            "truncated",
+            "elapsedMs",
+            "attribution",
+            "guidance",
+        ],
+    )
+}
+
+/// One detected agent, as `agents.presence` and the collision hint list it.
+fn detected_agent_output_schema(extra: Value, extra_required: &[&str]) -> Value {
+    let mut properties = json!({
+        "agent": { "type": "string", "minLength": 1 },
+        "state": { "enum": ["working", "open", "recent"] },
+        "sources": bounded_output_array(
+            json!({ "enum": ["process", "session", "repo-trace", "ide", "mcp"] }),
+            5,
+        ),
+        "pid": nullable_output_schema(non_negative_integer_output_schema()),
+        "lastActivityMs": nullable_output_schema(json!({ "type": "integer" })),
+        "branch": nullable_string_output_schema(),
+        "lastTool": nullable_string_output_schema(),
+        "files": bounded_output_array(json!({ "type": "string" }), 8),
+        "mcpClient": nullable_output_schema(output_object(
+            json!({
+                "name": { "type": "string", "minLength": 1 },
+                "version": nullable_string_output_schema(),
+            }),
+            &["name", "version"],
+        )),
+        "sameAgentAsCaller": { "type": "boolean" },
+    });
+    if let (Some(properties), Some(extra)) = (properties.as_object_mut(), extra.as_object()) {
+        properties.extend(extra.clone());
+    }
+    let mut required = vec![
+        "agent",
+        "state",
+        "sources",
+        "pid",
+        "lastActivityMs",
+        "branch",
+        "lastTool",
+        "files",
+        "mcpClient",
+        "sameAgentAsCaller",
+    ];
+    required.extend_from_slice(extra_required);
+    output_object(properties, &required)
+}
+
+fn agents_presence_output_schema() -> Value {
+    output_object(
+        json!({
+            "repoPath": { "type": "string", "minLength": 1 },
+            "agents": bounded_output_array(
+                detected_agent_output_schema(
+                    json!({ "likelyCaller": { "type": "boolean" } }),
+                    &["likelyCaller"],
+                ),
+                AGENTS_PRESENCE_MAX_AGENTS,
+            ),
+            "agentCount": { "type": "integer", "minimum": 0, "maximum": AGENTS_PRESENCE_MAX_AGENTS },
+            "truncated": { "type": "boolean" },
+            "caller": output_object(
+                json!({
+                    "clientName": nullable_string_output_schema(),
+                    "agent": nullable_string_output_schema(),
+                    "ownMcpPresenceExcluded": { "const": true },
+                }),
+                &["clientName", "agent", "ownMcpPresenceExcluded"],
+            ),
+            "privacy": { "type": "string", "minLength": 1 },
+            "guidance": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "repoPath",
+            "agents",
+            "agentCount",
+            "truncated",
+            "caller",
+            "privacy",
+            "guidance",
+        ],
+    )
+}
+
+/// The optional `otherAgents` hint on operation.preview.* results (§14.11).
+fn other_agents_hint_output_schema() -> Value {
+    output_object(
+        json!({
+            "informational": { "const": true },
+            "agents": bounded_output_array(
+                detected_agent_output_schema(
+                    json!({
+                        "overlappingPaths": nullable_output_schema(bounded_output_array(
+                            json!({ "type": "string" }),
+                            COLLISION_MAX_OVERLAPS,
+                        )),
+                    }),
+                    &["overlappingPaths"],
+                ),
+                AGENTS_PRESENCE_MAX_AGENTS,
+            ),
+            "agentCount": { "type": "integer", "minimum": 0, "maximum": AGENTS_PRESENCE_MAX_AGENTS },
+            "overlappingAgentCount": non_negative_integer_output_schema(),
+            "proposalPathsKnown": { "type": "boolean" },
+            "omittedLikelyCaller": non_negative_integer_output_schema(),
+            "note": { "type": "string", "minLength": 1 },
+        }),
+        &[
+            "informational",
+            "agents",
+            "agentCount",
+            "overlappingAgentCount",
+            "proposalPathsKnown",
+            "omittedLikelyCaller",
+            "note",
         ],
     )
 }
@@ -8609,6 +9779,8 @@ fn operation_type_for_kind(kind: ToolKind) -> Option<&'static str> {
         ToolKind::OperationPreviewCommit => Some("commit"),
         ToolKind::OperationPreviewPush => Some("push"),
         ToolKind::OperationPreviewBranch => Some("branch"),
+        ToolKind::OperationPreviewBranchDelete => Some("branchDelete"),
+        ToolKind::OperationPreviewSubmodulePointer => Some("submodulePointer"),
         _ => None,
     }
 }
@@ -8641,6 +9813,63 @@ fn plan_step_result_output_schema() -> Value {
             "restorePoint": operation_restore_point_output_schema(),
         }),
         &["operationType", "status"],
+    )
+}
+
+/// `result.branchDelete` of a completed/failed branch-delete proposal.
+fn branch_delete_result_output_schema() -> Value {
+    let branch = output_object(
+        json!({
+            "branch": { "type": "string" },
+            "status": { "enum": ["deleted", "failed", "skipped"] },
+            "tipOid": { "type": "string" },
+            "restoreOid": { "type": "string" },
+            "fleetBatchId": { "type": "string" },
+            "reason": { "type": "string" },
+        }),
+        &["branch", "status"],
+    );
+    let repository = output_object(
+        json!({
+            "repoPath": { "type": "string" },
+            "branches": output_array(branch),
+        }),
+        &["repoPath", "branches"],
+    );
+    output_object(
+        json!({
+            "deleted": non_negative_integer_output_schema(),
+            "failed": non_negative_integer_output_schema(),
+            "skipped": non_negative_integer_output_schema(),
+            "repositories": output_array(repository),
+        }),
+        &["deleted", "failed", "skipped", "repositories"],
+    )
+}
+
+/// `result.submodulePointer` of a completed submodule-pointer proposal. The
+/// generic `restorePoint` is deliberately not used for it: undoing a
+/// submodule checkout must not reset the open repository.
+fn submodule_pointer_result_output_schema() -> Value {
+    output_object(
+        json!({
+            "direction": { "enum": ["record", "return"] },
+            "parentPath": { "type": "string" },
+            "relativePath": { "type": "string" },
+            "parentHeadRef": { "type": "string" },
+            "previousParentOid": { "type": "string" },
+            "commitSha": { "type": "string" },
+            "pointerOid": { "type": "string" },
+            "checkedOutOid": { "type": "string" },
+            "restorePoint": output_object(
+                json!({
+                    "previousRef": nullable_string_output_schema(),
+                    "previousOid": { "type": "string" },
+                }),
+                &["previousOid"],
+            ),
+        }),
+        &["direction", "parentPath", "relativePath"],
     )
 }
 
@@ -8707,6 +9936,14 @@ fn operation_completion_result_schema(kind: Option<ToolKind>) -> Value {
             insert("branch", json!({ "type": "string" }));
             insert("checkedOut", json!({ "type": "boolean" }));
         }
+        Some(ToolKind::OperationPreviewBranchDelete) => {
+            insert("error", json!({ "type": "string" }));
+            insert("branchDelete", branch_delete_result_output_schema());
+        }
+        Some(ToolKind::OperationPreviewSubmodulePointer) => {
+            insert("commitSha", json!({ "type": "string" }));
+            insert("submodulePointer", submodule_pointer_result_output_schema());
+        }
         None | Some(_) => {
             // operation.status is discriminated by data.operationType rather
             // than one fixed tool kind, so advertise every stable result key.
@@ -8736,6 +9973,8 @@ fn operation_completion_result_schema(kind: Option<ToolKind>) -> Value {
                 ("pushedRef", json!({ "type": "string" })),
                 ("remote", json!({ "type": "string" })),
                 ("checkedOut", json!({ "type": "boolean" })),
+                ("branchDelete", branch_delete_result_output_schema()),
+                ("submodulePointer", submodule_pointer_result_output_schema()),
             ] {
                 insert(name, schema);
             }
@@ -8773,7 +10012,7 @@ fn operation_status_data_schema(kind: Option<ToolKind>, status: Option<&str>) ->
             json!({
                 "enum": [
                     "merge", "rebase", "discard", "reset", "patch", "plan", "worktree",
-                    "commit", "push", "branch"
+                    "commit", "push", "branch", "branchDelete", "submodulePointer"
                 ]
             })
         });
@@ -8808,7 +10047,7 @@ fn operation_cancel_data_schema() -> Value {
             "operationType": {
                 "enum": [
                     "merge", "rebase", "discard", "reset", "patch", "plan", "worktree",
-                    "commit", "push", "branch"
+                    "commit", "push", "branch", "branchDelete", "submodulePointer"
                 ]
             },
             // User overrides are explicitly free-form in the durable gateway
@@ -8841,6 +10080,24 @@ fn operation_cancel_data_schema() -> Value {
             "name": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
             "startPoint": { "type": "string", "maxLength": MCP_MAX_REF_CHARS },
             "checkout": { "type": "boolean" },
+            "targets": bounded_output_array(
+                output_object(
+                    json!({
+                        "repoPath": { "type": "string", "maxLength": MCP_MAX_PATH_CHARS },
+                        "branches": bounded_output_array(
+                            json!({ "type": "string", "maxLength": MCP_MAX_REF_CHARS }),
+                            BRANCH_DELETE_MAX_BRANCHES_PER_TARGET,
+                        ),
+                    }),
+                    &["repoPath", "branches"],
+                ),
+                BRANCH_DELETE_MAX_TARGETS,
+            ),
+            "parentPath": { "type": "string", "maxLength": MCP_MAX_PATH_CHARS },
+            "relativePath": { "type": "string", "maxLength": MCP_MAX_PATH_CHARS },
+            "direction": { "enum": ["record", "return"] },
+            "expectedRecordedOid": { "type": "string" },
+            "expectedCheckedOutOid": { "type": "string" },
         }),
         &["previewId", "status"],
     )
@@ -8889,6 +10146,12 @@ fn tool_description(kind: ToolKind) -> &'static str {
         }
         ToolKind::FleetRadar => {
             "Summarize many local repositories into one read-only attention stack — dirty state, divergence and predictive conflict signals per repo — without fetching or mutating disk state. Use it for 'which repo needs me first?' across a fleet; it replaces opening each repo one by one. Returns prioritized entries plus an attentionStack of one-line summaries."
+        }
+        ToolKind::FleetDigest => {
+            "Chronological digest of Git activity across many local repositories since a time: every HEAD and local-branch reflog move (commits, checkouts, merges, resets, rebases, pulls) newest first, without fetching or mutating anything. Use it for 'what changed across my repos while I was away?' and to review what agents did overnight. Pass repoPaths, or omit them to use the repositories registered in FluxGit. identity is exactly what Git recorded (the configured identity, not proof of a person or an agent); rewrote flags moves that dropped the previous tip (reset, amend, rebase, forced moves). Output is bounded by maxEvents."
+        }
+        ToolKind::AgentsPresence => {
+            "Which other coding agents are working in this repository right now, read from local sources only: running agent processes and their children, the agents' own session stores, files they keep in the repository, editors with built-in agents, and FluxGit's MCP presence records. Each finding says its sources, state (working/open/recent), branch, last tool and repository-relative files when known. Agent names are what each tool or MCP client declares about itself, not authenticated identity. Your own MCP record is excluded and findings that are probably your own session are marked likelyCaller. Call it before editing shared files or proposing an operation, and tell the user about overlaps. Never returns prompts, messages or file contents."
         }
         ToolKind::RepoStatus => {
             "Summarize working-tree cleanliness and branch divergence: current branch, ahead/behind upstream and changed-file count in one compact snapshot. Use it as the cheap freshness check before recommending any operation (repo.brief gives the fuller session-start picture). Returns { branch, ahead, behind, clean, changedFiles }."
@@ -8974,6 +10237,12 @@ fn tool_description(kind: ToolKind) -> &'static str {
         ToolKind::OperationPreviewBranch => {
             "Propose creating a local branch for human review. Provide `name` and `reason`; `startPoint` defaults to HEAD and `checkout` defaults true. The call returns a previewId promptly; poll operation.status for the terminal result. FluxGit requires approval and validates the ref before adding or checking out the branch."
         }
+        ToolKind::OperationPreviewBranchDelete => {
+            "Propose deleting merged local branches in one or more repositories. `repoPath` is the repository the approval binds to and must be one of `targets`; each target names short local branch names (no refs/ prefix). FluxGit inspects every branch natively, keeps any branch with commits not in HEAD or its upstream (or checked out anywhere), records each deleted tip as a restore point and asks the human to confirm. Remote branches are never touched. The call returns a previewId promptly; poll operation.status for per-branch results."
+        }
+        ToolKind::OperationPreviewSubmodulePointer => {
+            "Propose recording or returning one submodule pointer at any depth. `record` commits the submodule's current checkout as the parent's new pointer (requires `message`; hooks and signing apply; nothing is pushed). `return` checks out, detached, the commit the parent records, keeping the previous checkout as a restore point (no `message`). Call submodule.status first and pass `expectedRecordedOid` and `expectedCheckedOutOid` as pins. The submodule must be initialized, clean and differ from its recorded pointer. The call returns a previewId promptly; poll operation.status for the terminal result."
+        }
     }
 }
 
@@ -9003,6 +10272,43 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             "type": "object",
             "properties": properties,
             "required": ["previewId"],
+            "additionalProperties": false,
+        });
+    }
+
+    if kind == ToolKind::FleetDigest {
+        properties.insert(
+            "sinceMs".into(),
+            json!({
+                "type": "integer",
+                "minimum": 0,
+                "description": "Only activity at or after this time, in Unix milliseconds."
+            }),
+        );
+        properties.insert(
+            "repoPaths".into(),
+            json!({
+                "type": "array",
+                "items": { "type": "string", "minLength": 1, "maxLength": 32768 },
+                "minItems": 1,
+                "maxItems": 500,
+                "description": "Absolute local repository paths. Omit to use the repositories registered in FluxGit (filtered by the MCP allowed roots)."
+            }),
+        );
+        properties.insert(
+            "maxEvents".into(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "default": 200,
+                "description": "Maximum events returned, newest first; truncated says when more existed."
+            }),
+        );
+        return json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["sinceMs"],
             "additionalProperties": false,
         });
     }
@@ -9117,7 +10423,7 @@ fn tool_input_schema(kind: ToolKind) -> Value {
                 }),
             );
         }
-        ToolKind::FleetRadar => {}
+        ToolKind::FleetRadar | ToolKind::FleetDigest | ToolKind::AgentsPresence => {}
         ToolKind::RepoBrief => {
             properties.insert(
                 "recentCommits".into(),
@@ -9666,6 +10972,128 @@ fn tool_input_schema(kind: ToolKind) -> Value {
             required.push("name");
             required.push("reason");
         }
+        ToolKind::OperationPreviewBranchDelete => {
+            properties.insert(
+                "repoPath".into(),
+                json!({
+                    "type": "string",
+                    "maxLength": MCP_MAX_PATH_CHARS,
+                    "description": "Absolute path of the repository the approval binds to (open in FluxGit). Must equal one of targets[].repoPath."
+                }),
+            );
+            properties.insert(
+                "targets".into(),
+                json!({
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": BRANCH_DELETE_MAX_TARGETS,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["repoPath", "branches"],
+                        "properties": {
+                            "repoPath": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MCP_MAX_PATH_CHARS,
+                                "description": "Absolute repository path."
+                            },
+                            "branches": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": BRANCH_DELETE_MAX_BRANCHES_PER_TARGET,
+                                "uniqueItems": true,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": MCP_MAX_REF_CHARS,
+                                    "description": "Short local branch name, e.g. agent/fix-1 (no refs/ prefix)."
+                                }
+                            }
+                        }
+                    },
+                    "description": "Repositories and the merged local branches to delete in each. FluxGit decides by native inspection which ones are deletable; at most 100 branches in total."
+                }),
+            );
+            properties.insert(
+                "reason".into(),
+                json!({
+                    "type": "string",
+                    "description": "Why these branches should be deleted. Shown to the user on the approval card."
+                }),
+            );
+            required.push("targets");
+            required.push("reason");
+        }
+        ToolKind::OperationPreviewSubmodulePointer => {
+            properties.insert(
+                "repoPath".into(),
+                json!({
+                    "type": "string",
+                    "maxLength": MCP_MAX_PATH_CHARS,
+                    "description": "Absolute path of the top-level repository (open in FluxGit)."
+                }),
+            );
+            properties.insert(
+                "parentPath".into(),
+                json!({
+                    "type": "string",
+                    "maxLength": MCP_MAX_PATH_CHARS,
+                    "default": "",
+                    "description": "Path of the repository that directly contains the submodule, relative to repoPath, reached through submodules only. Empty = repoPath itself."
+                }),
+            );
+            properties.insert(
+                "relativePath".into(),
+                json!({
+                    "type": "string",
+                    "maxLength": MCP_MAX_PATH_CHARS,
+                    "description": "Submodule path relative to parentPath."
+                }),
+            );
+            properties.insert(
+                "direction".into(),
+                json!({
+                    "enum": ["record", "return"],
+                    "description": "record: the parent commits the submodule's current checkout as its new pointer. return: the submodule checks out, detached, the commit its parent records."
+                }),
+            );
+            properties.insert(
+                "message".into(),
+                json!({
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": SUBMODULE_POINTER_MAX_MESSAGE_CHARS,
+                    "description": "Commit message. Required for record, not allowed for return."
+                }),
+            );
+            properties.insert(
+                "expectedRecordedOid".into(),
+                json!({
+                    "type": "string",
+                    "pattern": FULL_OID_PATTERN,
+                    "description": "Optional pin: the pointer the parent records, as the agent observed it (submodule.status)."
+                }),
+            );
+            properties.insert(
+                "expectedCheckedOutOid".into(),
+                json!({
+                    "type": "string",
+                    "pattern": FULL_OID_PATTERN,
+                    "description": "Optional pin: the commit checked out in the submodule, as the agent observed it (submodule.status)."
+                }),
+            );
+            properties.insert(
+                "reason".into(),
+                json!({
+                    "type": "string",
+                    "description": "Why the pointer should be recorded or returned. Shown to the user on the approval card."
+                }),
+            );
+            required.push("relativePath");
+            required.push("direction");
+            required.push("reason");
+        }
         ToolKind::OperationStatus | ToolKind::OperationCancel => {
             unreachable!("operation.status/operation.cancel use the early previewId-only schema")
         }
@@ -9697,12 +11125,25 @@ fn tool_input_schema(kind: ToolKind) -> Value {
         }
     }
 
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": properties,
         "required": required,
         "additionalProperties": false,
-    })
+    });
+    if kind == ToolKind::OperationPreviewSubmodulePointer {
+        schema["allOf"] = json!([
+            {
+                "if": { "properties": { "direction": { "const": "record" } } },
+                "then": { "required": ["message"] }
+            },
+            {
+                "if": { "properties": { "direction": { "const": "return" } } },
+                "then": { "not": { "required": ["message"] } }
+            }
+        ]);
+    }
+    schema
 }
 
 fn validate_and_canonicalize_tool_arguments(
@@ -9738,55 +11179,7 @@ fn canonicalize_repository_arguments_with_config(
 ) -> Result<Value, JsonRpcError> {
     let mut canonical_arguments = arguments.clone();
 
-    let roots = match configured {
-        Some(configured) => {
-            if configured.to_string_lossy().trim().is_empty() {
-                return Err(JsonRpcError {
-                    code: -32010,
-                    message: "Invalid MCP allowed-roots configuration".into(),
-                    data: Some(json!({
-                        "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
-                        "details": "the configured root list is empty",
-                    })),
-                });
-            }
-            let roots = env::split_paths(configured)
-                .map(|root| {
-                    if root.as_os_str().is_empty() || !root.is_absolute() {
-                        return Err(JsonRpcError {
-                            code: -32010,
-                            message: "Invalid MCP allowed-roots configuration".into(),
-                            data: Some(json!({
-                                "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
-                                "details": "each configured root must be a non-empty absolute filesystem path",
-                            })),
-                        });
-                    }
-                    root.canonicalize().map_err(|error| JsonRpcError {
-                        code: -32010,
-                        message: "Invalid MCP allowed-roots configuration".into(),
-                        data: Some(json!({
-                            "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
-                            "root": root,
-                            "details": error.to_string(),
-                        })),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if roots.is_empty() {
-                return Err(JsonRpcError {
-                    code: -32010,
-                    message: "Invalid MCP allowed-roots configuration".into(),
-                    data: Some(json!({
-                        "environmentVariable": MCP_ALLOWED_ROOTS_ENV,
-                        "details": "the configured root list is empty",
-                    })),
-                });
-            }
-            Some(roots)
-        }
-        None => None,
-    };
+    let roots = parse_allowed_roots(configured)?;
 
     let rewrite = |value: &mut Value| -> Result<(), JsonRpcError> {
         let raw_path = value
@@ -9840,13 +11233,17 @@ fn canonicalize_repository_arguments_with_config(
                 rewrite(repo_path)?;
             }
         }
-        if let Some(repositories) = object.get_mut("repositories").and_then(Value::as_array_mut) {
-            for repository in repositories {
-                if let Some(repo_path) = repository
-                    .as_object_mut()
-                    .and_then(|repository| repository.get_mut("repoPath"))
-                {
-                    rewrite(repo_path)?;
+        // `repositories` (fleet.radar) and `targets` (branchDelete) carry one
+        // repository per entry; every one is held to the same allowed roots.
+        for key in ["repositories", "targets"] {
+            if let Some(entries) = object.get_mut(key).and_then(Value::as_array_mut) {
+                for entry in entries {
+                    if let Some(repo_path) = entry
+                        .as_object_mut()
+                        .and_then(|entry| entry.get_mut("repoPath"))
+                    {
+                        rewrite(repo_path)?;
+                    }
                 }
             }
         }
@@ -9864,6 +11261,43 @@ fn canonical_path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
 /// made missing fields and wrong types silently turn into empty strings or
 /// defaults before they reached the gateway.
 fn validate_json_schema_value(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    if let Some(options) = schema.get("allOf").and_then(Value::as_array) {
+        for option in options {
+            validate_json_schema_value(value, option, path)?;
+        }
+    }
+    if let Some(condition) = schema.get("if") {
+        let branch = if validate_json_schema_value(value, condition, path).is_ok() {
+            schema.get("then")
+        } else {
+            schema.get("else")
+        };
+        if let Some(branch) = branch {
+            validate_json_schema_value(value, branch, path)?;
+        }
+    }
+    if let Some(negated) = schema.get("not") {
+        if validate_json_schema_value(value, negated, path).is_ok() {
+            // The only `not` in the sidecar's contracts forbids fields
+            // (`not: { required: [...] }`); name them for the agent.
+            let fields = negated
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|field| format!("{path}.{field}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|fields| !fields.is_empty());
+            return Err(match fields {
+                Some(fields) => format!("{fields} is not allowed here"),
+                None => format!("{path} matches a forbidden schema"),
+            });
+        }
+    }
     if let Some(options) = schema.get("anyOf").and_then(Value::as_array) {
         if !options
             .iter()
@@ -9959,6 +11393,13 @@ fn validate_json_schema_value(value: &Value, schema: &Value, path: &str) -> Resu
                 validate_json_schema_value(item, item_schema, &format!("{path}[{index}]"))?;
             }
         }
+        if schema.get("uniqueItems") == Some(&Value::Bool(true)) {
+            for (index, item) in array.iter().enumerate() {
+                if array[..index].contains(item) {
+                    return Err(format!("{path}[{index}] duplicates an earlier item"));
+                }
+            }
+        }
     }
 
     if let Some(string) = value.as_str() {
@@ -9985,6 +11426,16 @@ fn validate_json_schema_value(value: &Value, schema: &Value, path: &str) -> Resu
         {
             return Err(format!(
                 "{path} must contain only ASCII letters, digits, '_' or '-'"
+            ));
+        }
+        if schema.get("pattern").and_then(Value::as_str) == Some(FULL_OID_PATTERN)
+            && !(matches!(string.len(), 40 | 64)
+                && string
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            return Err(format!(
+                "{path} must be a full lowercase hex object id (40 or 64 characters)"
             ));
         }
     }
@@ -10786,6 +12237,127 @@ fn dispatch_operation_preview_branch(
     dispatch_operation_preview_request(
         ToolKind::OperationPreviewBranch.as_str(),
         "branch",
+        gateway_addr,
+        &preview_id,
+        &body,
+    )
+}
+
+/// Build the branch-delete body and dispatch
+/// (`product/mcp/PROPOSALS_BRANCH_DELETE_SUBMODULE_2026-09-28.md` §1). The
+/// agent only names branches; FluxGit decides by native inspection which ones
+/// are deletable and records every deleted tip as a restore point.
+fn dispatch_operation_preview_branch_delete(
+    gateway_addr: &str,
+    agent_id: &str,
+    arguments: &Value,
+) -> Option<ToolCallResult> {
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let string_field = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    // Rebuilt field by field so nothing but the contract reaches the gateway.
+    let targets: Vec<Value> = arguments
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|targets| {
+            targets
+                .iter()
+                .map(|target| {
+                    json!({
+                        "repoPath": target.get("repoPath").and_then(Value::as_str).unwrap_or(""),
+                        "branches": target
+                            .get("branches")
+                            .and_then(Value::as_array)
+                            .map(|branches| {
+                                branches
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(|branch| Value::String(branch.to_string()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let body = json!({
+        "previewId": preview_id,
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("branchDelete", arguments),
+        "operationType": "branchDelete",
+        "repoPath": string_field("repoPath"),
+        "targets": targets,
+        "reason": string_field("reason"),
+        "requestedAt": requested_at,
+    });
+
+    dispatch_operation_preview_request(
+        ToolKind::OperationPreviewBranchDelete.as_str(),
+        "branchDelete",
+        gateway_addr,
+        &preview_id,
+        &body,
+    )
+}
+
+/// Build the submodule-pointer body and dispatch
+/// (`product/mcp/PROPOSALS_BRANCH_DELETE_SUBMODULE_2026-09-28.md` §2).
+/// `message` is sent only for `record`, the OID pins only when supplied:
+/// never as empty strings.
+fn dispatch_operation_preview_submodule_pointer(
+    gateway_addr: &str,
+    agent_id: &str,
+    arguments: &Value,
+) -> Option<ToolCallResult> {
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let string_field = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let direction = string_field("direction");
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    let mut body = json!({
+        "previewId": preview_id,
+        "agentId": agent_id,
+        "idempotencyKey": idempotency_key_for("submodulePointer", arguments),
+        "operationType": "submodulePointer",
+        "repoPath": string_field("repoPath"),
+        "parentPath": string_field("parentPath"),
+        "relativePath": string_field("relativePath"),
+        "direction": direction,
+        "reason": string_field("reason"),
+        "requestedAt": requested_at,
+    });
+    if direction == "record" {
+        if let Some(message) = arguments.get("message").and_then(Value::as_str) {
+            body["message"] = Value::String(message.to_string());
+        }
+    }
+    for pin in ["expectedRecordedOid", "expectedCheckedOutOid"] {
+        if let Some(oid) = arguments
+            .get(pin)
+            .and_then(Value::as_str)
+            .filter(|oid| !oid.is_empty())
+        {
+            body[pin] = Value::String(oid.to_string());
+        }
+    }
+
+    dispatch_operation_preview_request(
+        ToolKind::OperationPreviewSubmodulePointer.as_str(),
+        "submodulePointer",
         gateway_addr,
         &preview_id,
         &body,
@@ -11784,7 +13356,7 @@ mod tests {
         let legacy = serde_json::to_value(legacy).unwrap();
         assert!(legacy["result"].get("resultType").is_none());
         let legacy_tools = legacy["result"]["tools"].as_array().unwrap();
-        assert_eq!(legacy_tools.len(), 34);
+        assert_eq!(legacy_tools.len(), 38);
         assert!(legacy_tools
             .iter()
             .all(|tool| tool.get("outputSchema").is_none()));
@@ -11803,7 +13375,7 @@ mod tests {
         let modern = serde_json::to_value(modern).unwrap();
         assert_eq!(modern["result"]["resultType"], "complete");
         assert_eq!(modern["result"]["cacheScope"], "public");
-        assert_eq!(modern["result"]["tools"].as_array().unwrap().len(), 34);
+        assert_eq!(modern["result"]["tools"].as_array().unwrap().len(), 38);
         assert_eq!(
             modern["result"]["tools"][0]["outputSchema"]["type"],
             "object"
@@ -11858,7 +13430,7 @@ mod tests {
                 }))
                 .unwrap();
             let response = serde_json::to_value(response).unwrap();
-            assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 34);
+            assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 38);
             assert!(response["result"].get("nextCursor").is_none());
         }
     }
@@ -12927,7 +14499,7 @@ mod tests {
 
         assert!(
             serde_json::to_vec(&response).unwrap().len() < MCP_MAX_FRAME_BYTES,
-            "the fully typed 34-tool catalog must fit in one MCP frame"
+            "the fully typed 38-tool catalog must fit in one MCP frame"
         );
 
         let tools = response["result"]["tools"].as_array().unwrap();
@@ -12946,6 +14518,8 @@ mod tests {
                 "safety.timeline",
                 "safety.eventDetails",
                 "fleet.radar",
+                "fleet.digest",
+                "agents.presence",
                 "repo.status",
                 "repo.refs",
                 "repo.branchStack",
@@ -12979,21 +14553,23 @@ mod tests {
                 "operation.preview.commit",
                 "operation.preview.push",
                 "operation.preview.branch",
+                "operation.preview.branchDelete",
+                "operation.preview.submodulePointer",
                 // Write-adjacent: cancels this agent's own pending proposal.
                 "operation.cancel",
             ]
         );
 
-        // Advertisement counts pinned: 23 read-only + 11 write-handshake = 34.
+        // Advertisement counts pinned: 25 read-only + 13 write-handshake = 38.
         // operation.status is read-only; operation.cancel mutates proposal state.
-        assert_eq!(tools.len(), 34, "34 tools must be advertised");
+        assert_eq!(tools.len(), 38, "38 tools must be advertised");
         assert_eq!(
             tools
                 .iter()
                 .filter(|tool| tool["annotations"]["readOnlyHint"] == true)
                 .count(),
-            23,
-            "exactly 23 tools must advertise readOnlyHint: true"
+            25,
+            "exactly 25 tools must advertise readOnlyHint: true"
         );
         for tool in tools {
             let output_schema = &tool["outputSchema"];
@@ -13032,8 +14608,8 @@ mod tests {
             );
         }
 
-        // Verify all 11 write-handshake tools advertise readOnlyHint: false
-        // (10 operation.preview.* proposals + the write-adjacent cancel).
+        // Verify all 13 write-handshake tools advertise readOnlyHint: false
+        // (12 operation.preview.* proposals + the write-adjacent cancel).
         for handshake_name in [
             "operation.preview.merge",
             "operation.preview.rebase",
@@ -13045,6 +14621,8 @@ mod tests {
             "operation.preview.commit",
             "operation.preview.push",
             "operation.preview.branch",
+            "operation.preview.branchDelete",
+            "operation.preview.submodulePointer",
             "operation.cancel",
         ] {
             let tool = tools
@@ -13098,7 +14676,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .starts_with("operation."))
-            .filter(|tool| tool["name"] != "fleet.radar")
+            .filter(|tool| tool["name"] != "fleet.radar" && tool["name"] != "fleet.digest")
             .all(|tool| tool["inputSchema"]["required"]
                 .as_array()
                 .is_some_and(|required| required.iter().any(|item| item == "repoPath"))));
@@ -13136,6 +14714,8 @@ mod tests {
             ("operation.preview.worktree", false),
             ("operation.preview.commit", false),
             ("operation.preview.branch", false),
+            ("operation.preview.branchDelete", true),
+            ("operation.preview.submodulePointer", false),
             ("operation.cancel", false),
         ] {
             let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
@@ -13361,6 +14941,526 @@ mod tests {
         assert!(event["args_fingerprint"]
             .as_str()
             .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
+    }
+
+    // ------------------------------------------------ agents.presence
+
+    fn detected(
+        agent: &'static str,
+        pid: Option<u32>,
+        files: &[&str],
+        mcp_client: Option<&str>,
+    ) -> agent_detect::AgentPresence {
+        agent_detect::AgentPresence {
+            agent,
+            root: "/work/repo".into(),
+            state: "working",
+            sources: vec![if pid.is_some() { "process" } else { "session" }],
+            pid,
+            last_activity_ms: Some(1_700_000_000_000),
+            branch: Some(format!("{agent}/task")),
+            last_tool: Some("Edit".into()),
+            files: files.iter().map(|file| file.to_string()).collect(),
+            mcp_client: mcp_client.map(|name| agent_detect::McpClient {
+                name: name.into(),
+                version: Some("1.0".into()),
+            }),
+        }
+    }
+
+    /// One tools/call as the named client, modern (`2026-07-28`) or legacy.
+    fn call_as_client(
+        server: &McpSidecar,
+        client: &str,
+        modern: bool,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let params = if modern {
+            json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": LATEST_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": { "name": client, "version": "9.9" },
+                },
+                "name": name,
+                "arguments": arguments,
+            })
+        } else {
+            server.handle_value(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": client, "version": "9.9" },
+                }
+            }));
+            json!({ "name": name, "arguments": arguments })
+        };
+        let response = server
+            .handle_value(json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": params
+            }))
+            .unwrap();
+        let response = serde_json::to_value(response).unwrap();
+        if modern {
+            assert_tool_result_contract(name, &response);
+        }
+        response
+    }
+
+    fn result_text_payload(response: &Value) -> Value {
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn agents_presence_lists_other_agents_and_marks_the_likely_caller_in_both_protocols() {
+        let repo = fixture_repo();
+        let server = McpSidecar::new_for_tests(false).with_detected_agents(vec![
+            // Claude Code seen through its session log only: this session.
+            detected("claude-code", None, &["src/a.rs"], None),
+            detected(
+                "codex",
+                Some(4_242),
+                &["tracked.txt"],
+                Some("codex-mcp-client"),
+            ),
+            // Claude Code under an unrelated process: another session.
+            detected("claude-code", Some(3_999_999_999), &[], None),
+        ]);
+        for modern in [true, false] {
+            let response = call_as_client(
+                &server,
+                "claude-code",
+                modern,
+                "agents.presence",
+                json!({ "repoPath": repo.path() }),
+            );
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            let payload = result_text_payload(&response);
+            assert_eq!(payload["source"], "local-agent-detector");
+            let data = &payload["data"];
+            assert_eq!(data["agentCount"], 3);
+            assert_eq!(data["caller"]["clientName"], "claude-code");
+            assert_eq!(data["caller"]["agent"], "claude-code");
+            assert_eq!(data["caller"]["ownMcpPresenceExcluded"], true);
+            let agents = data["agents"].as_array().unwrap();
+            assert_eq!(agents[0]["likelyCaller"], true);
+            assert_eq!(agents[0]["sameAgentAsCaller"], true);
+            assert_eq!(agents[1]["agent"], "codex");
+            assert_eq!(agents[1]["likelyCaller"], false);
+            assert_eq!(agents[1]["sameAgentAsCaller"], false);
+            assert_eq!(agents[1]["files"], json!(["tracked.txt"]));
+            assert_eq!(agents[1]["mcpClient"]["name"], "codex-mcp-client");
+            assert_eq!(agents[2]["likelyCaller"], false);
+            assert_eq!(agents[2]["sameAgentAsCaller"], true);
+            assert!(data["guidance"].as_str().unwrap().contains("declares"));
+            if modern {
+                assert_eq!(response["result"]["structuredContent"], payload);
+            } else {
+                assert!(response["result"].get("structuredContent").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn agents_presence_is_an_honest_error_when_detection_is_disabled_or_not_a_repo() {
+        let repo = fixture_repo();
+        let response = call_tool("agents.presence", json!({ "repoPath": repo.path() }), false);
+        assert_eq!(response["result"]["isError"], true);
+        let payload = result_text_payload(&response);
+        assert_eq!(payload["error"]["code"], 10011);
+        assert_eq!(
+            payload["error"]["data"]["environmentVariable"],
+            MCP_AGENT_DETECTION_DISABLED_ENV
+        );
+
+        let not_repo = TestDir::new("fluxgit-agents-not-a-repo");
+        let server = McpSidecar::new_for_tests(false).with_detected_agents(Vec::new());
+        let response = call_as_client(
+            &server,
+            "codex",
+            true,
+            "agents.presence",
+            json!({ "repoPath": not_repo.path() }),
+        );
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(result_text_payload(&response)["error"]["code"], 10010);
+    }
+
+    #[test]
+    fn agents_presence_live_reads_other_sidecars_and_skips_its_own_record() {
+        let repo = fixture_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let presence = TestDir::new("fluxgit-agents-live");
+        let dir = presence.path().join("mcp");
+        let mut server = McpSidecar::new_for_tests(false).with_presence_dir(dir.clone());
+        server.agent_detector = AgentDetector::Live;
+        // Our own call writes our own record first.
+        let own = call_as_client(
+            &server,
+            "fluxgit-own-client-under-test",
+            true,
+            "repo.status",
+            json!({ "repoPath": repo.path() }),
+        );
+        assert_eq!(own["result"]["isError"], false);
+        assert!(dir.join(format!("{}.json", std::process::id())).exists());
+        // Another sidecar's record, for Codex, in the same repository.
+        fs::write(
+            dir.join("4000000001.json"),
+            json!({
+                "schemaVersion": 1,
+                "pid": 4_000_000_001_u64,
+                "client": { "name": "codex-mcp-client", "version": "0.40" },
+                "repos": [{ "repoPath": canonical, "lastCallMs": now_ms(), "lastTool": "diff.text" }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response = call_as_client(
+            &server,
+            "fluxgit-own-client-under-test",
+            true,
+            "agents.presence",
+            json!({ "repoPath": repo.path() }),
+        );
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let agents = result_text_payload(&response)["data"]["agents"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let codex = agents
+            .iter()
+            .find(|agent| agent["agent"] == "codex")
+            .expect("the other sidecar's Codex record");
+        assert!(codex["sources"].as_array().unwrap().contains(&json!("mcp")));
+        assert_eq!(codex["lastTool"], "diff.text");
+        assert!(agents
+            .iter()
+            .all(|agent| agent["mcpClient"]["name"] != "fluxgit-own-client-under-test"));
+    }
+
+    #[test]
+    fn preview_results_carry_an_informational_other_agents_hint() {
+        let _env = GatewayEnvGuard::unset();
+        let repo = fixture_repo();
+        let server = McpSidecar::new_for_tests(false).with_detected_agents(vec![
+            detected("codex", Some(4_242), &["src/lib.rs", "docs/guide.md"], None),
+            detected("claude-code", None, &["src/lib.rs"], None),
+        ]);
+        let response = call_as_client(
+            &server,
+            "claude-code",
+            true,
+            "operation.preview.discard",
+            json!({
+                "repoPath": repo.path(),
+                "paths": ["src", "README.md"],
+                "reason": "drop the experiment",
+            }),
+        );
+        // The hint never changes the outcome: still the 10003 fallback.
+        assert_eq!(response["result"]["isError"], true);
+        let payload = result_text_payload(&response);
+        assert_eq!(payload["error"]["code"], 10003);
+        let hint = &payload["otherAgents"];
+        assert_eq!(hint["informational"], true);
+        assert_eq!(hint["proposalPathsKnown"], true);
+        assert_eq!(hint["omittedLikelyCaller"], 1);
+        assert_eq!(hint["agentCount"], 1);
+        assert_eq!(hint["overlappingAgentCount"], 1);
+        assert_eq!(hint["agents"][0]["agent"], "codex");
+        assert_eq!(hint["agents"][0]["overlappingPaths"], json!(["src/lib.rs"]));
+        assert!(hint["note"].as_str().unwrap().contains("never blocks"));
+
+        // A merge names no files: agents are listed, overlap is unknown.
+        let response = call_as_client(
+            &server,
+            "claude-code",
+            true,
+            "operation.preview.merge",
+            json!({
+                "repoPath": repo.path(),
+                "sourceRef": "feature",
+                "targetRef": "main",
+                "reason": "ship",
+            }),
+        );
+        let hint = &result_text_payload(&response)["otherAgents"];
+        assert_eq!(hint["proposalPathsKnown"], false);
+        assert_eq!(hint["agents"][0]["overlappingPaths"], Value::Null);
+
+        // Without detection there is no hint at all (additive field).
+        let _ = &server;
+        let plain = call_tool(
+            "operation.preview.merge",
+            json!({
+                "repoPath": repo.path(),
+                "sourceRef": "feature",
+                "targetRef": "main",
+                "reason": "ship",
+            }),
+            false,
+        );
+        assert!(result_text_payload(&plain).get("otherAgents").is_none());
+    }
+
+    #[test]
+    fn proposal_paths_come_from_paths_patches_and_plan_steps() {
+        let repo = Path::new("/work/repo");
+        assert_eq!(
+            proposal_paths(
+                &json!({ "paths": ["./src/a.rs", "/work/repo/docs/", "src/a.rs"] }),
+                repo
+            ),
+            Some(vec!["src/a.rs".to_string(), "docs".to_string()])
+        );
+        let patch = "diff --git a/src/x.rs b/src/y.rs\n--- a/src/x.rs\n+++ b/src/y.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(
+            proposal_paths(&json!({ "patchContent": patch }), repo),
+            Some(vec!["src/y.rs".to_string(), "src/x.rs".to_string()])
+        );
+        assert_eq!(
+            proposal_paths(
+                &json!({ "steps": [
+                    { "operationType": "merge", "sourceRef": "a", "targetRef": "b" },
+                    { "operationType": "discard", "paths": ["lib"] }
+                ] }),
+                repo
+            ),
+            Some(vec!["lib".to_string()])
+        );
+        assert_eq!(proposal_paths(&json!({ "sourceRef": "a" }), repo), None);
+        assert!(paths_overlap("src", "src/lib.rs"));
+        assert!(paths_overlap("src/lib.rs", "src"));
+        assert!(paths_overlap(".", "anything"));
+        assert!(!paths_overlap("src", "srcs/lib.rs"));
+        assert!(!paths_overlap("a.rs", "b.rs"));
+    }
+
+    #[test]
+    fn presence_is_recorded_only_for_accepted_calls() {
+        let repo = fixture_repo();
+        let presence = TestDir::new("fluxgit-presence-accepted");
+        let dir = presence.path().join("mcp");
+        let file = dir.join(format!("{}.json", std::process::id()));
+        let server = McpSidecar::new_for_tests(true).with_presence_dir(dir);
+        let merge = json!({
+            "repoPath": repo.path(),
+            "sourceRef": "feature",
+            "targetRef": "main",
+            "reason": "ship",
+        });
+
+        // Refused by the agent policy (403): not "working here".
+        let addr = spawn_single_response_gateway_mock(
+            403,
+            json!({ "error": "agent_policy_violation", "message": "merge is blocked" }),
+        );
+        {
+            let _env = GatewayEnvGuard::set(&addr);
+            let response = call_as_client(
+                &server,
+                "codex",
+                true,
+                "operation.preview.merge",
+                merge.clone(),
+            );
+            assert_eq!(result_text_payload(&response)["status"], "refused");
+        }
+        assert!(
+            !file.exists(),
+            "a refused proposal must not record presence"
+        );
+
+        // No FluxGit (10003): not accepted either.
+        {
+            let _env = GatewayEnvGuard::unset();
+            let response = call_as_client(
+                &server,
+                "codex",
+                true,
+                "operation.preview.merge",
+                merge.clone(),
+            );
+            assert_eq!(result_text_payload(&response)["error"]["code"], 10003);
+        }
+        assert!(!file.exists(), "a 10003 fallback must not record presence");
+
+        // Reads are accepted calls.
+        call_as_client(
+            &server,
+            "codex",
+            true,
+            "repo.status",
+            json!({ "repoPath": repo.path() }),
+        );
+        assert!(file.exists());
+    }
+
+    // ---------------------------------------------------- fleet.digest
+
+    fn current_branch(repo: &Path) -> String {
+        git_output(repo, &["symbolic-ref", "--short", "HEAD"])
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn fleet_digest_reports_moves_newest_first_and_flags_rewrites() {
+        let repo = fixture_repo();
+        let branch = current_branch(repo.path());
+        fs::write(repo.path().join("tracked.txt"), "second\n").unwrap();
+        git(repo.path(), &["commit", "-qam", "second"]);
+        git(repo.path(), &["switch", "-q", "-c", "topic"]);
+        git(repo.path(), &["switch", "-q", &branch]);
+        git(repo.path(), &["reset", "-q", "--hard", "HEAD~1"]);
+
+        let response = call_tool(
+            "fleet.digest",
+            json!({ "sinceMs": 0, "repoPaths": [repo.path()] }),
+            false,
+        );
+        let payload = tool_payload(&response);
+        assert_eq!(payload["tool"], "fleet.digest");
+        let data = &payload["data"];
+        assert_eq!(data["repoSource"], "arguments");
+        assert_eq!(data["repos"][0]["error"], Value::Null);
+        let events = data["events"].as_array().unwrap();
+        let branch_ref = format!("refs/heads/{branch}");
+        let reset = events
+            .iter()
+            .find(|event| event["kind"] == "reset" && event["refName"] == branch_ref)
+            .expect("reset on the branch");
+        assert_eq!(reset["rewrote"], true);
+        assert_eq!(reset["identity"], "Test User <test@example.com>");
+        assert_eq!(reset["source"], "git");
+        assert!(events
+            .iter()
+            .any(|event| event["refName"] == "HEAD" && event["kind"] == "checkout"));
+        // The commit on the checked-out branch is listed once, on the branch.
+        let seconds = events
+            .iter()
+            .filter(|event| event["message"].as_str().unwrap().contains("second"))
+            .collect::<Vec<_>>();
+        assert_eq!(seconds.len(), 1);
+        assert_eq!(seconds[0]["refName"], branch_ref);
+        assert!(events
+            .iter()
+            .filter(|event| event["kind"] == "commit")
+            .all(|event| event["rewrote"] == false));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0]["atMs"].as_i64() >= pair[1]["atMs"].as_i64()));
+        assert!(events
+            .iter()
+            .all(|event| event["atMs"].as_i64().unwrap() > 0));
+
+        // maxEvents bounds the answer and says so.
+        let bounded = tool_payload(&call_tool(
+            "fleet.digest",
+            json!({ "sinceMs": 0, "repoPaths": [repo.path()], "maxEvents": 1 }),
+            false,
+        ));
+        assert_eq!(bounded["data"]["eventCount"], 1);
+        assert_eq!(bounded["data"]["truncated"], true);
+    }
+
+    #[test]
+    fn fleet_digest_respects_since_and_reports_bad_repositories_per_repo() {
+        let repo = fixture_repo();
+        let not_repo = TestDir::new("fluxgit-digest-not-a-repo");
+        let response = call_tool(
+            "fleet.digest",
+            json!({
+                "sinceMs": 4_000_000_000_000_i64,
+                "repoPaths": [repo.path(), not_repo.path()],
+            }),
+            false,
+        );
+        let data = tool_payload(&response)["data"].clone();
+        assert_eq!(data["eventCount"], 0);
+        assert_eq!(data["repos"][0]["error"], Value::Null);
+        assert!(data["repos"][1]["error"].as_str().is_some());
+
+        let missing = call_tool("fleet.digest", json!({ "repoPaths": [repo.path()] }), false);
+        assert_eq!(missing["error"]["code"], -32602, "{missing}");
+    }
+
+    #[test]
+    fn fleet_digest_without_repo_paths_uses_the_registry_inside_allowed_roots() {
+        let inside = fixture_repo();
+        let outside = fixture_repo();
+        let run_dir = TestDir::new("fluxgit-digest-run");
+        fs::create_dir_all(run_dir.path().join("repos")).unwrap();
+        fs::write(
+            run_dir.path().join("repos/inside.path"),
+            inside.path().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            run_dir.path().join("repos/outside.path"),
+            outside.path().to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::write(run_dir.path().join("repos/ignored.txt"), "/etc").unwrap();
+        let roots = vec![inside.path().canonicalize().unwrap()];
+        let data =
+            fleet_digest_payload(&json!({ "sinceMs": 0 }), Some(run_dir.path()), Some(&roots))
+                .unwrap();
+        assert_eq!(data["repoSource"], "fluxgit-registry");
+        assert_eq!(data["excludedOutsideAllowedRoots"], 1);
+        assert_eq!(data["repos"].as_array().unwrap().len(), 1);
+        assert!(data["eventCount"].as_u64().unwrap() >= 1);
+
+        let empty = TestDir::new("fluxgit-digest-empty-run");
+        let error =
+            fleet_digest_payload(&json!({ "sinceMs": 0 }), Some(empty.path()), None).unwrap_err();
+        assert_eq!(error.code, -32602);
+    }
+
+    #[test]
+    fn fleet_digest_repo_paths_are_held_to_the_allowed_roots() {
+        let allowed = TestDir::new("fluxgit-digest-allowed");
+        let outside = TestDir::new("fluxgit-digest-outside");
+        let configured = env::join_paths([allowed.path()]).unwrap();
+        let denied = validate_and_canonicalize_tool_arguments_with_config(
+            ToolKind::FleetDigest,
+            &json!({ "sinceMs": 0, "repoPaths": [outside.path()] }),
+            Some(&configured),
+        )
+        .unwrap_err();
+        assert_eq!(denied.code, -32011);
+    }
+
+    #[test]
+    fn reflog_file_lines_and_messages_parse_like_the_desktop_digest() {
+        let line = "0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 A Person (bot) <a@example.com> 1700000000 +0200\tcommit (initial): first";
+        let (old, new, identity, seconds, message) = parse_reflog_file_line(line).unwrap();
+        assert!(is_zero_oid(&old));
+        assert_eq!(new, "1".repeat(40));
+        assert_eq!(identity, "A Person (bot) <a@example.com>");
+        assert_eq!(seconds, 1_700_000_000);
+        assert_eq!(message, "commit (initial): first");
+        assert!(parse_reflog_file_line("garbage").is_none());
+        assert!(parse_reflog_file_line("zz 11 x <y> 1 +0000\tm").is_none());
+
+        assert_eq!(classify_reflog_message("commit (amend): x"), "amend");
+        assert_eq!(classify_reflog_message("commit (merge): x"), "merge");
+        assert_eq!(classify_reflog_message("commit (initial): x"), "commit");
+        assert_eq!(
+            classify_reflog_message("rebase (finish): refs/heads/main onto abc"),
+            "rebase"
+        );
+        assert_eq!(classify_reflog_message("pull: Fast-forward"), "pull");
+        assert_eq!(
+            classify_reflog_message("Fleet Radar: create local branch"),
+            "fluxgit"
+        );
+        assert_eq!(classify_reflog_message("something else"), "other");
+        assert_eq!(clip_chars(&"x".repeat(300), 200).chars().count(), 200);
     }
 
     #[test]
@@ -14393,6 +16493,48 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("FluxGit UI approval flows"));
+    }
+
+    #[test]
+    fn reflog_entries_and_timeline_events_carry_real_ordered_times() {
+        let repo = fixture_repo();
+        for (seconds, content) in [(1_700_000_000_i64, "one\n"), (1_700_000_100, "two\n")] {
+            fs::write(repo.path().join("tracked.txt"), content).unwrap();
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["commit", "-qam", content.trim()])
+                .env("GIT_COMMITTER_DATE", format!("@{seconds} +0000"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let reflog = repo_reflog_payload(repo.path(), &json!({ "limit": 3 })).unwrap();
+        let times = reflog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["timestamp"].as_i64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(times[0], 1_700_000_100, "{reflog}");
+        assert_eq!(times[1], 1_700_000_000, "{reflog}");
+        // The initial commit happened now, not at time 0.
+        assert!(times[2] > 1_700_000_100, "{times:?}");
+        assert!(reflog["entries"][0]["selector"]
+            .as_str()
+            .unwrap()
+            .starts_with("HEAD@{1700000100"));
+
+        assert_eq!(
+            reflog_selector_unix_seconds("HEAD@{1780480800}"),
+            Some(1_780_480_800)
+        );
+        assert_eq!(
+            reflog_selector_unix_seconds("refs/heads/a@{b}@{1780480800}"),
+            Some(1_780_480_800)
+        );
+        assert_eq!(reflog_selector_unix_seconds("HEAD@{0}"), None);
+        assert_eq!(reflog_selector_unix_seconds("HEAD"), None);
     }
 
     #[test]
@@ -15544,7 +17686,7 @@ mod tests {
         // 1. Be advertised in tools/list with readOnlyHint: false
         // 2. Require its operation-specific fields plus a `reason`
         // 3. Return write_handshake_pending (code 10003) when no handshake
-        //    address is configured (all ten dispatch when it is).
+        //    address is configured (all twelve dispatch when it is).
         // Schema requirements per PLAYBOOK §10.
         let _env = GatewayEnvGuard::unset();
         let server = McpSidecar::new_for_tests(true);
@@ -15640,6 +17782,23 @@ mod tests {
                 json!({
                     "repoPath": "/tmp/x", "name": "agent/fix-empty-refs",
                     "reason": "start the fix on its own branch"
+                }),
+            ),
+            (
+                "operation.preview.branchDelete",
+                &["repoPath", "targets", "reason"],
+                json!({
+                    "repoPath": "/tmp/x",
+                    "targets": [{ "repoPath": "/tmp/x", "branches": ["agent/fix-1"] }],
+                    "reason": "the fix branch was merged"
+                }),
+            ),
+            (
+                "operation.preview.submodulePointer",
+                &["repoPath", "relativePath", "direction", "reason"],
+                json!({
+                    "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                    "direction": "return", "reason": "go back to the recorded commit"
                 }),
             ),
             (
@@ -16834,6 +18993,444 @@ mod tests {
         );
         assert_eq!(payload["tier"], "fluxgit-write-handshake");
         assert_eq!(payload["readOnly"], false);
+    }
+
+    #[test]
+    fn operation_preview_branch_delete_dispatches_the_contract_body() {
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "branchDelete",
+            "completed",
+            json!({
+                "message": "Deleted 1 of 2 local branches (0 failed, 1 kept or skipped).",
+                "branchDelete": {
+                    "deleted": 1, "failed": 0, "skipped": 1,
+                    "repositories": [{
+                        "repoPath": "/work/api",
+                        "branches": [
+                            { "branch": "agent/fix-1", "status": "deleted", "tipOid": "a", "restoreOid": "a", "fleetBatchId": "b.jsonl" },
+                            { "branch": "agent/fix-2", "status": "skipped", "tipOid": "c", "reason": "unmerged" }
+                        ]
+                    }]
+                }
+            }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.branchDelete",
+            json!({
+                "repoPath": "/tmp/example",
+                "targets": [
+                    { "repoPath": "/tmp/example", "branches": ["agent/fix-1", "agent/fix-2"] },
+                    { "repoPath": "/tmp/example-web", "branches": ["agent/fix-1"] }
+                ],
+                "reason": "The fix branches were merged into main.",
+                "idempotencyKey": "cleanup-1"
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], false, "{response:?}");
+        let payload = tool_payload(&response);
+        assert_eq!(payload["tool"], "operation.preview.branchDelete");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["data"]["result"]["branchDelete"]["deleted"], 1);
+
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["previewId"], payload["previewId"]);
+        assert_eq!(dispatched["agentId"], "external-mcp-sidecar");
+        assert_eq!(dispatched["operationType"], "branchDelete");
+        assert_eq!(
+            dispatched["idempotencyKey"],
+            "branchDelete:client:cleanup-1"
+        );
+        assert_eq!(
+            dispatched["repoPath"],
+            platform_test_repo_path("/tmp/example")
+        );
+        assert_eq!(
+            dispatched["targets"],
+            json!([
+                {
+                    "repoPath": platform_test_repo_path("/tmp/example"),
+                    "branches": ["agent/fix-1", "agent/fix-2"]
+                },
+                {
+                    "repoPath": platform_test_repo_path("/tmp/example-web"),
+                    "branches": ["agent/fix-1"]
+                }
+            ])
+        );
+        assert_eq!(
+            dispatched["reason"],
+            "The fix branches were merged into main."
+        );
+        assert!(dispatched["requestedAt"].is_string());
+        let mut keys: Vec<&str> = dispatched
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "agentId",
+                "idempotencyKey",
+                "operationType",
+                "previewId",
+                "reason",
+                "repoPath",
+                "requestedAt",
+                "targets"
+            ]
+        );
+    }
+
+    #[test]
+    fn operation_preview_submodule_pointer_record_dispatches_message_and_pins() {
+        let recorded = "1".repeat(40);
+        let checked_out = "2".repeat(40);
+        let (addr, post_body_rx) = spawn_operation_gateway_mock(
+            "submodulePointer",
+            "completed",
+            json!({
+                "message": "Committed 44444444 in libs/core. Nothing was pushed.",
+                "commitSha": "4".repeat(40),
+                "submodulePointer": {
+                    "direction": "record",
+                    "parentPath": "libs/core",
+                    "relativePath": "vendor/json",
+                    "parentHeadRef": "refs/heads/main",
+                    "previousParentOid": "3".repeat(40),
+                    "commitSha": "4".repeat(40),
+                    "pointerOid": checked_out.clone()
+                }
+            }),
+        );
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.submodulePointer",
+            json!({
+                "repoPath": "/tmp/example",
+                "parentPath": "libs/core",
+                "relativePath": "vendor/json",
+                "direction": "record",
+                "message": "Update vendor/json to 1.2.3",
+                "expectedRecordedOid": recorded,
+                "expectedCheckedOutOid": checked_out,
+                "reason": "The parser bump is intended."
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], false, "{response:?}");
+        let payload = tool_payload(&response);
+        assert_eq!(payload["tool"], "operation.preview.submodulePointer");
+        assert_eq!(
+            payload["data"]["result"]["submodulePointer"]["direction"],
+            "record"
+        );
+
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["operationType"], "submodulePointer");
+        assert_eq!(dispatched["parentPath"], "libs/core");
+        assert_eq!(dispatched["relativePath"], "vendor/json");
+        assert_eq!(dispatched["direction"], "record");
+        assert_eq!(dispatched["message"], "Update vendor/json to 1.2.3");
+        assert_eq!(dispatched["expectedRecordedOid"], recorded);
+        assert_eq!(dispatched["expectedCheckedOutOid"], checked_out);
+        assert_eq!(dispatched["reason"], "The parser bump is intended.");
+        assert!(dispatched["idempotencyKey"]
+            .as_str()
+            .unwrap()
+            .starts_with("submodulePointer:call:"));
+    }
+
+    #[test]
+    fn operation_preview_submodule_pointer_return_omits_message_and_absent_pins() {
+        let (addr, post_body_rx) =
+            spawn_operation_gateway_mock("submodulePointer", "pending", json!(null));
+        let _env = GatewayEnvGuard::set(&addr);
+
+        let response = call_tool(
+            "operation.preview.submodulePointer",
+            json!({
+                "repoPath": "/tmp/example",
+                "relativePath": "vendor/json",
+                "direction": "return",
+                "reason": "Go back to the recorded commit."
+            }),
+            true,
+        );
+
+        assert_eq!(response["result"]["isError"], false, "{response:?}");
+        let payload = tool_payload(&response);
+        assert_eq!(payload["accepted"], true);
+        let dispatched = post_body_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock gateway did not receive the dispatch POST in time");
+        assert_eq!(dispatched["direction"], "return");
+        assert_eq!(
+            dispatched["parentPath"], "",
+            "parentPath defaults to the root"
+        );
+        for absent in ["message", "expectedRecordedOid", "expectedCheckedOutOid"] {
+            assert!(
+                dispatched.get(absent).is_none(),
+                "{absent} must be omitted, never sent empty"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_delete_and_submodule_pointer_reject_invalid_input_before_dispatch() {
+        // A gateway address is configured, so any validation gap would show
+        // up as a dispatch attempt instead of a JSON-RPC -32602.
+        let _env = GatewayEnvGuard::set("127.0.0.1:1");
+        let oid = "a".repeat(40);
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                "operation.preview.branchDelete",
+                json!({ "repoPath": "/tmp/x", "targets": [], "reason": "r" }),
+                "arguments.targets",
+            ),
+            (
+                "operation.preview.branchDelete",
+                json!({
+                    "repoPath": "/tmp/x",
+                    "targets": [{ "repoPath": "/tmp/x", "branches": ["a", "a"] }],
+                    "reason": "r"
+                }),
+                "arguments.targets[0].branches[1]",
+            ),
+            (
+                "operation.preview.branchDelete",
+                json!({
+                    "repoPath": "/tmp/x",
+                    "targets": [{ "repoPath": "/tmp/x", "branches": [] }],
+                    "reason": "r"
+                }),
+                "arguments.targets[0].branches",
+            ),
+            (
+                "operation.preview.branchDelete",
+                json!({
+                    "repoPath": "/tmp/x",
+                    "targets": [{ "repoPath": "/tmp/x", "branches": ["a"], "force": true }],
+                    "reason": "r"
+                }),
+                "arguments.targets[0].force",
+            ),
+            (
+                "operation.preview.branchDelete",
+                json!({
+                    "repoPath": "/tmp/x",
+                    "targets": [{ "repoPath": "relative/repo", "branches": ["a"] }],
+                    "reason": "r"
+                }),
+                "absolute",
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                    "direction": "record", "reason": "r"
+                }),
+                "arguments.message",
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                    "direction": "return", "message": "m", "reason": "r"
+                }),
+                "arguments.message",
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                    "direction": "sideways", "reason": "r"
+                }),
+                "arguments.direction",
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                    "direction": "return", "reason": "r",
+                    "expectedRecordedOid": oid.to_uppercase()
+                }),
+                "arguments.expectedRecordedOid",
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                    "direction": "return", "reason": "r",
+                    "expectedCheckedOutOid": &oid[..12]
+                }),
+                "arguments.expectedCheckedOutOid",
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                    "direction": "record", "message": "x".repeat(2001), "reason": "r"
+                }),
+                "arguments.message",
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/x", "direction": "return", "reason": "r"
+                }),
+                "arguments.relativePath",
+            ),
+        ];
+        for (tool, arguments, detail) in cases {
+            let response = call_tool(tool, arguments.clone(), true);
+            assert_eq!(
+                response["error"]["code"], -32602,
+                "{tool} must reject {arguments}: {response:?}"
+            );
+            let details = response["error"]["data"]["details"]
+                .as_str()
+                .or_else(|| response["error"]["message"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                details.contains(detail)
+                    || response["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(detail),
+                "{tool}: expected '{detail}' in {response:?}"
+            );
+        }
+
+        // A 64-character (SHA-256) pin is valid.
+        let valid = call_tool(
+            "operation.preview.submodulePointer",
+            json!({
+                "repoPath": "/tmp/x", "relativePath": "vendor/json",
+                "direction": "return", "reason": "r",
+                "expectedRecordedOid": "b".repeat(64)
+            }),
+            true,
+        );
+        assert!(valid.get("error").is_none(), "{valid:?}");
+    }
+
+    #[test]
+    fn branch_delete_targets_are_held_to_the_allowed_roots() {
+        let allowed = TestDir::new("fluxgit-mcp-branch-delete-root");
+        let inside = allowed.path().join("repo");
+        fs::create_dir_all(&inside).unwrap();
+        let outside = TestDir::new("fluxgit-mcp-branch-delete-outside");
+        let configured = env::join_paths([allowed.path()]).unwrap();
+
+        let lexical_inside = allowed.path().join("repo").join("..").join("repo");
+        let canonical = validate_and_canonicalize_tool_arguments_with_config(
+            ToolKind::OperationPreviewBranchDelete,
+            &json!({
+                "repoPath": inside,
+                "targets": [{ "repoPath": lexical_inside, "branches": ["agent/x"] }],
+                "reason": "r"
+            }),
+            Some(&configured),
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(canonical["targets"][0]["repoPath"].as_str().unwrap()),
+            inside.canonicalize().unwrap()
+        );
+
+        let denied = validate_and_canonicalize_tool_arguments_with_config(
+            ToolKind::OperationPreviewBranchDelete,
+            &json!({
+                "repoPath": inside,
+                "targets": [
+                    { "repoPath": inside, "branches": ["agent/x"] },
+                    { "repoPath": outside.path(), "branches": ["agent/x"] }
+                ],
+                "reason": "r"
+            }),
+            Some(&configured),
+        )
+        .unwrap_err();
+        assert_eq!(denied.code, -32011);
+    }
+
+    #[test]
+    fn branch_delete_and_submodule_pointer_audit_as_medium_write_proposals() {
+        for tool in [
+            "operation.preview.branchDelete",
+            "operation.preview.submodulePointer",
+        ] {
+            let context =
+                McpAuditContext::from_params(&json!({ "name": tool, "arguments": {} }), "agent");
+            let labels = context.audit_labels();
+            assert_eq!(labels.event_type, "write_proposal", "{tool}");
+            assert_eq!(labels.approval, "ui_handshake", "{tool}");
+            assert_eq!(labels.risk, "medium", "{tool}");
+            assert!(!labels.read_only, "{tool}");
+        }
+    }
+
+    #[test]
+    fn submodule_pointer_collision_paths_name_the_submodule_directory() {
+        let repo = Path::new("/work/repo");
+        assert_eq!(
+            proposal_paths(
+                &json!({ "parentPath": "libs/core/", "relativePath": "vendor/json" }),
+                repo
+            ),
+            Some(vec!["libs/core/vendor/json".to_string()])
+        );
+        assert_eq!(
+            proposal_paths(
+                &json!({ "parentPath": "", "relativePath": "vendor/json" }),
+                repo
+            ),
+            Some(vec!["vendor/json".to_string()])
+        );
+    }
+
+    #[test]
+    fn branch_delete_and_submodule_pointer_fall_back_to_pending_without_fluxgit() {
+        let _env = GatewayEnvGuard::set("127.0.0.1:1");
+        for (tool, arguments) in [
+            (
+                "operation.preview.branchDelete",
+                json!({
+                    "repoPath": "/tmp/example",
+                    "targets": [{ "repoPath": "/tmp/example", "branches": ["agent/fix-1"] }],
+                    "reason": "merged"
+                }),
+            ),
+            (
+                "operation.preview.submodulePointer",
+                json!({
+                    "repoPath": "/tmp/example", "relativePath": "vendor/json",
+                    "direction": "return", "reason": "restore"
+                }),
+            ),
+        ] {
+            let response = call_tool(tool, arguments, true);
+            assert_eq!(response["result"]["isError"], true);
+            let text = response["result"]["content"][0]["text"].as_str().unwrap();
+            let payload: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(payload["error"]["code"], 10003, "{tool}");
+            assert_eq!(payload["tier"], "fluxgit-write-handshake");
+        }
     }
 
     // ---------------------------------------------------------------------

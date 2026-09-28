@@ -32,6 +32,13 @@ sha2 = "0.10"
 # Cross-process advisory locking for the single shared gateway/sidecar audit
 # ledger. fs2 0.4 supports the sidecar's Rust 1.88 MSRV.
 fs2 = "0.4"
+# Agent detection for `agents.presence`, `fleet.digest` and collision hints.
+# src/agent_detect.rs is the shared detector (app/core/agent-presence in the
+# monorepo; a verbatim copy in the public mirror). These match that crate's
+# dependency list; SQLite stores are only ever opened read-only.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+dirs = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -46,3 +53,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# The shared detector's own tests compile here too (they run in the mirror).
+tempfile = "3"

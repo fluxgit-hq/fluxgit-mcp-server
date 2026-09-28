@@ -11,8 +11,8 @@
 
 > AI agents inspect. FluxGit keeps control.
 
-A Rust MCP server with **34 contracts** for AI code agents: **23 read-only
-tools** and **11 human-gated operation tools** (10 proposals plus cancellation
+A Rust MCP server with **38 contracts** for AI code agents: **25 read-only
+tools** and **13 human-gated operation tools** (12 proposals plus cancellation
 of a pending proposal). The sidecar never executes a Git write; it bridges
 approved proposals to the [FluxGit](https://fluxgit.com) desktop application.
 
@@ -38,7 +38,7 @@ restore points and audit.
 
 ## What's exposed
 
-### 23 read-only tools
+### 25 read-only tools
 
 | Tool | Purpose |
 |---|---|
@@ -59,6 +59,8 @@ restore points and audit.
 | `diff.semantic` | Capability-negotiated semantic explanation |
 | `diff.semanticFallbacks` | Paths that fell back from semantic to text |
 | `fleet.radar` | Multi-repo attention queue |
+| `fleet.digest` | **What changed across the fleet since a time** — HEAD and local-branch reflog moves of many repositories, newest first, bounded by `maxEvents` (default 200, max 1000). `repoPaths`, or FluxGit's registered repositories inside the allowed roots when omitted. `identity` is exactly what Git recorded (the configured identity, not proof of a person or an agent); `rewrote` flags moves that dropped the previous tip (reset, amend, rebase, forced moves). Reads reflog files only; nothing is fetched or written |
+| `agents.presence` | **Which other coding agents are working in this repository** — from local sources only (running agent processes and their children, the agents' own session stores, files they keep in the repository, editors with built-in agents, and FluxGit MCP presence records). Per agent: `state` (working/open/recent), `sources`, branch, last tool and repository-relative files when known. Names are what each tool or MCP client declares about itself. Your own MCP record is excluded; findings that are probably your own session are marked `likelyCaller`. Never returns prompts, messages or file contents |
 | `safety.timeline` | Synthesized safety events from restore points + reflog |
 | `safety.eventDetails` | Drill-down into one timeline event |
 | `flux.latestRestorePoint` | Newest FluxGit restore point |
@@ -66,9 +68,9 @@ restore points and audit.
 | `flux.restorePointDetails` | One restore point with before/after refs |
 | `operation.status` | Authoritative asynchronous status by `previewId`; poll after a preview returns `accepted: true` and do not report a Git outcome before it becomes terminal |
 
-### 11 write-with-UI-handshake tools
+### 13 write-with-UI-handshake tools
 
-All 10 `operation.preview.*` proposals dispatch through the FluxGit gateway when
+All 12 `operation.preview.*` proposals dispatch through the FluxGit gateway when
 configured. The sidecar POSTs the proposal, performs one bounded status read,
 and normally returns immediately with `accepted: true`, the canonical
 `previewId`, current status and `nextAction.tool: "operation.status"`. The
@@ -76,7 +78,7 @@ FluxGit app renders a “Requested by AI agent” approval card while human revi
 continues asynchronously. Code `10003` is reserved for a bridge that is absent,
 invalid or unreachable; it is not a human-approval timeout.
 
-All 10 preview schemas accept an optional bounded `idempotencyKey`. Reuse it
+All 12 preview schemas accept an optional bounded `idempotencyKey`. Reuse it
 only when retrying the same logical intent; the sidecar scopes it to the
 operation type so that retry resolves to the existing gateway proposal. Omit
 it for a new intent—even when the other arguments match—and the sidecar sends
@@ -95,6 +97,8 @@ a fresh UUID-backed key. Preview tools therefore continue to advertise
 | `operation.preview.commit` | Propose staging + committing with a message (non-destructive; amend not supported) | POST `/v1/mcp/operation/preview/commit` → approval card lists the exact files that will be staged and committed; runs through the normal commit pipeline (hooks, signing, policy); completion returns the new SHA |
 | `operation.preview.push` | Propose pushing a branch to a remote (optional set-upstream; force-with-lease shows a HIGH-risk warning) | POST `/v1/mcp/operation/preview/push` → approval card with remote + branch + force warning when applicable; runs the guarded push flow |
 | `operation.preview.branch` | Propose creating (and optionally checking out) a branch from a start point | POST `/v1/mcp/operation/preview/branch` → approval card with name + start point + checkout choice |
+| `operation.preview.branchDelete` | Propose deleting merged local branches in one or more repositories (`targets`, up to 20 repositories × 20 branches, 100 in total). The agent names branches; FluxGit decides which are deletable. Remote branches are never touched | POST `/v1/mcp/operation/preview/branchDelete` → the card inspects every branch natively and keeps any branch with commits not in HEAD or its upstream, checked out anywhere, or whose tip moved; each deleted tip is journaled in the Fleet branch-deletion history, where Restore recreates it. Completion returns per-branch `deleted`/`failed`/`skipped` results |
+| `operation.preview.submodulePointer` | Propose recording (`record`, requires `message`) or returning to (`return`) one submodule pointer at any depth (`parentPath` + `relativePath`). Optional `expectedRecordedOid` / `expectedCheckedOutOid` pins, as read from `submodule.status` | POST `/v1/mcp/operation/preview/submodulePointer` → `record` commits only the gitlink in the parent through Git's own commit (hooks and signing apply; nothing is pushed); `return` checks out the recorded commit detached, journaling the previous checkout as a restore point. The submodule must be initialized, clean and differ from its recorded pointer |
 | `operation.cancel` | Cancel the agent's own still-pending proposal by previewId | POST cancel; the card disappears from the user's queue like an expired proposal |
 
 All write proposals require a free-text `reason` so the user sees the agent's justification in the approval modal. All reuse the same durable gateway lifecycle (`pending → approved → executing → completed|failed`, with rejection/cancellation/expiry branches) and the same Tauri bridge in the UI. Six shims cover pending, recoverable, approve, claim, reject and complete. After restart, Approved proposals may resume only after repo/ref revalidation and claim; Executing proposals are shown for explicit reconciliation and are never blindly re-executed. When an approved operation captures a restore point, the completion `result` exposes that recovery metadata so the agent can report it without guessing.
@@ -104,10 +108,48 @@ proposal's `repoPath` to its canonical open-repository id and requires it to
 match the repository the human is reviewing; an unresolved path, mismatch, or
 repository switch blocks execution. Tool arguments are validated before
 dispatch and again by the gateway. An optional declarative agent policy can
-deny proposals before a card opens; if `FLUXGIT_MCP_AGENT_POLICY` is configured
+deny proposals before a card opens. Its rules match the `agentId` the sidecar
+forwards (the sanitized, self-declared `clientInfo.name`, such as `claude-code`)
+and can limit that agent to operations, refs and, with `pathConstraints`,
+repository and worktree path prefixes. If `FLUXGIT_MCP_AGENT_POLICY` is configured
 but the file is missing, unreadable, malformed, or unsupported, the gateway
 does not start. With no configured policy, compatibility remains permissive,
 but per-operation human approval is still mandatory.
+
+### Other agents in the same repository (collision hints)
+
+Every `operation.preview.*` result may carry an optional `otherAgents` object:
+the other agents `agents.presence` finds in the proposal's repository and, when
+both sides name their files (discard and commit `paths`, patch headers, plan
+steps, the submodule directory of `submodulePointer`), the `overlappingPaths`. It is informational only: it is added after
+the gateway decided, never blocks a proposal and never changes how it is
+approved. It is absent when agent detection is disabled.
+
+```json
+"otherAgents": {
+  "informational": true,
+  "agents": [{ "agent": "codex", "state": "working", "sources": ["process", "session"],
+               "branch": "codex/fix-login", "lastTool": "apply_patch",
+               "files": ["src/login.rs"], "overlappingPaths": ["src/login.rs"],
+               "pid": 4242, "lastActivityMs": 1790000000000, "mcpClient": null,
+               "sameAgentAsCaller": false }],
+  "agentCount": 1, "overlappingAgentCount": 1, "proposalPathsKnown": true,
+  "omittedLikelyCaller": 1, "note": "Informational only: ..."
+}
+```
+
+Detection is local and read-only: other agents' SQLite stores are opened
+read-only and only repository-relative paths, tool names, branches and times
+leave the detector. `FLUXGIT_MCP_AGENT_DETECTION_DISABLED` (any value) turns it
+off: `agents.presence` then returns `10011` and previews carry no hint.
+
+Each sidecar also records which repositories its client used, so the desktop
+and other sidecars can see it: `<run_dir>/presence/mcp/<pid>.json` (0600) with
+the self-declared `clientInfo` name and version and, per repository, the
+canonical path, time and last tool name. Only calls that were accepted are
+recorded (a proposal the agent policy or a missing FluxGit refused is not);
+the file is removed on clean exit. `FLUXGIT_MCP_PRESENCE_DISABLED` turns it
+off.
 
 ### Write protocol details
 
@@ -185,7 +227,7 @@ Any non-completed terminal state (`rejected`, `failed`, `expired`, `cancelled`)
 returns `isError: true` with the structured payload, so the agent can report the
 real outcome instead of inventing one.
 
-The same pattern applies to all 10 `operation.preview.*` tools. Only the request
+The same pattern applies to all 12 `operation.preview.*` tools. Only the request
 body fields and result shape differ; proposal submission, the one immediate
 read, asynchronous `operation.status` continuation and error semantics are
 shared. The public contract summary is maintained at
@@ -199,11 +241,11 @@ The sidecar speaks MCP without FluxGit installed. Standard Git inspection works 
 
 Tier classification:
 
-- **Free shell** — work with local `git` only: `repo.brief`, `repo.scope`, `repo.status`, `repo.refs`, `repo.branchStack`, `repo.history`, `repo.reflog`, `commit.details`, `worktree.changes`, `worktree.list`, `submodule.status`, `diff.text`, `conflict.read`.
+- **Free shell** — work with local `git` only: `repo.brief`, `repo.scope`, `repo.status`, `repo.refs`, `repo.branchStack`, `repo.history`, `repo.reflog`, `commit.details`, `worktree.changes`, `worktree.list`, `submodule.status`, `diff.text`, `conflict.read`, `fleet.digest`. `agents.presence` also needs no FluxGit: it reads local agent state (and FluxGit's MCP presence records when present).
 - **Hybrid** — work locally with documented fallback, enriched by FluxGit: `fleet.radar`, `diff.semantic`, `diff.semanticFallbacks`, `repo.conflictPreflight`.
 - **FluxGit-required** — return `gateway_not_configured` without FluxGit because synthesizing them from local refs alone would mislead the agent: `safety.timeline`, `safety.eventDetails`, `flux.latestRestorePoint`, `flux.restorePoints`, `flux.restorePointDetails`.
 - **Write handshake** — route through FluxGit UI approval via the gateway
-  handshake server. The 10 `operation.preview.*` tools return an accepted live
+  handshake server. The 12 `operation.preview.*` tools return an accepted live
   proposal promptly and continue through `operation.status`; `operation.cancel`
   withdraws a pending proposal owned by the same agent. Code `10003` is used
   only when the bridge cannot accept or serve the handshake.
@@ -468,8 +510,8 @@ JSON value per line. Pre-standard `Content-Length` framing remains accepted as
 limited to 8 MiB. JSON-RPC notifications receive no response, and request
 methods sent without an id are not executed.
 
-There are 34 tools in modern `tools/list`: 23 advertise
-`annotations.readOnlyHint: true`; the 10 `operation.preview.*` tools and
+There are 38 tools in modern `tools/list`: 25 advertise
+`annotations.readOnlyHint: true`; the 12 `operation.preview.*` tools and
 `operation.cancel` advertise `readOnlyHint: false`. These annotations describe
 effects for the host; they are not authorization.
 
@@ -491,12 +533,13 @@ Error codes:
 | `10006` | Gateway refused the proposal before opening a card (policy, validation or quota) |
 | `10007` | Gateway returned a malformed/unsafe canonical `previewId`; the sidecar refuses to follow it |
 | `10010` | Local read-only Git command failed |
+| `10011` | Agent detection is disabled (`FLUXGIT_MCP_AGENT_DETECTION_DISABLED`); `agents.presence` cannot answer |
 
 ---
 
 ## Status
 
-This is a working MCP server. The read-only surface and all 10
+This is a working MCP server. The read-only surface and all 12
 `operation.preview.*` routes are implemented; `operation.cancel` manages only a
 pending proposal owned by the same self-reported agent id. The write handshake
 renders an approval card in FluxGit and completes through the app's guarded
