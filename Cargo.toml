@@ -20,7 +20,7 @@ rust-version = "1.88"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.11", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 # Ed25519 audit log signing (per-install keypair; opt-in via FLUXGIT_MCP_AUDIT_SIGN_KEY).

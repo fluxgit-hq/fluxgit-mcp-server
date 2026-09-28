@@ -336,6 +336,21 @@ Prohibited wording: *"This is a semantic diff"* when `supported=false`.
 
 ---
 
+## Presence file (which agent is working where)
+
+Unless `FLUXGIT_MCP_PRESENCE_DISABLED` is set, each sidecar process keeps one
+local file, `<FluxGit run dir>/presence/mcp/<pid>.json`, so the FluxGit desktop
+app can show which coding agent is connected and which repository it is working
+on. It holds only the client name and version the agent declared in
+`initialize`, and per repository (at most 16) the checked `repoPath`, the time
+of the last call and the tool name. No other arguments, no results. Unlike the
+audit log, the repository path is stored as-is so the desktop can match it; the
+file is private (`0600` in a `0700` directory), rewritten atomically, deleted on
+clean exit, swept after 24 hours, and writing it never affects a tool call.
+The client name is self-declared, not an authenticated identity.
+
+---
+
 ## Audit log
 
 Unless `FLUXGIT_MCP_AUDIT_DISABLED` is set, the sidecar attempts to append each

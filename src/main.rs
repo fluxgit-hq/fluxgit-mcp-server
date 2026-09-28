@@ -37,7 +37,9 @@ ENVIRONMENT:\n  \
     FLUXGIT_RUN_DIR              Base for the default <run_dir>/audit/mcp.jsonl ledger\n  \
     FLUXGIT_MCP_AUDIT_LOG       Optional override for the shared audit ledger path\n  \
     FLUXGIT_MCP_AUDIT_DISABLED  Disable audit appends when explicitly present\n  \
-    FLUXGIT_MCP_AUDIT_SIGN_KEY  PEM PKCS8 Ed25519 key; invalid explicit configuration fails closed\n\
+    FLUXGIT_MCP_AUDIT_SIGN_KEY  PEM PKCS8 Ed25519 key; invalid explicit configuration fails closed\n  \
+    FLUXGIT_MCP_PRESENCE_DISABLED  Do not write <run_dir>/presence/mcp/<pid>.json (client name/version,\n\
+                                 repo path, last call time and tool name, read by the FluxGit desktop)\n\
 "
     );
 }

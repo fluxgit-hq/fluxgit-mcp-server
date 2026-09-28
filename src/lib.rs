@@ -17,6 +17,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+pub mod presence;
+pub use presence::{presence_dir_for_run_dir, PresenceRecorder};
+
 pub const SERVER_NAME: &str = "fluxgit-mcp-sidecar";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The latest stateless MCP protocol revision implemented by the sidecar.
@@ -95,6 +98,9 @@ pub struct McpSidecar {
     /// It is a self-declared name, not an authenticated identity: it makes
     /// policy and quotas addressable, and is not a security boundary.
     client_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Local "client X used repository Y at time T" record for the desktop's
+    /// agent presence (see `presence.rs`). `None` in tests and when disabled.
+    presence: Option<Arc<PresenceRecorder>>,
 }
 
 /// Per-install Ed25519 audit signer. Loaded once at startup from
@@ -1990,7 +1996,14 @@ impl McpSidecar {
             gateway_state,
             audit_ledger: AuditLedger::from_env()?,
             client_id: Default::default(),
+            presence: PresenceRecorder::from_env(fluxgit_run_dir()).map(Arc::new),
         })
+    }
+
+    /// Record MCP presence under `dir` (tests and embedders).
+    pub fn with_presence_dir(mut self, dir: PathBuf) -> Self {
+        self.presence = Some(Arc::new(PresenceRecorder::new(dir)));
+        self
     }
 
     pub fn new_for_tests(gateway_configured: bool) -> Self {
@@ -2002,6 +2015,7 @@ impl McpSidecar {
             },
             audit_ledger: None,
             client_id: Default::default(),
+            presence: None,
         }
     }
 
@@ -2016,6 +2030,7 @@ impl McpSidecar {
                 AuditLedger::new(audit_log, None).expect("valid test audit ledger configuration"),
             ),
             client_id: Default::default(),
+            presence: None,
         }
     }
 
@@ -2037,6 +2052,7 @@ impl McpSidecar {
                     .expect("valid signed test audit ledger configuration"),
             ),
             client_id: Default::default(),
+            presence: None,
         }
     }
 
@@ -2057,6 +2073,9 @@ impl McpSidecar {
         }
 
         output.flush()?;
+        if let Some(presence) = &self.presence {
+            presence.remove();
+        }
         Ok(())
     }
 
@@ -2174,6 +2193,15 @@ impl McpSidecar {
                     if let Ok(mut slot) = self.client_id.lock() {
                         *slot = Some(name);
                     }
+                }
+                if let Some(presence) = &self.presence {
+                    presence.note_initialize_version(
+                        request
+                            .params
+                            .get("clientInfo")
+                            .and_then(|info| info.get("version"))
+                            .and_then(Value::as_str),
+                    );
                 }
                 JsonRpcResponse {
                     jsonrpc: "2.0",
@@ -2366,6 +2394,7 @@ impl McpSidecar {
         // proposal, semantic request, fleet scan, or local Git invocation).
         let validated_arguments = validate_and_canonicalize_tool_arguments(kind, raw_arguments)?;
         let arguments = &validated_arguments;
+        self.record_presence(object, agent_id, kind, arguments);
 
         // operation.status / operation.cancel talk directly to the gateway
         // handshake bridge (they take only a previewId, no repoPath), so they
@@ -2516,6 +2545,36 @@ impl McpSidecar {
             }),
             true,
         ))
+    }
+
+    /// Presence is recorded only after the arguments validated, from the
+    /// canonical `repoPath` the call will actually use. Fleet scans (many
+    /// repositories) and previewId-only calls name no single repository.
+    fn record_presence(
+        &self,
+        params: &Map<String, Value>,
+        agent_id: &str,
+        kind: ToolKind,
+        arguments: &Value,
+    ) {
+        let Some(presence) = &self.presence else {
+            return;
+        };
+        let Some(repo_path) = repo_path_from_arguments(arguments) else {
+            return;
+        };
+        // The fallback id means the client did not identify itself.
+        let client_name = (agent_id != "external-mcp-sidecar").then_some(agent_id);
+        let request_version = params
+            .get("_meta")
+            .and_then(|meta| meta.get("io.modelcontextprotocol/clientInfo"))
+            .and_then(|info| info.get("version"))
+            .and_then(Value::as_str);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0);
+        presence.record(client_name, request_version, &repo_path, kind.as_str(), now);
     }
 
     fn record_tool_audit(&self, context: &McpAuditContext, result: &ToolCallResult) {
@@ -13302,6 +13361,59 @@ mod tests {
         assert!(event["args_fingerprint"]
             .as_str()
             .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")));
+    }
+
+    #[test]
+    fn tools_call_records_client_and_canonical_repo_for_desktop_presence() {
+        let repo = fixture_repo();
+        let presence_dir = TestDir::new("fluxgit-mcp-presence");
+        let server =
+            McpSidecar::new_for_tests(false).with_presence_dir(presence_dir.path().join("mcp"));
+        server.handle_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "clientInfo": { "name": "claude-code", "version": "2.1.7" } }
+        }));
+        // A call naming no repository records nothing.
+        server.handle_value(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "operation.status", "arguments": { "previewId": "p-1" } }
+        }));
+        let file = presence_dir
+            .path()
+            .join("mcp")
+            .join(format!("{}.json", std::process::id()));
+        assert!(!file.exists());
+
+        let response = server
+            .handle_value(json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {
+                    "name": "repo.status",
+                    "arguments": { "repoPath": repo.path(), "repoId": "secret-id" }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(response).unwrap()["result"]["isError"],
+            false
+        );
+
+        let text = fs::read_to_string(&file).unwrap();
+        let document: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(document["client"]["name"], "claude-code");
+        assert_eq!(document["client"]["version"], "2.1.7");
+        assert_eq!(
+            document["repos"][0]["repoPath"],
+            repo.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(document["repos"][0]["lastTool"], "repo.status");
+        assert!(document["repos"][0]["lastCallMs"].as_i64().unwrap() > 0);
+        // Other arguments never reach the presence file.
+        assert!(!text.contains("secret-id"));
     }
 
     #[test]
