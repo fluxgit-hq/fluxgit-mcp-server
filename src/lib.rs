@@ -3316,7 +3316,11 @@ fn render_fleet_radar_tool_result(arguments: &Value) -> ToolCallResult {
 }
 
 fn text_tool_result(payload: Value, is_error: bool) -> ToolCallResult {
-    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|serialize_err| {
+    // Compact, not pretty: the text is the same JSON the agent parses, and
+    // indentation alone was 24-40% of the tokens of every structured result
+    // (product/mcp/TOKEN_COST_AUDIT_2026-09-28.md, R1). Keys and values are
+    // unchanged, so any client that parses `content[0].text` sees no change.
+    let text = serde_json::to_string(&payload).unwrap_or_else(|serialize_err| {
         format!(
             "{{\"error\":{{\"code\":\"internal_serialization_error\",\"message\":\"{}\"}}}}",
             serialize_err
@@ -8203,19 +8207,29 @@ fn tool_output_schema(kind: ToolKind, read_only: bool) -> Value {
             "tier": tool_output_tier_schema(kind),
             "repoPath": { "type": "string" },
             "data": tool_data_schema(kind),
-            "error": tool_error_schema(),
-            "previewId": preview_id_output_schema(),
-            "status": lifecycle_status_schema(true),
-            "accepted": { "const": true },
-            "nextAction": preview_next_action_schema()
+            "error": tool_error_schema()
         },
-        "required": ["tool", "readOnly"],
+        "required": ["tool", "readOnly"]
         // The envelope and today's stable fields are strict enough for an MCP
         // client to consume directly. Objects remain open for additive fields
         // from a newer FluxGit gateway/desktop, which is important because the
-        // sidecar and app can be upgraded independently.
-        "additionalProperties": true
+        // sidecar and app can be upgraded independently. Open is the JSON
+        // Schema default, so no object states `"additionalProperties": true`
+        // (296 copies of it cost ~1.5k tokens of every modern tools/list).
+        // Only closed objects say `false`, and the validator honours that.
     });
+    // Proposal lifecycle fields exist only on proposal tools and on
+    // operation.status. Read-only tools never return them, and advertising
+    // them on all 25 cost ~6.3k tokens of every modern tools/list
+    // (TOKEN_COST_AUDIT_2026-09-28, R3). The set is unchanged for the tools
+    // that do return them.
+    if !read_only || kind == ToolKind::OperationStatus {
+        let properties = &mut schema["properties"];
+        properties["previewId"] = preview_id_output_schema();
+        properties["status"] = lifecycle_status_schema(true);
+        properties["accepted"] = json!({ "const": true });
+        properties["nextAction"] = preview_next_action_schema();
+    }
     if is_operation_preview(kind) {
         schema["properties"]["otherAgents"] = other_agents_hint_output_schema();
     }
@@ -8410,7 +8424,6 @@ fn output_object(properties: Value, required: &[&str]) -> Value {
         "type": "object",
         "properties": properties,
         "required": required,
-        "additionalProperties": true,
     })
 }
 
@@ -10369,14 +10382,14 @@ fn tool_input_schema(kind: ToolKind) -> Value {
         "repoPath".into(),
         json!({
             "type": "string",
-            "description": "Absolute local repository path. Required for the current read-only local sidecar contract."
+            "description": "Absolute local repository path."
         }),
     );
     properties.insert(
         "repoId".into(),
         json!({
             "type": "string",
-            "description": "Optional FluxGit workspace id. Do not use it as a substitute for repoPath in local sidecar calls."
+            "description": "Optional FluxGit workspace id; never replaces repoPath."
         }),
     );
     if operation_type_for_kind(kind).is_some() {
@@ -13229,6 +13242,13 @@ mod tests {
             parsed_text, *structured,
             "{tool_name} text and structuredContent must carry the same payload"
         );
+        // Compact JSON (TOKEN_COST_AUDIT_2026-09-28, R1): pretty-printing
+        // added 24-40% to the tokens of every result for no information.
+        assert_eq!(
+            text,
+            serde_json::to_string(structured).unwrap(),
+            "{tool_name} text must be compact JSON"
+        );
 
         let kind = ToolKind::from_name(tool_name).expect("known test tool");
         let read_only = READ_ONLY_TOOL_KINDS.contains(&kind);
@@ -15926,6 +15946,46 @@ mod tests {
             "repo.brief payload blew its token budget: {} chars",
             serialized.len()
         );
+        // The agent reads the whole text, envelope included, not only `data`.
+        // Capping it too means a regression in the envelope or a return to
+        // pretty-printing fails here (the repoPath is a temp dir, so allow it).
+        let text = result["result"]["content"][0]["text"].as_str().unwrap();
+        let path_len = path.to_string_lossy().len();
+        assert!(
+            text.len() < 2_400 + path_len + 120,
+            "repo.brief text blew its token budget: {} chars",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn output_schemas_advertise_only_fields_each_tool_can_return() {
+        // TOKEN_COST_AUDIT_2026-09-28 R3/R4: lifecycle fields belong to
+        // proposals and operation.status; open objects are the JSON Schema
+        // default and are not restated.
+        let lifecycle = ["previewId", "status", "accepted", "nextAction"];
+        for kind in READ_ONLY_TOOL_KINDS
+            .iter()
+            .chain(WRITE_HANDSHAKE_TOOL_KINDS.iter())
+            .copied()
+        {
+            let read_only = READ_ONLY_TOOL_KINDS.contains(&kind);
+            let schema = tool_output_schema(kind, read_only);
+            let advertises = !read_only || kind == ToolKind::OperationStatus;
+            for field in lifecycle {
+                assert_eq!(
+                    schema["properties"].get(field).is_some(),
+                    advertises,
+                    "{} outputSchema lifecycle field {field}",
+                    kind.as_str()
+                );
+            }
+            assert!(
+                !schema.to_string().contains("\"additionalProperties\":true"),
+                "{} outputSchema restates the default additionalProperties: true",
+                kind.as_str()
+            );
+        }
     }
 
     #[test]

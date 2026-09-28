@@ -7,12 +7,12 @@
     "source": "github"
   },
   "websiteUrl": "https://fluxgit.com/features/mcp-agent-git/",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packages": [
     {
       "registryType": "cargo",
       "identifier": "fluxgit-mcp-sidecar",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       }

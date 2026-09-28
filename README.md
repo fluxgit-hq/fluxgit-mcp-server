@@ -501,11 +501,15 @@ The server supports two protocol eras:
   results add `ttlMs` and `cacheScope`. `tools/list` includes `title`,
   `inputSchema`, `outputSchema` and annotations. `tools/call` includes both
   presentational `content` and the same payload in `structuredContent`.
+  Only the proposal tools and `operation.status` advertise `previewId`,
+  `status`, `accepted` and `nextAction` in their `outputSchema`; schema
+  objects are open unless they say `"additionalProperties": false`.
 - **`2024-11-05` (legacy compatibility):** older hosts continue to use
   `initialize`. Modern-only fields are omitted from legacy results.
 
 Stdio output is standard newline-delimited JSON-RPC 2.0: exactly one compact
-JSON value per line. Pre-standard `Content-Length` framing remains accepted as
+JSON value per line. The JSON in a result's `content[0].text` is compact too
+(no indentation), with the same keys and values as `structuredContent`. Pre-standard `Content-Length` framing remains accepted as
 **input only** for old FluxGit clients; the server never emits it. Frames are
 limited to 8 MiB. JSON-RPC notifications receive no response, and request
 methods sent without an id are not executed.
